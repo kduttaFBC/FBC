@@ -1,0 +1,507 @@
+"""
+FalconBridge Audit Intelligence — SBA loan reconciliation checks.
+
+Replaces the old Customer Master / Bank Transactions checks (CM-01..05,
+TX-01..09) with checks that reconcile a servicer's SRF submission (Servicer
+Inputs + Loan Terms & Prior Period) against the SOUP Performance Dataset for
+that same servicer.
+
+Each check returns a dict:
+{
+    "id": "POP-01",
+    "name": "Population Check",
+    "category": "SBA Reconciliation",
+    "severity": "FAIL" | "WARN",
+    "status": "PASS" | "WARN" | "FAIL",
+    "issues_found": <int>,
+    "details": "<human readable summary>",
+    "records": [ { ...flagged record... }, ... ],
+}
+"""
+
+import pandas as pd
+from file_readers import normalize_id_series as _norm_id
+
+
+BALANCE_TOLERANCE = 1.00  # dollars
+
+
+def _result(check_id, name, category, severity, records, details_fn):
+    issues = len(records)
+    status = "PASS" if issues == 0 else severity
+    details = "No issues found." if issues == 0 else details_fn(issues)
+    return {
+        "id": check_id,
+        "name": name,
+        "category": category,
+        "severity": severity,
+        "status": status,
+        "issues_found": issues,
+        "details": details,
+        "records": records,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POP-01 — Population Check
+# Every loan in the servicer's Loan Terms & Prior Period population should
+# exist in the SOUP dataset's history for that servicer, and vice versa.
+# ---------------------------------------------------------------------------
+
+def population_check(loan_terms_df, soup_servicer_df, servicer_name):
+    records = []
+
+    lt_ids = set(_norm_id(loan_terms_df["SBA GP Number"]).dropna()) if "SBA GP Number" in loan_terms_df.columns else set()
+    soup_ids = set(_norm_id(soup_servicer_df["SBA GP Number"]).dropna()) if "SBA GP Number" in soup_servicer_df.columns else set()
+
+    only_srf = lt_ids - soup_ids
+    only_soup = soup_ids - lt_ids
+
+    for gp in sorted(only_srf):
+        records.append({
+            "SBA GP Number": gp,
+            "Issue": "In servicer's Loan Terms & Prior Period but not found in SOUP dataset",
+        })
+    for gp in sorted(only_soup):
+        records.append({
+            "SBA GP Number": gp,
+            "Issue": "In SOUP dataset but not found in servicer's Loan Terms & Prior Period",
+        })
+
+    return _result(
+        "POP-01", "Population Check", "SBA Reconciliation", "FAIL", records,
+        lambda n: f"{n} loan(s) present in one source but missing from the other for {servicer_name}.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# BAL-01 — Balance Continuity
+# This cycle's Beginning Balance (Servicer Inputs) should tie to SOUP's most
+# recent Ending Actual Balance for that loan. Loans with multiple payment
+# postings this cycle are flagged as WARN (informational) rather than FAIL,
+# since their balance naturally reflects more than one payment.
+# ---------------------------------------------------------------------------
+
+def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
+    records = []
+
+    required = {"SBA GP Number", "Beginning Balance"}
+    if not required.issubset(servicer_inputs_df.columns) or "SBA GP Number" not in soup_servicer_df.columns:
+        return _result("BAL-01", "Balance Continuity", "SBA Reconciliation", "FAIL", records,
+                        lambda n: "")
+
+    si = servicer_inputs_df.copy()
+    si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
+
+    dup_mask = si.duplicated("SBA GP Number", keep=False)
+    dup_ids = set(si.loc[dup_mask, "SBA GP Number"])
+
+    # use the last posting per loan this cycle if there's a payment date to sort by
+    sort_col = "Payment Receipt Date" if "Payment Receipt Date" in si.columns else None
+    if sort_col:
+        si_last = si.sort_values(sort_col).groupby("SBA GP Number").tail(1)
+    else:
+        si_last = si.groupby("SBA GP Number").tail(1)
+
+    soup = soup_servicer_df.copy()
+    soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
+    sort_month = "Payment Month" if "Payment Month" in soup.columns else None
+    if sort_month:
+        soup_latest = soup.sort_values(["SBA GP Number", sort_month]).groupby("SBA GP Number").tail(1)
+    else:
+        soup_latest = soup.groupby("SBA GP Number").tail(1)
+    soup_latest = soup_latest.set_index("SBA GP Number")
+
+    for _, row in si_last.iterrows():
+        gp = row["SBA GP Number"]
+        if gp not in soup_latest.index:
+            continue  # already caught by the population check
+        prior_ending = soup_latest.loc[gp].get("Ending Actual Balance")
+        beginning = row.get("Beginning Balance")
+        if pd.isna(prior_ending) or pd.isna(beginning):
+            continue
+        diff = round(float(beginning) - float(prior_ending), 2)
+        if abs(diff) <= BALANCE_TOLERANCE:
+            continue
+        records.append({
+            "SBA GP Number": gp,
+            "Beginning Balance (this cycle)": round(float(beginning), 2),
+            "SOUP Prior Ending Balance": round(float(prior_ending), 2),
+            "Difference": diff,
+            "Multiple Postings This Cycle": "YES" if gp in dup_ids else "NO",
+            "Severity": "WARN" if gp in dup_ids else "FAIL",
+        })
+
+    # Sort so FAILs surface first
+    records.sort(key=lambda r: 0 if r["Severity"] == "FAIL" else 1)
+
+    hard_fails = [r for r in records if r["Severity"] == "FAIL"]
+    severity = "FAIL" if hard_fails else "WARN"
+    status = "PASS" if not records else severity
+
+    details = "No issues found." if not records else (
+        f"{len(hard_fails)} loan(s) with an unexplained balance break; "
+        f"{len(records) - len(hard_fails)} additional loan(s) flagged only because of multiple "
+        f"payment postings this cycle."
+    )
+
+    return {
+        "id": "BAL-01",
+        "name": "Balance Continuity",
+        "category": "SBA Reconciliation",
+        "severity": "FAIL",
+        "status": status,
+        "issues_found": len(records),
+        "details": details,
+        "records": records,
+    }
+
+
+# ---------------------------------------------------------------------------
+# STAT-01 — Status / Delinquency Match
+# Loan Status and Delinquency Status reported this cycle should match SOUP's
+# last recorded status for that loan. All mismatches are flagged equally.
+# ---------------------------------------------------------------------------
+
+def status_match_check(servicer_inputs_df, soup_servicer_df):
+    records = []
+
+    required = {"SBA GP Number", "Loan Status", "Delinquency Status"}
+    if not required.issubset(servicer_inputs_df.columns) or not required.issubset(soup_servicer_df.columns):
+        return _result("STAT-01", "Status / Delinquency Match", "SBA Reconciliation", "WARN", records,
+                        lambda n: "")
+
+    si = servicer_inputs_df.copy()
+    si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
+    sort_col = "Payment Receipt Date" if "Payment Receipt Date" in si.columns else None
+    si_last = (si.sort_values(sort_col) if sort_col else si).groupby("SBA GP Number").tail(1)
+
+    soup = soup_servicer_df.copy()
+    soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
+    sort_month = "Payment Month" if "Payment Month" in soup.columns else None
+    soup_latest = (soup.sort_values(["SBA GP Number", sort_month]) if sort_month else soup).groupby("SBA GP Number").tail(1)
+    soup_latest = soup_latest.set_index("SBA GP Number")
+
+    for _, row in si_last.iterrows():
+        gp = row["SBA GP Number"]
+        if gp not in soup_latest.index:
+            continue
+        srf_status = str(row.get("Loan Status", "")).strip()
+        srf_dq = str(row.get("Delinquency Status", "")).strip()
+        soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip()
+        soup_dq = str(soup_latest.loc[gp].get("Delinquency Status", "")).strip()
+
+        status_match = srf_status.lower() == soup_status.lower()
+        dq_match = srf_dq.lower() == soup_dq.lower()
+
+        if status_match and dq_match:
+            continue
+        records.append({
+            "SBA GP Number": gp,
+            "Servicer Loan Status": srf_status,
+            "SOUP Loan Status": soup_status,
+            "Loan Status Match": "YES" if status_match else "NO",
+            "Servicer DQ Status": srf_dq,
+            "SOUP DQ Status": soup_dq,
+            "DQ Status Match": "YES" if dq_match else "NO",
+        })
+
+    return _result(
+        "STAT-01", "Status / Delinquency Match", "SBA Reconciliation", "WARN", records,
+        lambda n: f"{n} loan(s) where Loan Status or Delinquency Status reported this cycle "
+                  f"doesn't match SOUP's last recorded status.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# DUP-01 — Duplicate Postings
+# Informational: a loan with more than one row in Servicer Inputs this cycle.
+# ---------------------------------------------------------------------------
+
+def _fmt_date(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return ""
+        return ts.strftime("%m/%d/%Y")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def duplicate_postings_check(servicer_inputs_df):
+    records = []
+
+    if "SBA GP Number" not in servicer_inputs_df.columns:
+        return {
+            "id": "DUP-01", "name": "Duplicate Postings", "category": "SBA Reconciliation",
+            "severity": "INFO", "status": "PASS", "issues_found": 0,
+            "details": "No issues found.", "records": [],
+        }
+
+    si = servicer_inputs_df.copy()
+    si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
+    dup_mask = si.duplicated("SBA GP Number", keep=False)
+    dup_rows = si[dup_mask].sort_values("SBA GP Number")
+
+    for _, row in dup_rows.iterrows():
+        records.append({
+            "SBA GP Number": row.get("SBA GP Number"),
+            "Lender Loan Number": row.get("Lender Loan Number", ""),
+            "Beginning Balance": row.get("Beginning Balance", ""),
+            "Ending Balance": row.get("Ending Balance", ""),
+            "Payment Received": row.get("Payment Received", ""),
+            "Payment Receipt Date": _fmt_date(row.get("Payment Receipt Date", "")),
+        })
+
+    issues = len(records)
+    details = (
+        "No issues found." if not records else
+        f"{issues} row(s) reflecting loans with more than one payment posted this cycle "
+        f"— informational only, not an error."
+    )
+
+    return {
+        "id": "DUP-01",
+        "name": "Duplicate Postings",
+        "category": "SBA Reconciliation",
+        "severity": "INFO",
+        "status": "PASS" if not records else "INFO",
+        "issues_found": issues,
+        "details": details,
+        "records": records,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PAY-01 — Missing Payment Periods
+# For each loan still on the servicer's active population, looks at its full
+# monthly reporting history in SOUP and flags:
+#   - interior gaps: a month skipped in the middle of the loan's history
+#   - stopped reporting: the loan hasn't shown up in SOUP for the most
+#     recent month(s) even though it's still listed as active
+# ---------------------------------------------------------------------------
+
+def missing_payment_periods_check(soup_servicer_df, loan_terms_df):
+    records = []
+
+    if "SBA GP Number" not in soup_servicer_df.columns or "Payment Month" not in soup_servicer_df.columns:
+        return _result("PAY-01", "Missing Payment Periods", "SBA Reconciliation", "FAIL", records,
+                        lambda n: "")
+
+    soup = soup_servicer_df.copy()
+    soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
+    soup["Payment Month"] = pd.to_datetime(soup["Payment Month"], errors="coerce")
+    soup = soup.dropna(subset=["Payment Month"])
+
+    if soup.empty:
+        return _result("PAY-01", "Missing Payment Periods", "SBA Reconciliation", "FAIL", records,
+                        lambda n: "")
+
+    servicer_latest_month = soup["Payment Month"].max()
+
+    active_ids = None
+    if loan_terms_df is not None and "SBA GP Number" in loan_terms_df.columns and not loan_terms_df.empty:
+        active_ids = set(_norm_id(loan_terms_df["SBA GP Number"]).dropna())
+
+    for gp, group in soup.groupby("SBA GP Number"):
+        if active_ids is not None and gp not in active_ids:
+            continue  # loan isn't on the current active population — gaps after payoff are expected
+
+        months = sorted(group["Payment Month"].unique())
+        if len(months) < 2:
+            continue
+
+        first, last = months[0], months[-1]
+        expected = pd.date_range(first, last, freq="MS")
+        actual = set(months)
+        missing = [m for m in expected if m not in actual]
+
+        stopped_reporting = last < servicer_latest_month
+
+        if not missing and not stopped_reporting:
+            continue
+
+        records.append({
+            "SBA GP Number": gp,
+            "First Reported Month": first.strftime("%m/%Y"),
+            "Last Reported Month": last.strftime("%m/%Y"),
+            "Interior Gap Month(s)": ", ".join(m.strftime("%m/%Y") for m in missing) if missing else "None",
+            "Stopped Reporting": "YES" if stopped_reporting else "NO",
+            "Most Recent Servicer Month": servicer_latest_month.strftime("%m/%Y"),
+        })
+
+    records.sort(key=lambda r: (r["Stopped Reporting"] != "YES", r["Interior Gap Month(s)"] == "None"))
+
+    stopped_count = sum(1 for r in records if r["Stopped Reporting"] == "YES")
+    gap_count = sum(1 for r in records if r["Interior Gap Month(s)"] != "None")
+
+    details = "No issues found." if not records else (
+        f"{stopped_count} loan(s) stopped reporting before the most recent month "
+        f"({servicer_latest_month.strftime('%m/%Y')}) despite still being active; "
+        f"{gap_count} loan(s) have a skipped month somewhere in their reporting history."
+    )
+
+    return {
+        "id": "PAY-01",
+        "name": "Missing Payment Periods",
+        "category": "SBA Reconciliation",
+        "severity": "FAIL",
+        "status": "PASS" if not records else "FAIL",
+        "issues_found": len(records),
+        "details": details,
+        "records": records,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PAY-02 — Payment Shortfall Check
+# Compares what the servicer actually remitted (Payment Received + Servicing
+# Fee, summed across any multiple postings this cycle) against the
+# Scheduled Payment for that loan. Most loans will show Payment Received a
+# bit below Scheduled Payment simply because the servicing fee is netted out
+# before remittance — that's expected and NOT flagged. Only genuine
+# shortfalls (or overages) beyond the fee-adjusted amount are surfaced.
+#
+# Note: this check depends on Scheduled Payment and Servicing Fee columns
+# being present in the servicer's file — not every servicer template may
+# include Servicing Fee, so this check can be safely disabled if it doesn't
+# apply to a particular servicer's reporting format.
+# ---------------------------------------------------------------------------
+
+SHORTFALL_TOLERANCE = 1.00  # dollars
+
+# Loans in a terminal status shouldn't be compared against their normal
+# monthly Scheduled Payment — a payoff, liquidation, or charge-off amount is
+# expected to look nothing like a scheduled payment and isn't a real shortfall.
+_TERMINAL_STATUS_KEYWORDS = ("PAID", "PIF", "LIQUIDAT", "FORECLOS", "CHARGE", "REO", "CANCEL", "WITHDRAWN")
+
+
+def payment_shortfall_check(servicer_inputs_df):
+    records = []
+
+    required = {"SBA GP Number", "Scheduled Payment", "Payment Received"}
+    if not required.issubset(servicer_inputs_df.columns):
+        return {
+            "id": "PAY-02", "name": "Payment Shortfall Check", "category": "SBA Reconciliation",
+            "severity": "FAIL", "status": "PASS", "issues_found": 0,
+            "details": "No issues found.", "records": [],
+        }
+
+    si = servicer_inputs_df.copy()
+
+    if "Loan Status" in si.columns:
+        status_upper = si["Loan Status"].astype("string").str.upper().fillna("")
+        is_terminal = status_upper.apply(lambda s: any(k in s for k in _TERMINAL_STATUS_KEYWORDS))
+        si = si[~is_terminal]
+
+    si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
+    si["Scheduled Payment"] = pd.to_numeric(si["Scheduled Payment"], errors="coerce")
+    si["Payment Received"] = pd.to_numeric(si["Payment Received"], errors="coerce")
+    has_fee = "Servicing Fee" in si.columns
+    si["Servicing Fee"] = pd.to_numeric(si["Servicing Fee"], errors="coerce").fillna(0) if has_fee else 0
+
+    # sum Payment Received + Servicing Fee across any multiple postings this
+    # cycle, but take Scheduled Payment as the max seen for the loan (it
+    # should be identical across duplicate rows for the same loan/cycle)
+    grouped = si.groupby("SBA GP Number").agg(
+        scheduled=("Scheduled Payment", "max"),
+        received=("Payment Received", "sum"),
+        fee=("Servicing Fee", "sum"),
+        lender_loan=("Lender Loan Number", "first"),
+    ).reset_index()
+
+    grouped["net_remitted"] = grouped["received"] + grouped["fee"]
+    grouped["shortfall"] = (grouped["scheduled"] - grouped["net_remitted"]).round(2)
+
+    for _, row in grouped.iterrows():
+        if pd.isna(row["shortfall"]) or abs(row["shortfall"]) <= SHORTFALL_TOLERANCE:
+            continue
+        records.append({
+            "SBA GP Number": row["SBA GP Number"],
+            "Lender Loan Number": row["lender_loan"],
+            "Scheduled Payment": round(float(row["scheduled"]), 2) if pd.notna(row["scheduled"]) else "",
+            "Payment Received": round(float(row["received"]), 2),
+            "Servicing Fee": round(float(row["fee"]), 2) if has_fee else "N/A",
+            "Shortfall (Scheduled - Received - Fee)": row["shortfall"],
+            "Direction": "Underpaid" if row["shortfall"] > 0 else "Overpaid",
+        })
+
+    records.sort(key=lambda r: -abs(r["Shortfall (Scheduled - Received - Fee)"]))
+
+    details = "No issues found." if not records else (
+        f"{len(records)} loan(s) where the amount remitted (payment received plus servicing fee) "
+        f"doesn't match the scheduled payment by more than ${SHORTFALL_TOLERANCE:.2f} — after "
+        f"accounting for the servicing fee that's normally netted out. Paid-off, liquidated, and "
+        f"other terminal-status loans are excluded since their payoff amount isn't comparable to "
+        f"a scheduled monthly payment."
+    )
+
+    return {
+        "id": "PAY-02",
+        "name": "Payment Shortfall Check",
+        "category": "SBA Reconciliation",
+        "severity": "FAIL",
+        "status": "PASS" if not records else "FAIL",
+        "issues_found": len(records),
+        "details": details,
+        "records": records,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Runner — one servicer file against SOUP at a time
+# ---------------------------------------------------------------------------
+
+ALL_CHECKS_META = [
+    ("POP-01", "Population Check"),
+    ("BAL-01", "Balance Continuity"),
+    ("STAT-01", "Status / Delinquency Match"),
+    ("PAY-01", "Missing Payment Periods"),
+    ("PAY-02", "Payment Shortfall Check"),
+    ("DUP-01", "Duplicate Postings"),
+]
+
+
+def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df, soup_servicer_df):
+    """Runs all checks for a single servicer file against its SOUP history."""
+    results = [
+        population_check(loan_terms_df, soup_servicer_df, servicer_name),
+        balance_continuity_check(servicer_inputs_df, soup_servicer_df),
+        status_match_check(servicer_inputs_df, soup_servicer_df),
+        missing_payment_periods_check(soup_servicer_df, loan_terms_df),
+        payment_shortfall_check(servicer_inputs_df),
+        duplicate_postings_check(servicer_inputs_df),
+    ]
+    # tag every result with which servicer it belongs to, so multi-servicer
+    # runs can be told apart in the combined results list
+    for r in results:
+        r["servicer"] = servicer_name
+        r["id"] = f"{r['id']}::{servicer_name}"
+
+    return results
+
+
+def summarize(all_results, soup_len, servicer_loan_counts):
+    total_issues = sum(r["issues_found"] for r in all_results)
+    checks_passed = sum(1 for r in all_results if r["status"] == "PASS")
+    checks_flagged = sum(1 for r in all_results if r["status"] in ("WARN", "FAIL"))
+    checks_informational = sum(1 for r in all_results if r["status"] == "INFO")
+    total_servicer_records = sum(servicer_loan_counts.values())
+
+    return {
+        "total_records": int(soup_len + total_servicer_records),
+        "soup_records": int(soup_len),
+        "servicer_records": int(total_servicer_records),
+        # exact per-servicer counts (this cycle's Servicer Inputs row count),
+        # so the chatbot can answer "how many records for X" precisely
+        # instead of estimating from a truncated CSV sample.
+        "servicer_record_counts": {k: int(v) for k, v in servicer_loan_counts.items()},
+        "servicers_processed": list(servicer_loan_counts.keys()),
+        "total_issues": int(total_issues),
+        "checks_passed": int(checks_passed),
+        "checks_flagged": int(checks_flagged),
+        "checks_informational": int(checks_informational),
+        "total_checks": len(all_results),
+    }
