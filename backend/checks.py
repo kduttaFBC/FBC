@@ -303,7 +303,12 @@ def missing_payment_periods_check(soup_servicer_df, loan_terms_df):
 
     active_ids = None
     if loan_terms_df is not None and "SBA GP Number" in loan_terms_df.columns and not loan_terms_df.empty:
-        active_ids = set(_norm_id(loan_terms_df["SBA GP Number"]).dropna())
+        lt = loan_terms_df.copy()
+        if "Loan Status" in lt.columns:
+            status_upper = lt["Loan Status"].astype("string").str.upper().fillna("")
+            is_terminal = status_upper.apply(lambda s: any(k in s for k in _TERMINAL_STATUS_KEYWORDS))
+            lt = lt[~is_terminal]
+        active_ids = set(_norm_id(lt["SBA GP Number"]).dropna())
 
     for gp, group in soup.groupby("SBA GP Number"):
         if active_ids is not None and gp not in active_ids:
@@ -402,11 +407,13 @@ def payment_shortfall_check(servicer_inputs_df):
     has_fee = "Servicing Fee" in si.columns
     si["Servicing Fee"] = pd.to_numeric(si["Servicing Fee"], errors="coerce").fillna(0) if has_fee else 0
 
-    # sum Payment Received + Servicing Fee across any multiple postings this
-    # cycle, but take Scheduled Payment as the max seen for the loan (it
-    # should be identical across duplicate rows for the same loan/cycle)
+    # sum Scheduled Payment, Payment Received, and Servicing Fee across any
+    # multiple postings this cycle — a loan with two postings usually means
+    # two separate payment periods being caught up (see Interest-From/To),
+    # so all three figures need to be summed together, not just the actual
+    # payment figures against a single scheduled amount.
     grouped = si.groupby("SBA GP Number").agg(
-        scheduled=("Scheduled Payment", "max"),
+        scheduled=("Scheduled Payment", "sum"),
         received=("Payment Received", "sum"),
         fee=("Servicing Fee", "sum"),
         lender_loan=("Lender Loan Number", "first"),
