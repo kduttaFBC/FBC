@@ -1,18 +1,20 @@
 services:
   - type: web
-    name: falconbridge-backend
+    name: falconbridge-realdata-backend
     runtime: python
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
-
   - type: web
-    name: falconbridge-frontend
+    name: falconbridge-realdata-frontend
     runtime: static
     buildCommand: cd frontend && npm install && npm run build
     staticPublishPath: frontend/dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://falconbridge-realdata-backend.onrender.com
     routes:
       - type: rewrite
         source: /*
