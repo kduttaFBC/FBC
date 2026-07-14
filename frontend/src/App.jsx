@@ -28,10 +28,10 @@ export const SERVICER_FIELDS = [
 export const SERVICER_SLOTS = [
   'Poppy Bank',
   'Millennium Bank',
-  'Servicer File 3',
-  'Servicer File 4',
-  'Servicer File 5',
-  'Servicer File 6',
+  'Mission Valley Bank',
+  'Peoples Bank',
+  'Lendistry',
+  'Community Bank and Trust',
   'Servicer File 7',
   'Servicer File 8',
 ]
