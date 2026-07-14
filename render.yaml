@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: falconbridge-realdata-backend
+    name: falconbridge-audit-backend
     runtime: python
     plan: free
     buildCommand: pip install -r backend/requirements.txt
@@ -9,13 +9,13 @@ services:
       - key: ANTHROPIC_API_KEY
         sync: false
   - type: web
-    name: falconbridge-realdata-frontend
+    name: falconbridge-audit-frontend
     runtime: static
     buildCommand: cd frontend && npm install && npm run build
     staticPublishPath: frontend/dist
     envVars:
       - key: VITE_API_URL
-        value: https://falconbridge-realdata-backend.onrender.com
+        value: https://falconbridge-audit-backend.onrender.com
     routes:
       - type: rewrite
         source: /*
