@@ -116,6 +116,8 @@ def read_soup_file(file_bytes):
     if best["matches"] < len(SOUP_FIELDS) // 2:
         raise ValueError("Could not find the expected SOUP columns in this file.")
     df = _rows_to_df(rows_cache[best["sheet_name"]], best["row_idx"])
+    rows_cache.clear()  # free the raw parsed rows now that the DataFrame exists
+    del wb
     if "SBA GP Number" in df.columns:
         df["SBA GP Number"] = normalize_id_series(df["SBA GP Number"])
     return df
@@ -141,6 +143,9 @@ def read_servicer_file(file_bytes):
     # servicer name — look for the "► Servicer:" label near the top of
     # Servicer Inputs and take the cell to its right
     servicer_name = _find_servicer_name(rows_cache[si_best["sheet_name"]])
+
+    rows_cache.clear()  # free the raw parsed rows now that the DataFrames exist
+    del wb
 
     for df in (servicer_inputs_df, loan_terms_df):
         if "SBA GP Number" in df.columns:

@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 import base64
+import gc
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -99,6 +100,8 @@ async def audit(
             return JSONResponse(status_code=400, content={
                 "error": f"Could not read the SOUP Performance Dataset: {exc}",
             })
+        del soup_bytes
+        gc.collect()
 
         all_results = []
         servicer_loan_counts = {}
@@ -112,6 +115,8 @@ async def audit(
                 return JSONResponse(status_code=400, content={
                     "error": f"Could not read servicer file '{uploaded.filename}': {exc}",
                 })
+            del file_bytes
+            gc.collect()
 
             soup_servicer_df = file_readers.filter_soup_by_servicer(soup_df, servicer_name)
 
