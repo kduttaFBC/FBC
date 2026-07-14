@@ -34,6 +34,7 @@ def _build_system_prompt(audit_context):
     summary = audit_context.get("summary", {})
     results = audit_context.get("results", [])
     soup_csv = audit_context.get("soup_csv", "")
+    flagged_loan_history_csv = audit_context.get("flagged_loan_history_csv", "")
     servicer_csvs = audit_context.get("servicer_csvs", {})
 
     servicer_csv_block = "\n\n".join(
@@ -55,11 +56,19 @@ def _build_system_prompt(audit_context):
         "summary.servicer_record_counts and summary.soup_records — never estimate by "
         "counting rows in the CSV samples below, since those are truncated and will "
         "give a wrong answer.\n\n"
+        "IMPORTANT: for questions about a specific loan's payment history over time "
+        "(multiple months, trends, when a status changed, etc.), use the "
+        "'FLAGGED LOAN FULL PAYMENT HISTORY' section below — it contains every month's "
+        "SOUP record for every loan that appeared in this audit's flagged results. The "
+        "generic SOUP sample further below is just a small snapshot of the whole file and "
+        "will NOT reliably contain a specific loan's full history.\n\n"
         "=== AUDIT SUMMARY (JSON) ===\n"
         f"{json.dumps(summary, indent=2)}\n\n"
         "=== AUDIT RESULTS (JSON) ===\n"
         f"{json.dumps(results, indent=2, default=str)}\n\n"
-        "=== SOUP PERFORMANCE DATASET SAMPLE (CSV, truncated) ===\n"
+        "=== FLAGGED LOAN FULL PAYMENT HISTORY (CSV, every month, every flagged loan) ===\n"
+        f"{flagged_loan_history_csv}\n\n"
+        "=== SOUP PERFORMANCE DATASET SAMPLE (CSV, small generic snapshot, truncated) ===\n"
         f"{soup_csv}\n\n"
         "=== SERVICER FILE SAMPLES (CSV, truncated) ===\n"
         f"{servicer_csv_block}\n"
