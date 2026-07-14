@@ -43,10 +43,25 @@ REPORTS_DIR = "/tmp/reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
-def _truncate_csv(df, rows: int = 300) -> str:
+SOUP_CHAT_COLUMNS = [
+    "SBA GP Number", "Servicer", "Payment Month", "Loan Status",
+    "Delinquency Status", "Beginning Actual Balance", "Ending Actual Balance",
+]
+SERVICER_CHAT_COLUMNS = [
+    "SBA GP Number", "Lender Loan Number", "Loan Status", "Delinquency Status",
+    "Beginning Balance", "Ending Balance", "Payment Received",
+    "Scheduled Payment", "Servicing Fee", "Payment Receipt Date",
+]
+
+
+def _truncate_csv(df, rows: int = 50, columns: list | None = None) -> str:
     if df is None or df.empty:
         return ""
     sample = df.head(rows).copy()
+    if columns:
+        keep = [c for c in columns if c in sample.columns]
+        if keep:
+            sample = sample[keep]
     for col in sample.columns:
         if str(sample[col].dtype).startswith("datetime"):
             sample[col] = sample[col].astype("string")
@@ -105,7 +120,7 @@ async def audit(
             )
             all_results.extend(results)
             servicer_loan_counts[servicer_name] = len(servicer_inputs_df)
-            servicer_csvs[servicer_name] = _truncate_csv(servicer_inputs_df)
+            servicer_csvs[servicer_name] = _truncate_csv(servicer_inputs_df, columns=SERVICER_CHAT_COLUMNS)
 
         summary = checks_mod.summarize(all_results, len(soup_df), servicer_loan_counts)
 
@@ -116,7 +131,7 @@ async def audit(
         chat_context = {
             "summary": summary,
             "results": all_results,
-            "soup_csv": _truncate_csv(soup_df),
+            "soup_csv": _truncate_csv(soup_df, columns=SOUP_CHAT_COLUMNS),
             "servicer_csvs": servicer_csvs,
         }
 
