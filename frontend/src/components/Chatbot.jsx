@@ -19,7 +19,7 @@ function buildOpeningMessage(summary, results) {
   return `Audit complete. I found ${issues} issue(s) across ${checksWithIssues} check(s).${summaryLine} What would you like to explore?`
 }
 
-export default function Chatbot({ auditContext, summary, results }) {
+export default function Chatbot({ auditContext, summary, results, sessionId }) {
   const [messages, setMessages] = useState(() => [
     { role: 'assistant', content: buildOpeningMessage(summary, results) },
   ])
@@ -48,6 +48,7 @@ export default function Chatbot({ auditContext, summary, results }) {
         message: text,
         history,
         audit_context: auditContext,
+        session_id: sessionId,
       })
       setMessages((m) => [...m, {
         role: 'assistant',

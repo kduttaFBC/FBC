@@ -10,9 +10,63 @@ import os
 import json
 
 import anthropic
+import pandas as pd
 
 MODEL = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 1024
+MAX_TOKENS = 1536
+MAX_TOOL_ROUNDS = 3
+
+LOOKUP_TOOL = {
+    "name": "lookup_loan_history",
+    "description": (
+        "Looks up the full monthly payment/status history for ANY SBA GP Number "
+        "directly from the complete SOUP Performance Dataset for this audit session — "
+        "whether or not that loan was flagged by any check, and regardless of which "
+        "servicer it belongs to. Use this whenever asked about a specific loan that "
+        "isn't already covered in the pre-loaded flagged-loan history."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sba_gp_number": {
+                "type": "string",
+                "description": "The SBA GP Number to look up, e.g. '2599617005'.",
+            }
+        },
+        "required": ["sba_gp_number"],
+    },
+}
+
+SOUP_LOOKUP_COLUMNS = [
+    "SBA GP Number", "Servicer", "Payment Month", "Loan Status",
+    "Delinquency Status", "Beginning Actual Balance", "Ending Actual Balance",
+]
+
+
+def _lookup_loan_history(soup_df, sba_gp_number):
+    """Returns a CSV string of every SOUP row for the given account, or a
+    clear not-found message — never silently returns nothing."""
+    if soup_df is None:
+        return "No live SOUP dataset is available for this session (it may have expired — try re-running the audit)."
+
+    gp = str(sba_gp_number).strip()
+    ids = soup_df["SBA GP Number"].astype("string").str.strip()
+    mask = ids == gp
+    matched = soup_df[mask]
+
+    if matched.empty:
+        return f"No records found for SBA GP Number '{gp}' in the SOUP Performance Dataset. Double-check the account number."
+
+    matched = matched.copy()
+    if "Payment Month" in matched.columns:
+        matched = matched.sort_values("Payment Month")
+    keep = [c for c in SOUP_LOOKUP_COLUMNS if c in matched.columns]
+    if keep:
+        matched = matched[keep]
+    for col in matched.columns:
+        if str(matched[col].dtype).startswith("datetime"):
+            matched[col] = matched[col].astype("string")
+    return matched.to_csv(index=False)
 
 _client = None
 
@@ -57,11 +111,15 @@ def _build_system_prompt(audit_context):
         "counting rows in the CSV samples below, since those are truncated and will "
         "give a wrong answer.\n\n"
         "IMPORTANT: for questions about a specific loan's payment history over time "
-        "(multiple months, trends, when a status changed, etc.), use the "
-        "'FLAGGED LOAN FULL PAYMENT HISTORY' section below — it contains every month's "
-        "SOUP record for every loan that appeared in this audit's flagged results. The "
-        "generic SOUP sample further below is just a small snapshot of the whole file and "
-        "will NOT reliably contain a specific loan's full history.\n\n"
+        "(multiple months, trends, when a status changed, etc.), first check the "
+        "'FLAGGED LOAN FULL PAYMENT HISTORY' section below — it already contains every "
+        "month's SOUP record for every loan that appeared in this audit's flagged results. "
+        "If the loan you need is NOT in that section (e.g. it wasn't flagged, or belongs to "
+        "a servicer that wasn't part of this audit run), use the lookup_loan_history tool "
+        "to query the complete SOUP Performance Dataset directly for that account — this "
+        "works for ANY SBA GP Number, flagged or not. Only report a loan as 'not found' "
+        "after actually calling the tool and getting a not-found result back — never assume "
+        "a loan doesn't exist just because it's missing from the pre-loaded section.\n\n"
         "=== AUDIT SUMMARY (JSON) ===\n"
         f"{json.dumps(summary, indent=2)}\n\n"
         "=== AUDIT RESULTS (JSON) ===\n"
@@ -75,11 +133,14 @@ def _build_system_prompt(audit_context):
     )
 
 
-def chat(message, history, audit_context):
+def chat(message, history, audit_context, soup_df=None):
     """
     message: the new user message (str)
     history: list of {"role": "user"|"assistant", "content": str}
     audit_context: dict with summary, results, and truncated CSV samples
+    soup_df: the full SOUP DataFrame for this session, if still cached
+             server-side — enables the lookup_loan_history tool for ANY
+             account, not just pre-loaded flagged loans.
     Returns the assistant reply (str).
     """
     system_prompt = _build_system_prompt(audit_context or {})
@@ -93,11 +154,37 @@ def chat(message, history, audit_context):
     messages.append({"role": "user", "content": message})
 
     client = _get_client()
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        messages=messages,
-    )
+    tools = [LOOKUP_TOOL] if soup_df is not None else []
 
-    return "".join(block.text for block in response.content if block.type == "text")
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=system_prompt,
+            messages=messages,
+            tools=tools,
+        )
+
+        if response.stop_reason != "tool_use":
+            return "".join(block.text for block in response.content if block.type == "text")
+
+        # Claude wants to call a tool — execute it and feed the result back
+        messages.append({"role": "assistant", "content": response.content})
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            if block.name == "lookup_loan_history":
+                gp = block.input.get("sba_gp_number", "")
+                result_text = _lookup_loan_history(soup_df, gp)
+            else:
+                result_text = f"Unknown tool: {block.name}"
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_text,
+            })
+        messages.append({"role": "user", "content": tool_results})
+
+    # Fallback if it somehow keeps calling tools past the round limit
+    return "I looked into this but couldn't finish putting together an answer. Please try rephrasing your question."

@@ -13,6 +13,7 @@ import time
 import traceback
 import base64
 import gc
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,6 +44,19 @@ app.add_middleware(
 REPORTS_DIR = "/tmp/reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
+# Holds the full SOUP dataset per audit session so the chatbot can look up
+# ANY account on demand (flagged or not), not just whatever was pre-loaded
+# into the chat context. Sessions expire after SESSION_TTL_SECONDS.
+SESSION_CACHE = {}
+SESSION_TTL_SECONDS = 3600
+
+
+def _cleanup_old_sessions():
+    now = time.time()
+    expired = [sid for sid, entry in SESSION_CACHE.items() if now - entry["created"] > SESSION_TTL_SECONDS]
+    for sid in expired:
+        del SESSION_CACHE[sid]
+
 
 def _flagged_gp_numbers(all_results):
     """Collects every SBA GP Number that appears in any check's flagged
@@ -56,7 +70,7 @@ def _flagged_gp_numbers(all_results):
     return gp_numbers
 
 
-def _flagged_loan_history_csv(soup_df, gp_numbers, columns=None, max_rows=400):
+def _flagged_loan_history_csv(soup_df, gp_numbers, columns=None, max_rows=2500):
     """Builds a CSV of SOUP's full monthly history (every Payment Month row)
     for every flagged loan — not a flat sample of the whole file, which would
     almost never happen to include a specific loan's full history. This is
@@ -181,12 +195,17 @@ async def audit(
             "servicer_csvs": servicer_csvs,
         }
 
+        session_id = str(uuid.uuid4())
+        _cleanup_old_sessions()
+        SESSION_CACHE[session_id] = {"soup_df": soup_df, "created": time.time()}
+
         return JSONResponse({
             "results": all_results,
             "summary": summary,
             "report_b64": excel_b64,
             "report_filename": report_mod.report_filename(),
             "chat_context": chat_context,
+            "session_id": session_id,
         })
 
     except Exception as exc:
@@ -288,9 +307,14 @@ async def chat(payload: dict):
         message = payload.get("message", "")
         history = payload.get("history", [])
         audit_context = payload.get("audit_context", {})
+        session_id = payload.get("session_id")
         if not message.strip():
             return JSONResponse(status_code=400, content={"error": "Empty message."})
-        reply = chatbot_mod.chat(message, history, audit_context)
+
+        session_entry = SESSION_CACHE.get(session_id) if session_id else None
+        soup_df = session_entry["soup_df"] if session_entry else None
+
+        reply = chatbot_mod.chat(message, history, audit_context, soup_df=soup_df)
 
         tables = _parse_markdown_tables(reply)
         excel_b64, excel_filename = _markdown_tables_to_excel_b64(tables)
