@@ -215,11 +215,23 @@ def _missed_count_to_status(missed_count):
 
 def _apply_payment_transition(prior_missed_count, payment_received, scheduled_payment):
     """Returns the new missed-payment count after this cycle's payment."""
-    if scheduled_payment is None or pd.isna(scheduled_payment) or scheduled_payment == 0:
-        return prior_missed_count
     if payment_received is None or pd.isna(payment_received):
         payment_received = 0
-    multiple = round(float(payment_received) / float(scheduled_payment))
+    received = float(payment_received)
+
+    # a $0 payment is always a miss, regardless of what the Scheduled
+    # Payment field says — some servicer submissions zero out BOTH fields
+    # together for a no-payment month, which shouldn't be mistaken for
+    # "no scheduled amount exists" and silently skipped
+    if received <= 0:
+        return prior_missed_count + 1
+
+    if scheduled_payment is None or pd.isna(scheduled_payment) or scheduled_payment == 0:
+        # can't compute a ratio without a valid scheduled amount to divide
+        # by — hold steady rather than risk a divide-by-zero
+        return prior_missed_count
+
+    multiple = round(received / float(scheduled_payment))
     if multiple <= 0:
         return prior_missed_count + 1
     if multiple == 1:
