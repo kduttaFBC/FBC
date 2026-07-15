@@ -159,9 +159,73 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
 
 # ---------------------------------------------------------------------------
 # STAT-01 — Status / Delinquency Match
-# Loan Status and Delinquency Status reported this cycle should match SOUP's
-# last recorded status for that loan. All mismatches are flagged equally.
+# Loan Status reported this cycle should match SOUP's last recorded Loan
+# Status for that loan (simple string comparison, unchanged).
+#
+# Delinquency Status is handled differently: rather than a straight string
+# comparison against SOUP's last DQ status, this independently CALCULATES
+# what the DQ status should be based on missed-payment math, using SOUP's
+# last recorded status as the starting point and this cycle's Payment
+# Received vs. Scheduled Payment to determine the transition:
+#
+#   multiple = round(Payment Received / Scheduled Payment)
+#     multiple == 0  -> missed_count + 1   (status moves DOWN one rank)
+#     multiple == 1  -> missed_count unchanged (status stays the SAME rank)
+#     multiple >= 2  -> missed_count - (multiple - 1), floored at 0
+#                       (status moves UP one rank per full extra payment)
+#
+# Status ladder (uncapped upward in missed_count):
+#   0 missed = CURRENT, 1 = DELINQUENT, 2 = 30 DAYS, 3 = 60 DAYS,
+#   4 = 90 DAYS, 5 = 120 DAYS, 6 = 150 DAYS, 7 = 180 DAYS, ... (+30/miss)
+#
+# NOTE: partial payments (0 < received < 1x scheduled) are currently treated
+# the same as a full regular payment (multiple rounds to 1, status holds
+# steady) per client direction — this is a placeholder pending refinement
+# on how aggressively partials should round down to a "miss" instead.
 # ---------------------------------------------------------------------------
+
+def _status_to_missed_count(status_str):
+    """Parses a Delinquency Status label into a missed-payment count."""
+    s = str(status_str).strip().upper()
+    if not s or s in ("NAN", "NONE"):
+        return None
+    if s == "CURRENT":
+        return 0
+    if s == "DELINQUENT":
+        return 1
+    # e.g. "30 DAYS", "120 DAYS ", "150+ DAYS"
+    digits = "".join(ch for ch in s.split("DAY")[0] if ch.isdigit())
+    if not digits:
+        return None
+    days = int(digits)
+    if days <= 0:
+        return 0
+    return (days // 30) + 1
+
+
+def _missed_count_to_status(missed_count):
+    """Maps a missed-payment count back to a Delinquency Status label."""
+    if missed_count <= 0:
+        return "CURRENT"
+    if missed_count == 1:
+        return "DELINQUENT"
+    days = (missed_count - 1) * 30
+    return f"{days} DAYS"
+
+
+def _apply_payment_transition(prior_missed_count, payment_received, scheduled_payment):
+    """Returns the new missed-payment count after this cycle's payment."""
+    if scheduled_payment is None or pd.isna(scheduled_payment) or scheduled_payment == 0:
+        return prior_missed_count
+    if payment_received is None or pd.isna(payment_received):
+        payment_received = 0
+    multiple = round(float(payment_received) / float(scheduled_payment))
+    if multiple <= 0:
+        return prior_missed_count + 1
+    if multiple == 1:
+        return prior_missed_count
+    return max(0, prior_missed_count - (multiple - 1))
+
 
 def status_match_check(servicer_inputs_df, soup_servicer_df):
     records = []
@@ -173,8 +237,21 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
 
     si = servicer_inputs_df.copy()
     si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
-    sort_col = "Payment Receipt Date" if "Payment Receipt Date" in si.columns else None
-    si_last = (si.sort_values(sort_col) if sort_col else si).groupby("SBA GP Number").tail(1)
+    has_payment_cols = {"Scheduled Payment", "Payment Received"}.issubset(si.columns)
+    if has_payment_cols:
+        si["Scheduled Payment"] = pd.to_numeric(si["Scheduled Payment"], errors="coerce")
+        si["Payment Received"] = pd.to_numeric(si["Payment Received"], errors="coerce")
+
+    # combine multiple postings this cycle into one period per loan: last
+    # Loan Status/Delinquency Status reported, and payment figures summed
+    agg_dict = {
+        "loan_status": ("Loan Status", "last"),
+        "dq_status": ("Delinquency Status", "last"),
+    }
+    if has_payment_cols:
+        agg_dict["scheduled"] = ("Scheduled Payment", "sum")
+        agg_dict["received"] = ("Payment Received", "sum")
+    si_grouped = si.groupby("SBA GP Number").agg(**agg_dict).reset_index()
 
     soup = soup_servicer_df.copy()
     soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
@@ -182,17 +259,29 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
     soup_latest = (soup.sort_values(["SBA GP Number", sort_month]) if sort_month else soup).groupby("SBA GP Number").tail(1)
     soup_latest = soup_latest.set_index("SBA GP Number")
 
-    for _, row in si_last.iterrows():
+    for _, row in si_grouped.iterrows():
         gp = row["SBA GP Number"]
         if gp not in soup_latest.index:
             continue
-        srf_status = str(row.get("Loan Status", "")).strip()
-        srf_dq = str(row.get("Delinquency Status", "")).strip()
+        srf_status = str(row.get("loan_status", "")).strip()
+        srf_dq = str(row.get("dq_status", "")).strip()
         soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip()
-        soup_dq = str(soup_latest.loc[gp].get("Delinquency Status", "")).strip()
+        soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "")
 
         status_match = srf_status.lower() == soup_status.lower()
-        dq_match = srf_dq.lower() == soup_dq.lower()
+
+        # calculate what DQ status should be, based on missed-payment math,
+        # rather than a straight string comparison against SOUP's last DQ
+        prior_missed = _status_to_missed_count(soup_dq_raw) if has_payment_cols else None
+        if has_payment_cols and prior_missed is not None:
+            new_missed = _apply_payment_transition(prior_missed, row.get("received"), row.get("scheduled"))
+            calculated_dq = _missed_count_to_status(new_missed)
+            dq_match = srf_dq.upper() == calculated_dq
+        else:
+            # fall back to the original straight string comparison if
+            # payment columns aren't available or prior status is unparseable
+            calculated_dq = str(soup_dq_raw).strip().upper()
+            dq_match = srf_dq.lower() == calculated_dq.lower()
 
         if status_match and dq_match:
             continue
@@ -202,14 +291,16 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
             "SOUP Loan Status": soup_status,
             "Loan Status Match": "YES" if status_match else "NO",
             "Servicer DQ Status": srf_dq,
-            "SOUP DQ Status": soup_dq,
+            "Calculated DQ Status": calculated_dq,
             "DQ Status Match": "YES" if dq_match else "NO",
         })
 
     return _result(
         "STAT-01", "Status / Delinquency Match", "SBA Reconciliation", "WARN", records,
-        lambda n: f"{n} loan(s) where Loan Status or Delinquency Status reported this cycle "
-                  f"doesn't match SOUP's last recorded status.",
+        lambda n: f"{n} loan(s) where Loan Status doesn't match SOUP's last recorded status, or "
+                  f"where Delinquency Status doesn't match the status calculated from "
+                  f"missed-payment history (Payment Received vs. Scheduled Payment against the "
+                  f"loan's prior recorded status).",
     )
 
 
