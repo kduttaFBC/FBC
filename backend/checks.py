@@ -312,6 +312,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
             "SOUP Loan Status": soup_status,
             "Loan Status Match": "YES" if status_match else "NO",
             "Servicer DQ Status": srf_dq,
+            "SOUP DQ Status": str(soup_dq_raw).strip(),
             "Calculated DQ Status": calculated_dq,
             "DQ Status Match": "YES" if dq_match else "NO",
         })

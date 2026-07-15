@@ -108,13 +108,22 @@ _INVALID_SHEET_CHARS = set('[]:*?/\\')
 
 def _sheet_name_for(result):
     """Excel sheet names cap at 31 chars, can't repeat, and can't contain
-    []:*?/\\ — combine check name + servicer, sanitized and truncated."""
-    base = f"{result['name']} - {result['servicer']}"
+    []:*?/\\ — combine servicer + check name, sanitized and truncated.
+    Servicer goes FIRST so it (and any distinguishing suffix like a year,
+    e.g. "Lendistry 2024" vs "Lendistry 2025") survives truncation — the
+    check name is what gets cut short if the combined string runs long,
+    since it's less critical for telling tabs apart at a glance."""
+    base = f"{result['servicer']} - {result['name']}"
     base = "".join(c for c in base if c not in _INVALID_SHEET_CHARS)
     return base[:31]
 
 
 CHECK_LEGEND = [
+    ("Population Check", "FAIL",
+     "Confirms every loan in the servicer's active population (Loan Terms & Prior Period) "
+     "also appears in SOUP's history for that servicer, and vice versa. A loan in SOUP's "
+     "history but missing from the active list is often just a paid-off or liquidated loan — "
+     "but a large or unexplained gap is worth a closer look."),
     ("Balance Continuity", "FAIL / INFO",
      "Confirms this cycle's reported Beginning Balance ties to SOUP's most recently recorded "
      "Ending Balance for that loan. Loans with more than one payment posted this cycle are "
