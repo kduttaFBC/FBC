@@ -243,13 +243,22 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
         si["Payment Received"] = pd.to_numeric(si["Payment Received"], errors="coerce")
 
     # combine multiple postings this cycle into one period per loan: last
-    # Loan Status/Delinquency Status reported, and payment figures summed
+    # Loan Status/Delinquency Status reported. Payment Received is summed
+    # (it genuinely represents total cash received this cycle), but
+    # Scheduled Payment is NOT summed — multiple postings in one cycle
+    # typically represent one payment period split into sub-periods (e.g.
+    # a rate change or interim payment date splitting April 29-June 5 into
+    # two rows), not two separate months' worth of dues. Summing Scheduled
+    # Payment across postings inflates the monthly-due figure and causes
+    # false DELINQUENT flags on loans that actually caught up. We use the
+    # max of the postings' Scheduled Payment as the single recurring
+    # monthly figure.
     agg_dict = {
         "loan_status": ("Loan Status", "last"),
         "dq_status": ("Delinquency Status", "last"),
     }
     if has_payment_cols:
-        agg_dict["scheduled"] = ("Scheduled Payment", "sum")
+        agg_dict["scheduled"] = ("Scheduled Payment", "max")
         agg_dict["received"] = ("Payment Received", "sum")
     si_grouped = si.groupby("SBA GP Number").agg(**agg_dict).reset_index()
 
