@@ -44,13 +44,17 @@ export default function Chatbot({ auditContext, summary, results }) {
 
     try {
       const apiUrl = import.meta.env.VITE_API_URL || ''
-const { data } = await axios.post(`${apiUrl}/api/chat`, {
-
+      const { data } = await axios.post(`${apiUrl}/api/chat`, {
         message: text,
         history,
         audit_context: auditContext,
       })
-      setMessages((m) => [...m, { role: 'assistant', content: data.reply }])
+      setMessages((m) => [...m, {
+        role: 'assistant',
+        content: data.reply,
+        excelB64: data.excel_b64 || null,
+        excelFilename: data.excel_filename || null,
+      }])
     } catch (err) {
       const msg =
         err.response?.data?.error ||
@@ -68,6 +72,19 @@ const { data } = await axios.post(`${apiUrl}/api/chat`, {
     }
   }
 
+  const downloadExcel = (base64, filename) => {
+    const byteCharacters = atob(base64)
+    const byteNumbers = Array.from(byteCharacters, (c) => c.charCodeAt(0))
+    const byteArray = new Uint8Array(byteNumbers)
+    const blob = new Blob([byteArray], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename || 'FalconBridge_Chat_Export.xlsx'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <div className="chatbot">
       <div className="chat-header">
@@ -80,6 +97,13 @@ const { data } = await axios.post(`${apiUrl}/api/chat`, {
         {messages.map((m, i) => (
           <div key={i} className={`bubble ${m.role === 'user' ? 'user' : 'bot'}`}>
             {m.content}
+            {m.excelB64 && (
+              <div className="chat-excel-download">
+                <button onClick={() => downloadExcel(m.excelB64, m.excelFilename)}>
+                  ⬇ Download Excel
+                </button>
+              </div>
+            )}
           </div>
         ))}
         {sending && <div className="bubble bot typing">FalconBridge AI is typing…</div>}

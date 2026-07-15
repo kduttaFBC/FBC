@@ -201,6 +201,87 @@ async def audit(
         )
 
 
+def _parse_markdown_tables(text):
+    """Finds every markdown table in a chat reply and returns a list of
+    (headers, rows) tuples. A markdown table is a block of lines starting
+    with '|', where the second line is the '---' separator row."""
+    lines = text.split("\n")
+    tables = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("|") and i + 1 < len(lines):
+            sep_line = lines[i + 1].strip()
+            if sep_line.startswith("|") and set(sep_line.replace("|", "").replace(" ", "")) <= set("-:"):
+                headers = [c.strip() for c in line.strip("|").split("|")]
+                rows = []
+                j = i + 2
+                while j < len(lines) and lines[j].strip().startswith("|"):
+                    cells = [c.strip() for c in lines[j].strip().strip("|").split("|")]
+                    if len(cells) == len(headers):
+                        rows.append(cells)
+                    j += 1
+                if rows:
+                    tables.append((headers, rows))
+                i = j
+                continue
+        i += 1
+    return tables
+
+
+def _markdown_tables_to_excel_b64(tables):
+    """Builds a formatted Excel workbook from one or more parsed markdown
+    tables (one sheet per table), returns (base64_string, filename), or
+    (None, None) if there's nothing to export."""
+    if not tables:
+        return None, None
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    HEADER_FILL = PatternFill("solid", fgColor="0C447C")
+    HEADER_FONT = Font(color="FFFFFF", bold=True)
+    THIN = Side(style="thin", color="E2E8F0")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    for idx, (headers, rows) in enumerate(tables):
+        sheet_name = f"Table {idx + 1}" if len(tables) > 1 else "Data"
+        ws = wb.create_sheet(sheet_name[:31])
+        for col_idx, header in enumerate(headers, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+            cell.border = BORDER
+        ws.freeze_panes = "A2"
+        for r_offset, row in enumerate(rows):
+            for c_idx, value in enumerate(row, start=1):
+                # try to preserve numbers as numbers, not text, for anything
+                # that looks like a plain number (skip $ and % formatted values)
+                cell_value = value
+                if value and not any(ch in value for ch in "$%,"):
+                    try:
+                        cell_value = float(value) if "." in value else int(value)
+                    except ValueError:
+                        pass
+                ws.cell(row=r_offset + 2, column=c_idx, value=cell_value).border = BORDER
+        for col_idx, header in enumerate(headers, start=1):
+            max_len = len(str(header))
+            for row in rows:
+                v = row[col_idx - 1] if col_idx - 1 < len(row) else ""
+                max_len = max(max_len, len(str(v)))
+            ws.column_dimensions[get_column_letter(col_idx)].width = max(10, min(40, max_len + 2))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    filename = f"FalconBridge_Chat_Export_{int(time.time())}.xlsx"
+    return b64, filename
+
+
 @app.post("/api/chat")
 async def chat(payload: dict):
     try:
@@ -210,7 +291,15 @@ async def chat(payload: dict):
         if not message.strip():
             return JSONResponse(status_code=400, content={"error": "Empty message."})
         reply = chatbot_mod.chat(message, history, audit_context)
-        return {"reply": reply}
+
+        tables = _parse_markdown_tables(reply)
+        excel_b64, excel_filename = _markdown_tables_to_excel_b64(tables)
+
+        response = {"reply": reply}
+        if excel_b64:
+            response["excel_b64"] = excel_b64
+            response["excel_filename"] = excel_filename
+        return response
     except Exception as exc:
         traceback.print_exc()
         return JSONResponse(

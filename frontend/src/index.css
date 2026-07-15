@@ -343,6 +343,19 @@ button { font-family: inherit; }
 }
 .bubble.bot { background: #EDF0F4; color: var(--text); align-self: flex-start; border-bottom-left-radius: 3px; }
 .bubble.user { background: var(--blue); color: #fff; align-self: flex-end; border-bottom-right-radius: 3px; }
+
+.chat-excel-download { margin-top: 10px; }
+.chat-excel-download button {
+  background: var(--teal);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.chat-excel-download button:hover { filter: brightness(1.08); }
 .bubble.typing { color: var(--text-secondary); font-style: italic; }
 
 .chat-input-row {
