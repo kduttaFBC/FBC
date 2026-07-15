@@ -191,7 +191,9 @@ async def audit(
         for uploaded in servicer_files:
             file_bytes = await uploaded.read()
             try:
-                servicer_name, loan_terms_df, servicer_inputs_df = file_readers.read_servicer_file(file_bytes)
+                servicer_name, loan_terms_df, servicer_inputs_df = file_readers.read_servicer_file(
+                    file_bytes, filename=uploaded.filename
+                )
             except ValueError as exc:
                 return JSONResponse(status_code=400, content={
                     "error": f"Could not read servicer file '{uploaded.filename}': {exc}",

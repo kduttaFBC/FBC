@@ -20,6 +20,18 @@ from python_calamine import CalamineWorkbook
 
 MAX_HEADER_SCAN_ROWS = 15
 
+# Fixed set of servicers this client works with. Used to identify the
+# servicer from the uploaded filename, which is far more reliable than
+# scanning for an in-sheet "Servicer:" label — that label pattern only
+# exists in some servicers' templates (e.g. Poppy Bank, Millennium Bank).
+# Lendistry's "Last Month Final" template has no such label anywhere in the
+# file, so relying on the label alone silently falls through to
+# "Unknown Servicer" for any servicer using this template.
+KNOWN_SERVICERS = [
+    "Poppy Bank", "Millennium Bank", "Mission Valley Bank",
+    "Peoples Bank", "Lendistry", "Community Bank and Trust",
+]
+
 SOUP_FIELDS = [
     "SBA GP Number", "Servicer", "Payment Month", "Loan Status",
     "Delinquency Status", "Beginning Actual Balance", "Ending Actual Balance",
@@ -123,8 +135,11 @@ def read_soup_file(file_bytes):
     return df
 
 
-def read_servicer_file(file_bytes):
-    """Returns (servicer_name, loan_terms_df, servicer_inputs_df) for one SRF file."""
+def read_servicer_file(file_bytes, filename=None):
+    """Returns (servicer_name, loan_terms_df, servicer_inputs_df) for one SRF file.
+    filename is used to identify the servicer via KNOWN_SERVICERS when the
+    file's own template doesn't contain an in-sheet 'Servicer:' label
+    (e.g. Lendistry's 'Last Month Final' template)."""
     wb = _load_workbook(file_bytes)
     rows_cache = {}
 
@@ -140,9 +155,13 @@ def read_servicer_file(file_bytes):
         lt_best = _find_best_header(wb, LOAN_TERMS_FIELDS, _rows_cache=rows_cache)
     loan_terms_df = _rows_to_df(rows_cache[lt_best["sheet_name"]], lt_best["row_idx"]) if lt_best["matches"] >= 2 else pd.DataFrame()
 
-    # servicer name — look for the "► Servicer:" label near the top of
-    # Servicer Inputs and take the cell to its right
-    servicer_name = _find_servicer_name(rows_cache[si_best["sheet_name"]])
+    # Servicer name resolution, in order of reliability:
+    #   1. Filename match against KNOWN_SERVICERS (works regardless of template)
+    #   2. "► Servicer:" label near the top of Servicer Inputs (older templates)
+    #   3. "Unknown Servicer" if neither finds a match
+    servicer_name = _find_servicer_name_from_filename(filename)
+    if not servicer_name:
+        servicer_name = _find_servicer_name(rows_cache[si_best["sheet_name"]])
 
     rows_cache.clear()  # free the raw parsed rows now that the DataFrames exist
     del wb
@@ -155,6 +174,21 @@ def read_servicer_file(file_bytes):
             df.dropna(subset=["SBA GP Number"], inplace=True)
 
     return servicer_name, loan_terms_df, servicer_inputs_df
+
+
+def _find_servicer_name_from_filename(filename):
+    """Matches the uploaded filename against the known servicer list
+    (case-insensitive substring match, ignoring spaces/underscores/hyphens
+    so 'Lendistry_2025_2026.xlsx' matches 'Lendistry', 'Community-Bank-and-
+    Trust.xlsx' matches 'Community Bank and Trust', etc.). Returns the
+    matched servicer name, or None if nothing matches."""
+    if not filename:
+        return None
+    normed_filename = _norm(filename)
+    for servicer in KNOWN_SERVICERS:
+        if _norm(servicer) in normed_filename:
+            return servicer
+    return None
 
 
 def _find_servicer_name(rows):
