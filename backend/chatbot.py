@@ -43,6 +43,85 @@ SOUP_LOOKUP_COLUMNS = [
 ]
 
 
+SEARCH_TOOL = {
+    "name": "search_accounts_by_status",
+    "description": (
+        "Searches across ALL accounts for a given servicer (or all servicers) and "
+        "returns every account matching a specific Loan Status and/or Delinquency "
+        "Status, based on each account's MOST RECENT month in the SOUP Performance "
+        "Dataset. Use this for questions like 'find all delinquent loans for "
+        "Lendistry' or 'which Poppy Bank loans are 90+ days delinquent' — this is "
+        "different from lookup_loan_history, which only returns one specific "
+        "account's full history. This tool scans many accounts at once but only "
+        "returns their latest snapshot, not full monthly history."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "servicer": {
+                "type": "string",
+                "description": "Servicer name to filter to, e.g. 'Lendistry'. Leave blank to search all servicers.",
+            },
+            "delinquency_status_contains": {
+                "type": "string",
+                "description": (
+                    "Text to match within Delinquency Status (case-insensitive substring match), "
+                    "e.g. 'DAYS' to find any DAYS-delinquent loan, or 'DELINQUENT', or '90' for 90-day "
+                    "delinquencies. Leave blank to not filter by delinquency status."
+                ),
+            },
+            "exclude_current": {
+                "type": "boolean",
+                "description": "If true, excludes accounts whose latest Delinquency Status is exactly 'CURRENT'. Defaults to false.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def _search_accounts_by_status(soup_df, servicer=None, delinquency_status_contains=None, exclude_current=False, max_rows=300):
+    """Returns a CSV of the latest snapshot for every account matching the
+    given filters, scanning the ENTIRE SOUP dataset (not just flagged loans)."""
+    if soup_df is None:
+        return "No live SOUP dataset is available for this session (it may have expired — try re-running the audit)."
+
+    df = soup_df.copy()
+    if servicer:
+        df = df[df["Servicer"].astype("string").str.strip().str.lower() == servicer.strip().lower()]
+        if df.empty:
+            return f"No records found for servicer '{servicer}'. Check the spelling or whether that servicer's data exists in SOUP."
+
+    if "Payment Month" not in df.columns or "SBA GP Number" not in df.columns:
+        return "SOUP dataset is missing expected columns for this search."
+
+    latest = df.sort_values("Payment Month").groupby("SBA GP Number").tail(1)
+
+    if exclude_current and "Delinquency Status" in latest.columns:
+        latest = latest[latest["Delinquency Status"].astype("string").str.strip().str.upper() != "CURRENT"]
+
+    if delinquency_status_contains and "Delinquency Status" in latest.columns:
+        needle = delinquency_status_contains.strip().lower()
+        latest = latest[latest["Delinquency Status"].astype("string").str.lower().str.contains(needle, na=False)]
+
+    if latest.empty:
+        return "No accounts matched that filter."
+
+    total_matches = len(latest)
+    keep = [c for c in SOUP_LOOKUP_COLUMNS if c in latest.columns]
+    result = latest[keep].sort_values("SBA GP Number") if keep else latest
+    truncated = len(result) > max_rows
+    result = result.head(max_rows)
+
+    for col in result.columns:
+        if str(result[col].dtype).startswith("datetime"):
+            result[col] = result[col].astype("string")
+
+    csv = result.to_csv(index=False)
+    note = f"\n[Showing {max_rows} of {total_matches} total matches — results truncated.]" if truncated else f"\n[Total matches: {total_matches}]"
+    return csv + note
+
+
 def _lookup_loan_history(soup_df, sba_gp_number):
     """Returns a CSV string of every SOUP row for the given account, or a
     clear not-found message — never silently returns nothing."""
@@ -120,6 +199,16 @@ def _build_system_prompt(audit_context):
         "works for ANY SBA GP Number, flagged or not. Only report a loan as 'not found' "
         "after actually calling the tool and getting a not-found result back — never assume "
         "a loan doesn't exist just because it's missing from the pre-loaded section.\n\n"
+        "IMPORTANT: for questions asking to FIND or LIST MULTIPLE accounts matching some "
+        "criteria (e.g. 'find all delinquent loans for Lendistry', 'which accounts are 90+ "
+        "days past due', 'list Poppy Bank's active loans'), use the "
+        "search_accounts_by_status tool instead — it scans every account for a servicer "
+        "(or all servicers) and returns everyone matching, based on their latest recorded "
+        "status. Do NOT try to answer multi-account search questions from memory or from "
+        "the small samples elsewhere in this context — those are not comprehensive and will "
+        "give an incomplete or wrong answer. lookup_loan_history is only for ONE specific, "
+        "already-known account number; search_accounts_by_status is for finding accounts you "
+        "don't already have the ID for.\n\n"
         "=== AUDIT SUMMARY (JSON) ===\n"
         f"{json.dumps(summary, indent=2)}\n\n"
         "=== AUDIT RESULTS (JSON) ===\n"
@@ -154,7 +243,7 @@ def chat(message, history, audit_context, soup_df=None):
     messages.append({"role": "user", "content": message})
 
     client = _get_client()
-    tools = [LOOKUP_TOOL] if soup_df is not None else []
+    tools = [LOOKUP_TOOL, SEARCH_TOOL] if soup_df is not None else []
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = client.messages.create(
@@ -177,6 +266,13 @@ def chat(message, history, audit_context, soup_df=None):
             if block.name == "lookup_loan_history":
                 gp = block.input.get("sba_gp_number", "")
                 result_text = _lookup_loan_history(soup_df, gp)
+            elif block.name == "search_accounts_by_status":
+                result_text = _search_accounts_by_status(
+                    soup_df,
+                    servicer=block.input.get("servicer") or None,
+                    delinquency_status_contains=block.input.get("delinquency_status_contains") or None,
+                    exclude_current=block.input.get("exclude_current", False),
+                )
             else:
                 result_text = f"Unknown tool: {block.name}"
             tool_results.append({
