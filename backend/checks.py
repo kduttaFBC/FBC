@@ -96,9 +96,15 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
     dup_mask = si.duplicated("SBA GP Number", keep=False)
     dup_ids = set(si.loc[dup_mask, "SBA GP Number"])
 
-    # use the last posting per loan this cycle if there's a payment date to sort by
+    # use the last posting per loan this cycle if there's a payment date to sort by.
+    # Real-world files mix populated dates with blank strings ("" for loans with
+    # no payment posted this cycle) in the same column — pandas can't sort a
+    # column containing both str and datetime.date objects, so coerce to a
+    # proper datetime dtype first (blanks/unparseable values become NaT, which
+    # sorts safely to one end rather than raising).
     sort_col = "Payment Receipt Date" if "Payment Receipt Date" in si.columns else None
     if sort_col:
+        si[sort_col] = pd.to_datetime(si[sort_col], errors="coerce")
         si_last = si.sort_values(sort_col).groupby("SBA GP Number").tail(1)
     else:
         si_last = si.groupby("SBA GP Number").tail(1)
@@ -107,6 +113,7 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
     soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
     sort_month = "Payment Month" if "Payment Month" in soup.columns else None
     if sort_month:
+        soup[sort_month] = pd.to_datetime(soup[sort_month], errors="coerce")
         soup_latest = soup.sort_values(["SBA GP Number", sort_month]).groupby("SBA GP Number").tail(1)
     else:
         soup_latest = soup.groupby("SBA GP Number").tail(1)
@@ -277,6 +284,8 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
     soup = soup_servicer_df.copy()
     soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
     sort_month = "Payment Month" if "Payment Month" in soup.columns else None
+    if sort_month:
+        soup[sort_month] = pd.to_datetime(soup[sort_month], errors="coerce")
     soup_latest = (soup.sort_values(["SBA GP Number", sort_month]) if sort_month else soup).groupby("SBA GP Number").tail(1)
     soup_latest = soup_latest.set_index("SBA GP Number")
 
@@ -315,6 +324,8 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
             "SOUP DQ Status": str(soup_dq_raw).strip(),
             "Calculated DQ Status": calculated_dq,
             "DQ Status Match": "YES" if dq_match else "NO",
+            "Payment Received (this cycle)": round(float(row.get("received")), 2) if has_payment_cols and pd.notna(row.get("received")) else "",
+            "Scheduled Payment (this cycle)": round(float(row.get("scheduled")), 2) if has_payment_cols and pd.notna(row.get("scheduled")) else "",
         })
 
     return _result(

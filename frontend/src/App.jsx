@@ -25,29 +25,34 @@ export const SERVICER_FIELDS = [
 
 // Right-side slot labels. First is Poppy Bank (the file we already have);
 // the rest are placeholders until each servicer's file is confirmed.
-// Lendistry provides two separate yearly files (2024, 2025) that each run
-// as their own independent reconciliation — NOT merged into one. Both
-// still need to match against the single "Lendistry" servicer key in the
-// SOUP dataset, so SERVICER_SOUP_KEYS below maps each display label back
-// to the actual SOUP servicer name for lookup purposes.
+// Both Lendistry and Millennium Bank submit two separate SBA note-series
+// files (2024 FBC-1 and 2025 FBC-1 pools) that each run as their own
+// independent reconciliation — NOT merged into one. "2024"/"2025" here
+// refers to the note series/pool, not the calendar year of the activity
+// data itself (both pools can contain the same reporting month's activity).
+// Both note-series files for a servicer still need to match against that
+// single servicer's name in the SOUP dataset, so SERVICER_SOUP_KEYS below
+// maps each display label back to the actual SOUP servicer name.
 export const SERVICER_SLOTS = [
   'Poppy Bank',
-  'Millennium Bank',
+  'Millennium 2025',
+  'Millennium 2024',
   'Mission Valley Bank',
   'Peoples Bank',
   'Lendistry 2025',
   'Lendistry 2024',
   'Community Bank and Trust',
-  'Servicer File 8',
 ]
 
 // Maps a display label to the servicer name that actually appears in the
 // SOUP dataset's "Servicer" column, for any label that doesn't match SOUP
-// verbatim (e.g. year-specific Lendistry labels all map back to plain
-// "Lendistry"). Labels not listed here are assumed to match SOUP directly.
+// verbatim (e.g. note-series-specific labels all map back to the servicer's
+// plain name). Labels not listed here are assumed to match SOUP directly.
 export const SERVICER_SOUP_KEYS = {
   'Lendistry 2025': 'Lendistry',
   'Lendistry 2024': 'Lendistry',
+  'Millennium 2025': 'Millennium Bank',
+  'Millennium 2024': 'Millennium Bank',
 }
 
 export default function App() {
