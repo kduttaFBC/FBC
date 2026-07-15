@@ -136,10 +136,19 @@ def read_soup_file(file_bytes):
 
 
 def read_servicer_file(file_bytes, filename=None):
-    """Returns (servicer_name, loan_terms_df, servicer_inputs_df) for one SRF file.
-    filename is used to identify the servicer via KNOWN_SERVICERS when the
-    file's own template doesn't contain an in-sheet 'Servicer:' label
-    (e.g. Lendistry's 'Last Month Final' template)."""
+    """Returns (soup_key, display_label, loan_terms_df, servicer_inputs_df)
+    for one SRF file. soup_key is what filter_soup_by_servicer should match
+    against SOUP's Servicer column; display_label is what should be shown
+    in report tabs, the summary, and the chatbot — these differ for files
+    like Lendistry's two yearly uploads, which both match SOUP's plain
+    "Lendistry" but need distinct display labels.
+    filename is used to resolve both, in order of reliability:
+      1. The "{soupKey}||{displayLabel}__{originalFilename}" convention the
+         frontend sends (exact, no guessing)
+      2. Filename match against KNOWN_SERVICERS (older-style uploads)
+      3. In-file "Servicer:" label scan (older servicer templates)
+      4. "Unknown Servicer" for both, if nothing else matches
+    """
     wb = _load_workbook(file_bytes)
     rows_cache = {}
 
@@ -155,13 +164,12 @@ def read_servicer_file(file_bytes, filename=None):
         lt_best = _find_best_header(wb, LOAN_TERMS_FIELDS, _rows_cache=rows_cache)
     loan_terms_df = _rows_to_df(rows_cache[lt_best["sheet_name"]], lt_best["row_idx"]) if lt_best["matches"] >= 2 else pd.DataFrame()
 
-    # Servicer name resolution, in order of reliability:
-    #   1. Filename match against KNOWN_SERVICERS (works regardless of template)
-    #   2. "► Servicer:" label near the top of Servicer Inputs (older templates)
-    #   3. "Unknown Servicer" if neither finds a match
-    servicer_name = _find_servicer_name_from_filename(filename)
-    if not servicer_name:
-        servicer_name = _find_servicer_name(rows_cache[si_best["sheet_name"]])
+    soup_key, display_label = _parse_servicer_filename(filename)
+    if not soup_key:
+        fallback = _find_servicer_name_from_filename(filename)
+        if not fallback:
+            fallback = _find_servicer_name(rows_cache[si_best["sheet_name"]])
+        soup_key, display_label = fallback, fallback
 
     rows_cache.clear()  # free the raw parsed rows now that the DataFrames exist
     del wb
@@ -173,15 +181,38 @@ def read_servicer_file(file_bytes, filename=None):
             # when only the ID column has a stray value
             df.dropna(subset=["SBA GP Number"], inplace=True)
 
-    return servicer_name, loan_terms_df, servicer_inputs_df
+    return soup_key, display_label, loan_terms_df, servicer_inputs_df
+
+
+def _parse_servicer_filename(filename):
+    """Parses the "{soupKey}||{displayLabel}__{originalFilename}" convention
+    the frontend uses to unambiguously tell the backend both (a) which SOUP
+    servicer name to filter against, and (b) what display label to use for
+    this file's report tabs/summary — these differ for cases like Lendistry's
+    two yearly files, which both must match SOUP's "Lendistry" but need
+    distinct tab labels ("Lendistry 2024" / "Lendistry 2025").
+
+    Returns (soup_key, display_label) or (None, None) if the filename doesn't
+    follow this convention (e.g. an older-style upload) — callers should fall
+    back to KNOWN_SERVICERS matching or the in-file label scan in that case."""
+    if not filename or "__" not in filename:
+        return None, None
+    prefix = filename.split("__", 1)[0].strip()
+    if not prefix:
+        return None, None
+    if "||" in prefix:
+        soup_key, display_label = prefix.split("||", 1)
+        soup_key, display_label = soup_key.strip(), display_label.strip()
+        return (soup_key or None), (display_label or soup_key or None)
+    # no "||" separator — same value serves as both soup key and display label
+    return prefix, prefix
 
 
 def _find_servicer_name_from_filename(filename):
     """Matches the uploaded filename against the known servicer list
-    (case-insensitive substring match, ignoring spaces/underscores/hyphens
-    so 'Lendistry_2025_2026.xlsx' matches 'Lendistry', 'Community-Bank-and-
-    Trust.xlsx' matches 'Community Bank and Trust', etc.). Returns the
-    matched servicer name, or None if nothing matches."""
+    (case-insensitive substring match, ignoring spaces/underscores/hyphens),
+    for filenames that don't follow the "{soupKey}||{displayLabel}__..."
+    convention. Returns the matched servicer name, or None if nothing matches."""
     if not filename:
         return None
     normed_filename = _norm(filename)

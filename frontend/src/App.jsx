@@ -25,16 +25,30 @@ export const SERVICER_FIELDS = [
 
 // Right-side slot labels. First is Poppy Bank (the file we already have);
 // the rest are placeholders until each servicer's file is confirmed.
+// Lendistry provides two separate yearly files (2024, 2025) that each run
+// as their own independent reconciliation — NOT merged into one. Both
+// still need to match against the single "Lendistry" servicer key in the
+// SOUP dataset, so SERVICER_SOUP_KEYS below maps each display label back
+// to the actual SOUP servicer name for lookup purposes.
 export const SERVICER_SLOTS = [
   'Poppy Bank',
   'Millennium Bank',
   'Mission Valley Bank',
   'Peoples Bank',
-  'Lendistry',
+  'Lendistry 2025',
+  'Lendistry 2024',
   'Community Bank and Trust',
-  'Servicer File 7',
   'Servicer File 8',
 ]
+
+// Maps a display label to the servicer name that actually appears in the
+// SOUP dataset's "Servicer" column, for any label that doesn't match SOUP
+// verbatim (e.g. year-specific Lendistry labels all map back to plain
+// "Lendistry"). Labels not listed here are assumed to match SOUP directly.
+export const SERVICER_SOUP_KEYS = {
+  'Lendistry 2025': 'Lendistry',
+  'Lendistry 2024': 'Lendistry',
+}
 
 export default function App() {
   // screens: 'upload' | 'ready' | 'results' | 'ended'
@@ -61,7 +75,16 @@ export default function App() {
       const form = new FormData()
       form.append('soup_file', soup.file)
       servicerFiles.forEach((s, i) => {
-        if (s && s.valid) form.append('servicer_files', s.file, `${SERVICER_SLOTS[i]}__${s.file.name}`)
+        if (s && s.valid) {
+          const label = SERVICER_SLOTS[i]
+          const soupKey = SERVICER_SOUP_KEYS[label] || label
+          // Filename convention: "{soupKey}||{displayLabel}__{originalFilename}"
+          // soupKey is what filter_soup_by_servicer matches against SOUP's
+          // Servicer column; displayLabel is what shows up in the report
+          // tabs, summary, and chatbot. They're equal for most servicers —
+          // only diverge for things like Lendistry's two yearly files.
+          form.append('servicer_files', s.file, `${soupKey}||${label}__${s.file.name}`)
+        }
       })
 
       const apiUrl = import.meta.env.VITE_API_URL || ''

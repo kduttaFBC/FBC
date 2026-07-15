@@ -191,7 +191,7 @@ async def audit(
         for uploaded in servicer_files:
             file_bytes = await uploaded.read()
             try:
-                servicer_name, loan_terms_df, servicer_inputs_df = file_readers.read_servicer_file(
+                soup_key, display_label, loan_terms_df, servicer_inputs_df = file_readers.read_servicer_file(
                     file_bytes, filename=uploaded.filename
                 )
             except ValueError as exc:
@@ -201,13 +201,18 @@ async def audit(
             del file_bytes
             gc.collect()
 
-            soup_servicer_df = file_readers.filter_soup_by_servicer(soup_df, servicer_name)
+            # soup_key is what actually matches SOUP's Servicer column (e.g.
+            # "Lendistry"); display_label is what shows up in results/report
+            # tabs/summary (e.g. "Lendistry 2024") — these differ for files
+            # like Lendistry's two yearly uploads, which both reconcile
+            # against the same SOUP servicer but need distinct labels.
+            soup_servicer_df = file_readers.filter_soup_by_servicer(soup_df, soup_key)
 
             results = checks_mod.run_servicer_reconciliation(
-                servicer_name, loan_terms_df, servicer_inputs_df, soup_servicer_df,
+                display_label, loan_terms_df, servicer_inputs_df, soup_servicer_df,
             )
             all_results.extend(results)
-            servicer_loan_counts[servicer_name] = len(servicer_inputs_df)
+            servicer_loan_counts[display_label] = len(servicer_inputs_df)
 
         summary = checks_mod.summarize(all_results, len(soup_df), servicer_loan_counts)
 
