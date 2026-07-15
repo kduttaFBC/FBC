@@ -58,19 +58,50 @@ def _cleanup_old_sessions():
         del SESSION_CACHE[sid]
 
 
-def _flagged_gp_numbers(all_results):
-    """Collects every SBA GP Number that appears in any check's flagged
-    records, across all servicers."""
+# Caps chosen against measured token cost at Lendistry scale (~1,444 rows,
+# 6 checks): uncapped results + flagged history ran ~118k tokens on their
+# own before conversation history or tool calls. These caps bring that down
+# to ~35k tokens while keeping issues_found counts exact and full detail one
+# tool call away via lookup_loan_history / search_accounts_by_status.
+MAX_RECORDS_PER_RESULT = 5          # example records shipped per check, per servicer
+MAX_FLAGGED_LOANS_FOR_HISTORY = 100  # distinct loans included in the pre-loaded history CSV
+
+
+def _cap_results_for_chat(all_results, max_records=MAX_RECORDS_PER_RESULT):
+    """Returns a copy of all_results with each result's records list capped
+    for the chatbot's context. issues_found stays the TRUE total; only the
+    records list sent to the chatbot is trimmed. The full list remains
+    available via search_accounts_by_status, and the Excel report (built
+    from the uncapped all_results) is unaffected."""
+    capped = []
+    for r in all_results:
+        r2 = dict(r)
+        records = r2.get("records", [])
+        if len(records) > max_records:
+            r2["records"] = records[:max_records]
+            r2["records_truncated"] = True
+            r2["records_shown"] = max_records
+        capped.append(r2)
+    return capped
+
+
+def _flagged_gp_numbers(all_results, max_loans=MAX_FLAGGED_LOANS_FOR_HISTORY):
+    """Collects SBA GP Numbers that appear in any check's flagged records,
+    across all servicers, capped to max_loans distinct loans so the full
+    monthly history CSV built from these stays a bounded size. Any loan
+    beyond the cap is still reachable via lookup_loan_history on demand."""
     gp_numbers = set()
     for result in all_results:
         for record in result.get("records", []):
             gp = record.get("SBA GP Number")
             if gp is not None:
                 gp_numbers.add(str(gp).strip())
+            if len(gp_numbers) >= max_loans:
+                return gp_numbers
     return gp_numbers
 
 
-def _flagged_loan_history_csv(soup_df, gp_numbers, columns=None, max_rows=2500):
+def _flagged_loan_history_csv(soup_df, gp_numbers, columns=None, max_rows=1800):
     """Builds a CSV of SOUP's full monthly history (every Payment Month row)
     for every flagged loan — not a flat sample of the whole file, which would
     almost never happen to include a specific loan's full history. This is
@@ -156,7 +187,6 @@ async def audit(
 
         all_results = []
         servicer_loan_counts = {}
-        servicer_csvs = {}
 
         for uploaded in servicer_files:
             file_bytes = await uploaded.read()
@@ -176,23 +206,32 @@ async def audit(
             )
             all_results.extend(results)
             servicer_loan_counts[servicer_name] = len(servicer_inputs_df)
-            servicer_csvs[servicer_name] = _truncate_csv(servicer_inputs_df, columns=SERVICER_CHAT_COLUMNS)
 
         summary = checks_mod.summarize(all_results, len(soup_df), servicer_loan_counts)
 
+        # POP-01 is excluded from the downloadable report only — it still
+        # runs and still feeds the chatbot/summary, just skips the (mostly
+        # redundant) Excel tab per servicer to cut report generation work.
+        REPORT_EXCLUDED_CHECK_IDS = {"POP-01"}
+        report_results = [
+            r for r in all_results
+            if r["id"].split("::")[0] not in REPORT_EXCLUDED_CHECK_IDS
+        ]
+
         excel_buffer = io.BytesIO()
-        report_mod.generate_report_bytes(all_results, summary, excel_buffer)
+        report_mod.generate_report_bytes(report_results, summary, excel_buffer)
         excel_b64 = base64.b64encode(excel_buffer.getvalue()).decode("utf-8")
 
-        flagged_gps = _flagged_gp_numbers(all_results)
+        flagged_gps = _flagged_gp_numbers(all_results)  # already capped to MAX_FLAGGED_LOANS_FOR_HISTORY
         flagged_loan_history_csv = _flagged_loan_history_csv(soup_df, flagged_gps, columns=SOUP_CHAT_COLUMNS)
 
+        # soup_csv and servicer_csvs are dropped here: both were flat samples
+        # of the full files, now redundant with lookup_loan_history and
+        # search_accounts_by_status querying the live soup_df on demand.
         chat_context = {
             "summary": summary,
-            "results": all_results,
-            "soup_csv": _truncate_csv(soup_df, columns=SOUP_CHAT_COLUMNS),
+            "results": _cap_results_for_chat(all_results),
             "flagged_loan_history_csv": flagged_loan_history_csv,
-            "servicer_csvs": servicer_csvs,
         }
 
         session_id = str(uuid.uuid4())

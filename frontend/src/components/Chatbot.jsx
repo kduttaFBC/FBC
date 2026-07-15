@@ -19,6 +19,32 @@ function buildOpeningMessage(summary, results) {
   return `Audit complete. I found ${issues} issue(s) across ${checksWithIssues} check(s).${summaryLine} What would you like to explore?`
 }
 
+// History sent to /api/chat is capped on two axes so a long session or a
+// single big reply (e.g. a large "list all delinquent loans" table) can't
+// make every subsequent chat call grow without bound:
+//   - MAX_HISTORY_TURNS: only the most recent N messages are resent at all
+//   - MAX_HISTORY_MESSAGE_CHARS: any single message beyond this length is
+//     truncated before being resent, since a full result table only needs
+//     to be seen once by the person (and is separately exportable to Excel)
+//     — replaying it in full on every future turn just burns tokens.
+const MAX_HISTORY_TURNS = 10
+const MAX_HISTORY_MESSAGE_CHARS = 2000
+
+function buildHistoryForRequest(messages) {
+  return messages
+    .slice(-MAX_HISTORY_TURNS)
+    .map((m) => {
+      const content = m.content || ''
+      const truncated = content.length > MAX_HISTORY_MESSAGE_CHARS
+      return {
+        role: m.role,
+        content: truncated
+          ? content.slice(0, MAX_HISTORY_MESSAGE_CHARS) + '\n\n[...earlier reply truncated for length...]'
+          : content,
+      }
+    })
+}
+
 export default function Chatbot({ auditContext, summary, results, sessionId }) {
   const [messages, setMessages] = useState(() => [
     { role: 'assistant', content: buildOpeningMessage(summary, results) },
@@ -37,7 +63,7 @@ export default function Chatbot({ auditContext, summary, results, sessionId }) {
     const text = input.trim()
     if (!text || sending) return
 
-    const history = messages.map((m) => ({ role: m.role, content: m.content }))
+    const history = buildHistoryForRequest(messages)
     setMessages((m) => [...m, { role: 'user', content: text }])
     setInput('')
     setSending(true)

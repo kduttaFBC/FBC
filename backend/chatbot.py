@@ -160,20 +160,51 @@ def _get_client():
     return _client
 
 
+MAX_RESULT_EXAMPLES = 5  # example records shown per check in the system prompt
+
+
+def _summarize_results(results, max_examples=MAX_RESULT_EXAMPLES):
+    """Condenses full per-loan audit results into per-check pass/fail counts
+    plus a few example flagged records. issues_found is always the TRUE
+    total (never capped) — only the example records shown here are limited.
+    Full detail for any account is available on demand via
+    lookup_loan_history / search_accounts_by_status, so we don't need to
+    ship every flagged record on every chat call."""
+    summary_lines = []
+    for r in results or []:
+        raw_id = r.get("id", "UNKNOWN")
+        check_id = raw_id.split("::")[0]  # strip the "::Servicer" suffix — servicer is its own field
+        name = r.get("name", "")
+        servicer = r.get("servicer", "")
+        status = r.get("status", "")
+        issues_found = r.get("issues_found", 0)
+        records = r.get("records", [])
+
+        summary_lines.append(
+            f"- {check_id} ({name}) — Servicer: {servicer} — Status: {status} — "
+            f"Issues found: {issues_found}"
+        )
+
+        if records and issues_found:
+            examples = records[:max_examples]
+            shown_note = f"showing {len(examples)} of {issues_found}"
+            summary_lines.append(
+                f"  Example flagged record(s) ({shown_note}): {json.dumps(examples, default=str)}"
+            )
+    return "\n".join(summary_lines) if summary_lines else "No check results available."
+
+
 def _build_system_prompt(audit_context):
-    """audit_context carries the structured audit results plus truncated CSV
-    samples of SOUP and each servicer file. Keeping the flagged records front
-    and centre keeps answers grounded and the token cost low."""
+    """audit_context carries the structured audit summary/results plus a
+    capped CSV of flagged-loan payment history. soup_csv and servicer_csvs
+    are intentionally not read here even if an older cached audit_context
+    still includes them — lookup_loan_history and search_accounts_by_status
+    query the live soup_df directly, making pre-loaded samples redundant."""
     summary = audit_context.get("summary", {})
     results = audit_context.get("results", [])
-    soup_csv = audit_context.get("soup_csv", "")
     flagged_loan_history_csv = audit_context.get("flagged_loan_history_csv", "")
-    servicer_csvs = audit_context.get("servicer_csvs", {})
 
-    servicer_csv_block = "\n\n".join(
-        f"--- {name} (Servicer Inputs sample) ---\n{csv}"
-        for name, csv in servicer_csvs.items()
-    )
+    results_summary = _summarize_results(results)
 
     return (
         "You are FalconBridge AI, a data-quality and compliance assistant for SBA loan "
@@ -187,38 +218,39 @@ def _build_system_prompt(audit_context):
         "they belong to. Be concise and precise — this is a compliance context.\n\n"
         "IMPORTANT: for record/row counts, always use the exact figures in "
         "summary.servicer_record_counts and summary.soup_records — never estimate by "
-        "counting rows in the CSV samples below, since those are truncated and will "
+        "counting rows in any CSV data below, since it may be truncated and will "
         "give a wrong answer.\n\n"
+        "IMPORTANT: the AUDIT RESULTS section below shows the true issue count per check, "
+        "plus a few example flagged records — it is NOT the complete list. For a complete, "
+        "accurate list of every account matching any status or condition, always use the "
+        "search_accounts_by_status tool rather than relying on the examples shown.\n\n"
         "IMPORTANT: for questions about a specific loan's payment history over time "
         "(multiple months, trends, when a status changed, etc.), first check the "
-        "'FLAGGED LOAN FULL PAYMENT HISTORY' section below — it already contains every "
-        "month's SOUP record for every loan that appeared in this audit's flagged results. "
-        "If the loan you need is NOT in that section (e.g. it wasn't flagged, or belongs to "
-        "a servicer that wasn't part of this audit run), use the lookup_loan_history tool "
-        "to query the complete SOUP Performance Dataset directly for that account — this "
-        "works for ANY SBA GP Number, flagged or not. Only report a loan as 'not found' "
-        "after actually calling the tool and getting a not-found result back — never assume "
-        "a loan doesn't exist just because it's missing from the pre-loaded section.\n\n"
+        "'FLAGGED LOAN FULL PAYMENT HISTORY' section below — it contains full monthly "
+        "SOUP records for a subset of this audit's flagged loans. If the loan you need is "
+        "NOT in that section (e.g. it wasn't flagged, belongs to a servicer outside this "
+        "audit run, or was left out due to the section's size limit), use the "
+        "lookup_loan_history tool to query the complete SOUP Performance Dataset directly "
+        "for that account — this works for ANY SBA GP Number, flagged or not. Only report "
+        "a loan as 'not found' after actually calling the tool and getting a not-found "
+        "result back — never assume a loan doesn't exist just because it's missing from "
+        "the pre-loaded section.\n\n"
         "IMPORTANT: for questions asking to FIND or LIST MULTIPLE accounts matching some "
         "criteria (e.g. 'find all delinquent loans for Lendistry', 'which accounts are 90+ "
         "days past due', 'list Poppy Bank's active loans'), use the "
-        "search_accounts_by_status tool instead — it scans every account for a servicer "
-        "(or all servicers) and returns everyone matching, based on their latest recorded "
-        "status. Do NOT try to answer multi-account search questions from memory or from "
-        "the small samples elsewhere in this context — those are not comprehensive and will "
-        "give an incomplete or wrong answer. lookup_loan_history is only for ONE specific, "
-        "already-known account number; search_accounts_by_status is for finding accounts you "
-        "don't already have the ID for.\n\n"
+        "search_accounts_by_status tool — it scans every account for a servicer (or all "
+        "servicers) and returns everyone matching, based on their latest recorded status. "
+        "Do NOT try to answer multi-account search questions from memory or from the "
+        "condensed examples elsewhere in this context — those are not comprehensive and "
+        "will give an incomplete or wrong answer. lookup_loan_history is only for ONE "
+        "specific, already-known account number; search_accounts_by_status is for finding "
+        "accounts you don't already have the ID for.\n\n"
         "=== AUDIT SUMMARY (JSON) ===\n"
         f"{json.dumps(summary, indent=2)}\n\n"
-        "=== AUDIT RESULTS (JSON) ===\n"
-        f"{json.dumps(results, indent=2, default=str)}\n\n"
-        "=== FLAGGED LOAN FULL PAYMENT HISTORY (CSV, every month, every flagged loan) ===\n"
-        f"{flagged_loan_history_csv}\n\n"
-        "=== SOUP PERFORMANCE DATASET SAMPLE (CSV, small generic snapshot, truncated) ===\n"
-        f"{soup_csv}\n\n"
-        "=== SERVICER FILE SAMPLES (CSV, truncated) ===\n"
-        f"{servicer_csv_block}\n"
+        "=== AUDIT RESULTS (condensed — true counts + a few examples per check) ===\n"
+        f"{results_summary}\n\n"
+        "=== FLAGGED LOAN FULL PAYMENT HISTORY (CSV, subset of flagged loans) ===\n"
+        f"{flagged_loan_history_csv}\n"
     )
 
 

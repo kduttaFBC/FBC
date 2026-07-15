@@ -115,11 +115,6 @@ def _sheet_name_for(result):
 
 
 CHECK_LEGEND = [
-    ("Population Check", "FAIL",
-     "Confirms every loan in the servicer's active population (Loan Terms & Prior Period) "
-     "also appears in SOUP's history for that servicer, and vice versa. A loan in SOUP's "
-     "history but missing from the active list is often just a paid-off or liquidated loan — "
-     "but a large or unexplained gap is worth a closer look."),
     ("Balance Continuity", "FAIL / INFO",
      "Confirms this cycle's reported Beginning Balance ties to SOUP's most recently recorded "
      "Ending Balance for that loan. Loans with more than one payment posted this cycle are "
