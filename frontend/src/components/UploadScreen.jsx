@@ -269,11 +269,10 @@ export default function UploadScreen({ onContinue }) {
   const soupError = soup && !soup.valid
 
   // Ready to continue once soup is valid and at least one servicer file
-  // (Poppy Bank) is valid — the rest of the 7 slots are optional until
-  // those files are provided.
-  const canContinue = soupValid && servicerFiles[0]?.valid
+  // (any of the 8 slots) is valid.
+  const canContinue = soupValid && servicerFiles.some((s) => s?.valid)
 
-  let status = { cls: 'gray', text: 'Upload the SOUP dataset and at least the Poppy Bank file to continue' }
+  let status = { cls: 'gray', text: 'Upload the SOUP dataset and at least one servicer file to continue' }
   if (soupError || servicerErrorCount > 0) {
     status = { cls: 'red', text: 'Fix the file errors above before continuing' }
   } else if (canContinue) {
@@ -281,9 +280,9 @@ export default function UploadScreen({ onContinue }) {
       cls: 'green',
       text: `Ready — SOUP dataset validated, ${servicerValidCount} of ${SERVICER_SLOTS.length} servicer file(s) uploaded`,
     }
-  } else if (soupValid && !servicerFiles[0]) {
-    status = { cls: 'amber', text: 'Waiting for the Poppy Bank file' }
-  } else if (servicerFiles[0]?.valid && !soupValid) {
+  } else if (soupValid && servicerValidCount === 0) {
+    status = { cls: 'amber', text: 'Waiting for at least one servicer file' }
+  } else if (servicerValidCount > 0 && !soupValid) {
     status = { cls: 'amber', text: 'Waiting for the SOUP Performance Dataset' }
   }
 
