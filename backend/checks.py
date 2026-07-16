@@ -507,23 +507,48 @@ def duplicate_postings_check(servicer_inputs_df):
 
     si = servicer_inputs_df.copy()
     si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
+    if "Payment Received" in si.columns:
+        si["Payment Received"] = pd.to_numeric(si["Payment Received"], errors="coerce")
     dup_mask = si.duplicated("SBA GP Number", keep=False)
     dup_rows = si[dup_mask].sort_values("SBA GP Number")
 
-    for _, row in dup_rows.iterrows():
+    # consolidate one row per loan instead of one row per posting -- a loan
+    # with 3 postings this cycle should appear ONCE here, with all 3
+    # payments/dates combined, rather than as 3 separate rows repeating the
+    # same Beginning/Ending Balance
+    for gp, group in dup_rows.groupby("SBA GP Number", sort=False):
+        # sort each loan's own postings by date so the combined list reads
+        # in chronological order
+        if "Payment Receipt Date" in group.columns:
+            group = group.assign(_sort_date=pd.to_datetime(group["Payment Receipt Date"], errors="coerce")).sort_values("_sort_date")
+
+        first = group.iloc[0]
+        payment_parts = []
+        total_received = 0.0
+        for _, r in group.iterrows():
+            amt = r.get("Payment Received", "")
+            date_str = _fmt_date(r.get("Payment Receipt Date", "")) if "Payment Receipt Date" in group.columns else ""
+            if pd.notna(amt) and amt != "":
+                total_received += float(amt)
+                amt_str = f"${float(amt):,.2f}"
+            else:
+                amt_str = ""
+            payment_parts.append(f"{amt_str} ({date_str})" if date_str else amt_str)
+
         records.append({
-            "SBA GP Number": row.get("SBA GP Number"),
-            "Lender Loan Number": row.get("Lender Loan Number", ""),
-            "Beginning Balance": row.get("Beginning Balance", ""),
-            "Ending Balance": row.get("Ending Balance", ""),
-            "Payment Received": row.get("Payment Received", ""),
-            "Payment Receipt Date": _fmt_date(row.get("Payment Receipt Date", "")),
+            "SBA GP Number": gp,
+            "Lender Loan Number": first.get("Lender Loan Number", ""),
+            "Beginning Balance": first.get("Beginning Balance", ""),
+            "Ending Balance": first.get("Ending Balance", ""),
+            "Number of Postings": len(group),
+            "Total Payment Received": round(total_received, 2),
+            "Payment Details (amount / date)": "; ".join(p for p in payment_parts if p),
         })
 
     issues = len(records)
     details = (
         "No issues found." if not records else
-        f"{issues} row(s) reflecting loans with more than one payment posted this cycle "
+        f"{issues} loan(s) with more than one payment posted this cycle "
         f"— informational only, not an error."
     )
 
