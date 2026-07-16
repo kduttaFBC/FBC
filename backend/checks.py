@@ -517,12 +517,19 @@ def duplicate_postings_check(servicer_inputs_df):
     # payments/dates combined, rather than as 3 separate rows repeating the
     # same Beginning/Ending Balance
     for gp, group in dup_rows.groupby("SBA GP Number", sort=False):
-        # sort each loan's own postings by date so the combined list reads
-        # in chronological order
-        if "Payment Receipt Date" in group.columns:
-            group = group.assign(_sort_date=pd.to_datetime(group["Payment Receipt Date"], errors="coerce")).sort_values("_sort_date")
+        # sort each loan's own postings into chronological order so the
+        # combined list reads correctly and "last posting" (for Ending
+        # Balance) is determined reliably. Prefer "Loan Payment Instance"
+        # when the template provides it (an explicit 1, 2, 3... ordinal) --
+        # more reliable than date, since same-day postings can't be
+        # distinguished by date alone. Fall back to Payment Receipt Date.
+        if "Loan Payment Instance" in group.columns:
+            group = group.assign(_sort_key=pd.to_numeric(group["Loan Payment Instance"], errors="coerce")).sort_values("_sort_key")
+        elif "Payment Receipt Date" in group.columns:
+            group = group.assign(_sort_key=pd.to_datetime(group["Payment Receipt Date"], errors="coerce")).sort_values("_sort_key")
 
         first = group.iloc[0]
+        last = group.iloc[-1]
         payment_parts = []
         total_received = 0.0
         for _, r in group.iterrows():
@@ -539,7 +546,7 @@ def duplicate_postings_check(servicer_inputs_df):
             "SBA GP Number": gp,
             "Lender Loan Number": first.get("Lender Loan Number", ""),
             "Beginning Balance": first.get("Beginning Balance", ""),
-            "Ending Balance": first.get("Ending Balance", ""),
+            "Ending Balance": last.get("Ending Balance", ""),
             "Number of Postings": len(group),
             "Total Payment Received": round(total_received, 2),
             "Payment Details (amount / date)": "; ".join(p for p in payment_parts if p),
