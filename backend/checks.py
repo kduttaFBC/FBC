@@ -220,8 +220,21 @@ def _missed_count_to_status(missed_count):
     return f"{days} DAYS"
 
 
+PAYMENT_SUFFICIENCY_THRESHOLD = 0.80  # a payment covering >= 80% of one scheduled
+                                       # installment counts as that installment paid
+
+
 def _apply_payment_transition(prior_missed_count, payment_received, scheduled_payment):
-    """Returns the new missed-payment count after this cycle's payment."""
+    """Returns the new missed-payment count after this cycle's payment.
+
+    A period is only treated as "paid" if the amount received covers at
+    least PAYMENT_SUFFICIENCY_THRESHOLD (80%) of the scheduled payment for
+    that installment — receiving *some* payment isn't enough on its own.
+    A payment below that threshold moves the loan down one delinquency
+    rank, exactly the same as receiving nothing at all. Payments covering
+    multiple installments' worth (e.g. a catch-up payment) still reduce
+    the missed count by the number of full installments covered, each
+    judged against the same 80% threshold."""
     if payment_received is None or pd.isna(payment_received):
         payment_received = 0
     received = float(payment_received)
@@ -238,12 +251,22 @@ def _apply_payment_transition(prior_missed_count, payment_received, scheduled_pa
         # by — hold steady rather than risk a divide-by-zero
         return prior_missed_count
 
-    multiple = round(received / float(scheduled_payment))
-    if multiple <= 0:
+    ratio = received / float(scheduled_payment)
+    whole_installments = int(ratio)  # floor, since ratio is always >= 0 here
+    fractional_remainder = ratio - whole_installments
+    # a partial installment only counts as "covered" if it clears the 80%
+    # sufficiency threshold on its own -- e.g. 1.75x scheduled covers 1 full
+    # installment plus a 75% partial, which does NOT clear the threshold,
+    # so only 1 installment counts as paid (0.75 < 0.80)
+    installments_covered = whole_installments + (1 if fractional_remainder >= PAYMENT_SUFFICIENCY_THRESHOLD else 0)
+
+    if installments_covered <= 0:
+        # received something, but less than 80% of one scheduled payment --
+        # treated as insufficient, same as a full miss
         return prior_missed_count + 1
-    if multiple == 1:
+    if installments_covered == 1:
         return prior_missed_count
-    return max(0, prior_missed_count - (multiple - 1))
+    return max(0, prior_missed_count - (installments_covered - 1))
 
 
 def status_match_check(servicer_inputs_df, soup_servicer_df):
@@ -300,10 +323,30 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
 
         status_match = srf_status.lower() == soup_status.lower()
 
+        # A loan reported as paid in full, liquidated, or otherwise in a
+        # terminal state has no ongoing payment schedule to be delinquent
+        # against — its correct calculated status is CURRENT, regardless of
+        # what the missed-payment math would otherwise say (e.g. a loan that
+        # was 60 DAYS delinquent and then gets paid off is not still "90
+        # DAYS delinquent" — it's paid off, full stop).
+        #
+        # Check BOTH the servicer's self-reported status this cycle AND
+        # SOUP's last recorded status, rather than trusting either source
+        # alone — a servicer's file could be wrong or lag behind, and SOUP
+        # could equally be stale, so either source flagging a terminal
+        # status is enough to treat the loan as closed out.
+        is_terminal_this_cycle = any(
+            k in srf_status.upper() or k in soup_status.upper()
+            for k in _TERMINAL_STATUS_KEYWORDS
+        )
+
         # calculate what DQ status should be, based on missed-payment math,
         # rather than a straight string comparison against SOUP's last DQ
         prior_missed = _status_to_missed_count(soup_dq_raw) if has_payment_cols else None
-        if has_payment_cols and prior_missed is not None:
+        if is_terminal_this_cycle:
+            calculated_dq = "CURRENT"
+            dq_match = srf_dq.upper() == calculated_dq
+        elif has_payment_cols and prior_missed is not None:
             new_missed = _apply_payment_transition(prior_missed, row.get("received"), row.get("scheduled"))
             calculated_dq = _missed_count_to_status(new_missed)
             dq_match = srf_dq.upper() == calculated_dq
