@@ -146,6 +146,11 @@ CHECK_LEGEND = [
     ("Duplicate Postings", "INFO",
      "Informational only. Flags loans with more than one payment posted in the same cycle "
      "(e.g. a catch-up payment) so they aren't mistaken for a data error elsewhere in the report."),
+    ("Negative Payment Flags", "WARN",
+     "Flags any individual payment posting this cycle with a negative amount received "
+     "(typically a reversal of a prior payment). This does NOT change the delinquency status "
+     "calculation shown elsewhere in this report — it's a visibility flag only, so these loans "
+     "can be manually reviewed and their status adjusted by hand if needed."),
 ]
 
 

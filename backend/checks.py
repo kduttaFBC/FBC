@@ -381,6 +381,98 @@ def status_match_check(servicer_inputs_df, soup_servicer_df):
 
 
 # ---------------------------------------------------------------------------
+# NEG-01 — Negative Payment Flags
+# Flags any individual payment posting this cycle with a negative Payment
+# Received amount (typically a reversal of a prior payment). This is purely
+# a visibility flag for manual review — it does NOT alter the delinquency
+# status calculation in STAT-01 in any way. The "current calculated status"
+# shown here is computed independently, using the exact same missed-payment
+# math as STAT-01, purely so a reviewer can see what the system currently
+# thinks the status is without having to cross-reference another tab.
+# ---------------------------------------------------------------------------
+
+def negative_payment_check(servicer_inputs_df, soup_servicer_df):
+    records = []
+
+    required = {"SBA GP Number", "Payment Received"}
+    if not required.issubset(servicer_inputs_df.columns):
+        return _result("NEG-01", "Negative Payment Flags", "SBA Reconciliation", "WARN", records,
+                        lambda n: "")
+
+    si = servicer_inputs_df.copy()
+    si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
+    si["Payment Received"] = pd.to_numeric(si["Payment Received"], errors="coerce")
+    has_scheduled_col = "Scheduled Payment" in si.columns
+    if has_scheduled_col:
+        si["Scheduled Payment"] = pd.to_numeric(si["Scheduled Payment"], errors="coerce")
+    has_dq_col = "Delinquency Status" in si.columns
+
+    # per-loan aggregate calculated status, using the identical missed-payment
+    # math STAT-01 uses -- computed here independently so this tab can show
+    # "what the system currently calculates" without touching status_match_check
+    calculated_dq_by_loan = {}
+    if has_dq_col:
+        agg_dict = {"dq_status": ("Delinquency Status", "last")}
+        if has_scheduled_col:
+            agg_dict["scheduled"] = ("Scheduled Payment", "max")
+        agg_dict["received"] = ("Payment Received", "sum")
+        si_grouped = si.groupby("SBA GP Number").agg(**agg_dict).reset_index()
+    else:
+        si_grouped = pd.DataFrame(columns=["SBA GP Number"])
+
+    soup = soup_servicer_df.copy() if soup_servicer_df is not None else pd.DataFrame()
+    soup_latest = pd.DataFrame()
+    if not soup.empty and "SBA GP Number" in soup.columns:
+        soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
+        sort_month = "Payment Month" if "Payment Month" in soup.columns else None
+        if sort_month:
+            soup[sort_month] = pd.to_datetime(soup[sort_month], errors="coerce")
+        soup_latest = (soup.sort_values(["SBA GP Number", sort_month]) if sort_month else soup).groupby("SBA GP Number").tail(1)
+        soup_latest = soup_latest.set_index("SBA GP Number")
+
+    for _, row in si_grouped.iterrows():
+        gp = row["SBA GP Number"]
+        soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "") if gp in soup_latest.index else ""
+        prior_missed = _status_to_missed_count(soup_dq_raw)
+        if prior_missed is not None and has_scheduled_col:
+            new_missed = _apply_payment_transition(prior_missed, row.get("received"), row.get("scheduled"))
+            calculated_dq_by_loan[gp] = _missed_count_to_status(new_missed)
+        else:
+            calculated_dq_by_loan[gp] = str(soup_dq_raw).strip().upper() if soup_dq_raw != "" else ""
+
+    prior_status_by_loan = {}
+    if not soup_latest.empty:
+        for gp in soup_latest.index:
+            prior_status_by_loan[gp] = str(soup_latest.loc[gp].get("Delinquency Status", "")).strip()
+
+    # scan the RAW, un-aggregated rows -- a negative posting can be masked by
+    # a positive one in the same cycle's summed total, so each posting needs
+    # to be checked individually rather than relying on the aggregate sum
+    negative_rows = si[si["Payment Received"] < 0]
+    for _, row in negative_rows.iterrows():
+        gp = row["SBA GP Number"]
+        period = _fmt_date(row.get("Payment Receipt Date")) if "Payment Receipt Date" in si.columns else ""
+        records.append({
+            "SBA GP Number": gp,
+            "Period / Month": period,
+            "Negative Payment Amount": round(float(row["Payment Received"]), 2),
+            "Prior Period Status": prior_status_by_loan.get(gp, ""),
+            "Current Period Status (Calculated)": calculated_dq_by_loan.get(gp, ""),
+            "Note": "Reversed payment — review delinquency status manually",
+        })
+
+    records.sort(key=lambda r: (r["SBA GP Number"], r["Period / Month"]))
+
+    return _result(
+        "NEG-01", "Negative Payment Flags", "SBA Reconciliation", "WARN", records,
+        lambda n: f"{n} payment posting(s) with a negative Payment Received amount this cycle "
+                  f"(typically a reversal) — flagged for manual review. Delinquency status "
+                  f"calculations are NOT auto-adjusted for these; a reviewer should confirm the "
+                  f"correct status by hand.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # DUP-01 — Duplicate Postings
 # Informational: a loan with more than one row in Servicer Inputs this cycle.
 # ---------------------------------------------------------------------------
@@ -635,6 +727,7 @@ ALL_CHECKS_META = [
     ("PAY-01", "Missing Payment Periods"),
     ("PAY-02", "Payment Shortfall Check"),
     ("DUP-01", "Duplicate Postings"),
+    ("NEG-01", "Negative Payment Flags"),
 ]
 
 
@@ -647,6 +740,7 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
         missing_payment_periods_check(soup_servicer_df, loan_terms_df),
         payment_shortfall_check(servicer_inputs_df),
         duplicate_postings_check(servicer_inputs_df),
+        negative_payment_check(servicer_inputs_df, soup_servicer_df),
     ]
     # tag every result with which servicer it belongs to, so multi-servicer
     # runs can be told apart in the combined results list
