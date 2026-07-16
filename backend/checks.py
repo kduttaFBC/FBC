@@ -252,19 +252,25 @@ def _apply_payment_transition(prior_missed_count, payment_received, scheduled_pa
         return prior_missed_count
 
     ratio = received / float(scheduled_payment)
-    whole_installments = int(ratio)  # floor, since ratio is always >= 0 here
-    fractional_remainder = ratio - whole_installments
-    # a partial installment only counts as "covered" if it clears the 80%
-    # sufficiency threshold on its own -- e.g. 1.75x scheduled covers 1 full
-    # installment plus a 75% partial, which does NOT clear the threshold,
-    # so only 1 installment counts as paid (0.75 < 0.80)
-    installments_covered = whole_installments + (1 if fractional_remainder >= PAYMENT_SUFFICIENCY_THRESHOLD else 0)
 
-    if installments_covered <= 0:
+    if ratio < PAYMENT_SUFFICIENCY_THRESHOLD:
         # received something, but less than 80% of one scheduled payment --
         # treated as insufficient, same as a full miss
         return prior_missed_count + 1
-    if installments_covered == 1:
+    if ratio < 1.0:
+        # received at least 80% but less than 100% of one installment --
+        # counts as that installment paid (held steady, not reduced)
+        return prior_missed_count
+    # ratio >= 1.0: this is a catch-up payment covering one or more
+    # installments. The 80% sufficiency threshold only governs whether a
+    # SINGLE period counts as paid (per the business rule above) -- it does
+    # not redefine how multi-installment catch-up payments are measured, so
+    # this uses standard rounding to the nearest whole installment, exactly
+    # as before (e.g. a payment of 1.77x one scheduled installment rounds to
+    # covering 2 installments, correctly catching up a loan that missed one
+    # prior payment).
+    installments_covered = round(ratio)
+    if installments_covered <= 1:
         return prior_missed_count
     return max(0, prior_missed_count - (installments_covered - 1))
 
