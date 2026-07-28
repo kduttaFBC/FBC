@@ -334,6 +334,21 @@ _LIQUIDATION_FIELD_COLUMNS = (
 )
 
 
+def _json_safe_value(value, is_date_field=False):
+    """Converts one raw cell value into something json.dumps can handle.
+    Calamine/pandas can hand back datetime.date/Timestamp/numpy scalar
+    types depending on the source cell — none of those are JSON-
+    serializable as-is, which crashed the /api/audit response the first
+    time a real Liquidation Date reached this code path. Reuses the
+    existing _fmt_date formatting convention for date fields so the display
+    format matches every other date already shown elsewhere in the app."""
+    if is_date_field:
+        return _fmt_date(value)
+    if hasattr(value, "item"):  # numpy scalar (int64/float64/etc.)
+        return value.item()
+    return value
+
+
 def _consolidate_liquidation_fields(raw_group):
     """For ONE GP's raw postings this cycle, returns {column: value} for
     each of the four liquidation-specific fields, per the client's explicit
@@ -360,8 +375,11 @@ def _consolidate_liquidation_fields(raw_group):
             if v not in distinct:
                 distinct.append(v)
         if len(distinct) <= 1:
-            values[col] = distinct[0] if distinct else ""
+            values[col] = _json_safe_value(distinct[0], is_date_field=(col == "Liquidation Date")) if distinct else ""
         else:
+            # Already JSON-safe: the f-string converts every element (dates
+            # included) to its string form via repr, same as the ambiguous
+            # branch anywhere else in this file.
             values[col] = f"AMBIGUOUS — postings disagree: {distinct}"
             ambiguous_fields.append(col)
     return values, ambiguous_fields
