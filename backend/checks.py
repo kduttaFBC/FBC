@@ -71,6 +71,13 @@ def consolidate_cycle_postings(servicer_inputs_df):
       (FIRST posting), ending_balance (LAST posting), interest_from (FIRST),
       interest_to (LAST), lender_loan_number (FIRST).
 
+    Does NOT include the four liquidation-specific fields (Liquidation Date,
+    Liquidation Proceeds, Subsequent Recoveries/(Losses), Liquidation Loss)
+    — LIQ-01 (liquidation_review_check) computes those itself directly from
+    the raw postings via _consolidate_liquidation_fields, since a naive
+    first/last choice here would silently hide genuine multi-posting
+    disagreement rather than surface it for review.
+
     Scheduled Payment is never summed — there is one scheduled obligation
     per cycle. If every nonzero Scheduled Payment value for a loan this
     cycle agrees, that value is used. If two or more DISTINCT nonzero
@@ -283,28 +290,93 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
 
 
 # ---------------------------------------------------------------------------
-# BAL-02 — Liquidation Balance Validation
-# The Remittance Form Instructions formally define LIQUIDATION as: the loan
-# has been charged off, the balance is reduced to $0, and the loan is no
-# longer expected to make regular payments. This is a CURRENT-CYCLE rule —
-# a loan reporting Loan Status = LIQUIDATION this cycle should report an
-# Ending Balance of $0 this cycle, full stop. Deliberately independent of
-# BAL-01: this doesn't look at prior SOUP balance at all, so a loan can fail
-# BAL-01 (continuity break vs. last cycle) and BAL-02 (current-cycle
-# LIQUIDATION balance rule) simultaneously, for two genuinely separate
-# reasons, exactly as validated against loan 4338609104.
+# LIQ-01 — Liquidation Review (formerly BAL-02, converted per client
+# clarification)
+#
+# CLIENT-CONFIRMED RULE: there is no historical data available to
+# independently determine that a loan "should" transition into LIQUIDATION.
+# The engine must NEVER infer, predict, approve, or reject a LIQUIDATION
+# status from a loan's prior SOUP status — if sufficient supporting data
+# doesn't exist, the engine does not guess. Instead, the servicer's own
+# report of Loan Status = LIQUIDATION is itself what triggers review: EVERY
+# such loan is surfaced here, unconditionally — this is NOT contingent on
+# any exception existing. A $0 Ending Balance is still a review item; a
+# nonzero Ending Balance is a review item PLUS a clearly identified balance
+# problem (the Remittance Form Instructions require LIQUIDATION loans to
+# report $0).
+#
+# This replaces the old BAL-02, which only ever surfaced the nonzero-balance
+# subset — silently passing every $0-balance LIQUIDATION loan with no
+# visibility at all. Converted rather than kept alongside a separate check
+# because every old BAL-02 exception is a strict subset of what LIQ-01 now
+# covers; keeping both would show the same loan twice for overlapping
+# reasons rather than complementary ones.
+#
+# Delinquency Status here is NOT invented separately — it reuses the exact
+# same shared _calculate_expected_status engine as STAT-01/NEG-01 (80%
+# threshold, zero-payment progression, prior baseline, deferral logic,
+# UNVERIFIED/REVIEW handling, all unchanged). See _calculate_expected_status's
+# is_liquidation_this_cycle carve-out for why LIQUIDATION loans now get a
+# real calculation instead of the old terminal-status CURRENT shortcut.
+#
+# A servicer-reported LIQUIDATION loan is presentation-excluded from STAT-01
+# (see status_match_check) — this check is where it belongs instead.
 # ---------------------------------------------------------------------------
 
-_LIQUIDATION_STATUS_KEYWORD = "LIQUIDATION"
+_LIQUIDATION_KEYWORD = "LIQUIDAT"  # substring match — same convention as
+                                    # _TERMINAL_STATUS_KEYWORDS and the
+                                    # STAT-01 exclusion, so the two checks
+                                    # stay exact complements of each other.
+
+_LIQUIDATION_FIELD_COLUMNS = (
+    "Liquidation Date", "Liquidation Proceeds",
+    "Subsequent Recoveries/(Losses)", "Liquidation Loss",
+)
 
 
-def liquidation_balance_check(servicer_inputs_df):
+def _consolidate_liquidation_fields(raw_group):
+    """For ONE GP's raw postings this cycle, returns {column: value} for
+    each of the four liquidation-specific fields, per the client's explicit
+    no-guess rule for this scenario:
+      - 0 or 1 posting, or all postings agree (including all-blank): that
+        single/agreed value is used directly — this is NOT an aggregation
+        choice, there's nothing to pick between.
+      - Multiple postings with genuinely DIFFERENT non-blank values: do NOT
+        pick first/last/max/min/sum. Instead the value becomes an explicit
+        "AMBIGUOUS — see raw values" marker listing every distinct value
+        found, and the field name is returned separately so the caller can
+        surface it as a data-quality warning rather than a confident number.
+    Returns (values: dict, ambiguous_fields: list[str])."""
+    values = {}
+    ambiguous_fields = []
+    for col in _LIQUIDATION_FIELD_COLUMNS:
+        if col not in raw_group.columns:
+            values[col] = ""
+            continue
+        col_values = raw_group[col].tolist()
+        non_blank = [v for v in col_values if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip() != ""]
+        distinct = []
+        for v in non_blank:
+            if v not in distinct:
+                distinct.append(v)
+        if len(distinct) <= 1:
+            values[col] = distinct[0] if distinct else ""
+        else:
+            values[col] = f"AMBIGUOUS — postings disagree: {distinct}"
+            ambiguous_fields.append(col)
+    return values, ambiguous_fields
+
+
+def liquidation_review_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None):
     records = []
 
     required = {"SBA GP Number", "Loan Status", "Ending Balance"}
     if not required.issubset(servicer_inputs_df.columns):
-        return _result("BAL-02", "Liquidation Balance Validation", "SBA Reconciliation", "FAIL", records,
+        return _result("LIQ-01", "Liquidation Review", "SBA Reconciliation", "WARN", records,
                         lambda n: "")
+
+    cycle_month = _infer_cycle_month(soup_servicer_df)
+    has_payment_cols = {"Scheduled Payment", "Payment Received"}.issubset(servicer_inputs_df.columns)
 
     # Evaluate the CONSOLIDATED cycle record per GP — final chronological
     # Loan Status and final chronological Ending Balance — not each raw
@@ -314,37 +386,115 @@ def liquidation_balance_check(servicer_inputs_df):
     # loan actually ended the cycle as.
     consolidated = consolidate_cycle_postings(servicer_inputs_df)
 
+    # Raw (pre-consolidation) rows, grouped by GP, used ONLY to check the
+    # four liquidation-specific fields for multi-posting disagreement — see
+    # _consolidate_liquidation_fields. Deliberately separate from the
+    # shared consolidate_cycle_postings() used by every other check, since
+    # no other check needs these fields or this ambiguity handling.
+    raw = servicer_inputs_df.copy()
+    raw["SBA GP Number"] = _norm_id(raw["SBA GP Number"])
+    raw_by_gp = {gp: group for gp, group in raw.groupby("SBA GP Number")}
+
+    soup = soup_servicer_df.copy() if soup_servicer_df is not None else pd.DataFrame()
+    soup_latest = pd.DataFrame()
+    if not soup.empty and "SBA GP Number" in soup.columns:
+        soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
+        sort_month = "Payment Month" if "Payment Month" in soup.columns else None
+        if sort_month:
+            soup[sort_month] = pd.to_datetime(soup[sort_month], errors="coerce")
+        soup_latest = (soup.sort_values(["SBA GP Number", sort_month]) if sort_month else soup).groupby("SBA GP Number").tail(1)
+        soup_latest = soup_latest.set_index("SBA GP Number")
+
     for gp, row in consolidated.iterrows():
         loan_status = str(row.get("loan_status", "")).strip().upper()
-        if loan_status != _LIQUIDATION_STATUS_KEYWORD:
+        if _LIQUIDATION_KEYWORD not in loan_status:
             continue
 
+        soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip() if gp in soup_latest.index else ""
+        soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "") if gp in soup_latest.index else ""
+        srf_dq = str(row.get("dq_status", "")).strip()
+        scheduled_ambiguous = bool(row.get("scheduled_ambiguous"))
+
+        # Same shared engine as STAT-01/NEG-01 — no separate liquidation
+        # delinquency logic. NOT used to infer or contest the LIQUIDATION
+        # status itself (expected_loan_status is deliberately ignored below
+        # — the servicer's own report is what puts this loan here, full
+        # stop); only calculated_dq/memo_warning are used.
+        calculated_dq, _, _, memo_warning, warning_type, _ = _calculate_expected_status(
+            gp, row.get("loan_status", ""), soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
+            has_payment_cols, memo_df, servicer_name, cycle_month,
+            scheduled_ambiguous=scheduled_ambiguous,
+        )
+
+        if calculated_dq == "UNVERIFIED":
+            dq_match = "REVIEW"
+        else:
+            dq_match = srf_dq.upper() == calculated_dq.upper()
+
         ending_balance = row.get("ending_balance")
-        if ending_balance is None or pd.isna(ending_balance):
-            continue  # can't evaluate without a balance figure
-        if abs(ending_balance) <= BALANCE_TOLERANCE:
-            continue  # within tolerance of $0 -- PASS for this loan
+        has_balance_figure = ending_balance is not None and not pd.isna(ending_balance)
+        ending_balance_is_zero = has_balance_figure and abs(ending_balance) <= BALANCE_TOLERANCE
+
+        balance_issue = ""
+        if has_balance_figure and not ending_balance_is_zero:
+            balance_issue = (
+                f"LIQUIDATION loans are required to report a $0 balance. "
+                f"Reported Ending Balance: {round(float(ending_balance), 2)}."
+            )
+
+        liq_field_values, liq_ambiguous_fields = _consolidate_liquidation_fields(raw_by_gp.get(gp, raw.iloc[0:0]))
+
+        data_quality_warning_parts = []
+        if memo_warning:
+            data_quality_warning_parts.append(memo_warning)
+        if liq_ambiguous_fields:
+            data_quality_warning_parts.append(
+                f"Multiple postings this cycle report DIFFERENT values for: "
+                f"{', '.join(liq_ambiguous_fields)}. No aggregation rule is confirmed for this "
+                f"case, so each field shows every distinct reported value rather than a single "
+                f"picked one — review the underlying postings directly."
+            )
+        if scheduled_ambiguous:
+            data_quality_warning_parts.append(
+                f"Multiple distinct nonzero Scheduled Payment values this cycle "
+                f"({row.get('scheduled_distinct_values')}) — cycle obligation is ambiguous; "
+                f"the Calculated Delinquency Status above is NOT definitive."
+            )
 
         records.append({
             "SBA GP Number": gp,
-            "Loan Status": str(row.get("loan_status", "")).strip(),
-            "Ending Balance": round(float(ending_balance), 2),
-            "Expected Ending Balance": 0.00,
-            "Difference": round(float(ending_balance), 2),
-            "Issue": "LIQUIDATION loans are required to report a $0 balance.",
+            "Lender Loan Number": row.get("lender_loan_number", ""),
+            "Prior SOUP Loan Status": soup_status,
+            "Servicer Loan Status": str(row.get("loan_status", "")).strip(),
+            "Prior SOUP Delinquency Status": str(soup_dq_raw).strip(),
+            "Servicer Delinquency Status": srf_dq,
+            "Calculated Delinquency Status": calculated_dq,
+            "DQ Status Match": dq_match if dq_match == "REVIEW" else ("YES" if dq_match else "NO"),
+            "Beginning Balance": round(float(row["beginning_balance"]), 2) if pd.notna(row.get("beginning_balance")) else "",
+            "Ending Balance": round(float(ending_balance), 2) if has_balance_figure else "",
+            "Ending Balance Is Zero": "YES" if ending_balance_is_zero else ("NO" if has_balance_figure else ""),
+            "Payment Received": round(float(row["received"]), 2) if has_payment_cols and pd.notna(row.get("received")) else "",
+            "Scheduled Payment": round(float(row["scheduled"]), 2) if has_payment_cols and pd.notna(row.get("scheduled")) else "",
+            "Liquidation Date": liq_field_values["Liquidation Date"],
+            "Liquidation Proceeds": liq_field_values["Liquidation Proceeds"],
+            "Subsequent Recoveries/(Losses)": liq_field_values["Subsequent Recoveries/(Losses)"],
+            "Liquidation Loss": liq_field_values["Liquidation Loss"],
+            "Posting Count": int(row.get("posting_count", 1)),
+            "Balance Issue": balance_issue,
+            "Data Quality Warning": " ".join(data_quality_warning_parts),
         })
 
     details = "No issues found." if not records else (
-        f"{len(records)} loan(s) reported as LIQUIDATION with a nonzero Ending Balance, "
-        f"contrary to the Remittance Form Instructions."
+        f"{len(records)} loan(s) reported by the servicer as LIQUIDATION this cycle — every "
+        f"such loan is surfaced here for review, regardless of Ending Balance."
     )
 
     return {
-        "id": "BAL-02",
-        "name": "Liquidation Balance Validation",
+        "id": "LIQ-01",
+        "name": "Liquidation Review",
         "category": "SBA Reconciliation",
-        "severity": "FAIL",
-        "status": "PASS" if not records else "FAIL",
+        "severity": "WARN",
+        "status": "PASS" if not records else "WARN",
         "issues_found": len(records),
         "details": details,
         "records": records,
@@ -767,13 +917,20 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     is_terminal_this_cycle = any(
         k in srf_status_u or k in soup_status_u for k in _TERMINAL_STATUS_KEYWORDS
     )
+    # Client clarification: LIQUIDATION loans still need a REAL calculated
+    # Delinquency Status (same validated engine as any other loan — 80%
+    # threshold, zero-payment progression, prior baseline, etc.), routed to
+    # the dedicated LIQ-01 review rather than STAT-01. Every other terminal
+    # status (PAID-IN-FULL, FORECLOSURE, CHARGE-OFF, REO, CANCEL, WITHDRAWN)
+    # keeps the existing CURRENT shortcut below, unchanged.
+    is_liquidation_this_cycle = "LIQUIDAT" in srf_status_u or "LIQUIDAT" in soup_status_u
 
     deferral, memo_warning, warning_type = (None, None, None) if is_terminal_this_cycle else _lookup_deferral(memo_df, gp, servicer_name, cycle_month)
 
     prior_missed = _status_to_missed_count(soup_dq_raw) if has_payment_cols else None
     expected_loan_status = None
 
-    if is_terminal_this_cycle:
+    if is_terminal_this_cycle and not is_liquidation_this_cycle:
         calculated_dq = "CURRENT"
     elif deferral and deferral["deferral_type"] == "full" and deferral["phase"] == "resume":
         # Client-confirmed: the cycle containing Regular Payment Resume
@@ -924,6 +1081,14 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip()
         soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "")
         scheduled_ambiguous = bool(row.get("scheduled_ambiguous"))
+
+        # Client clarification: there is no historical data to independently
+        # establish that LIQUIDATION is an incorrect transition from any
+        # prior status, so a servicer-reported LIQUIDATION loan must never
+        # be flagged here as a Loan Status mismatch. It belongs exclusively
+        # in the dedicated LIQ-01 review instead — see liquidation_review_check.
+        if "LIQUIDAT" in srf_status.upper():
+            continue
 
         calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, _ = _calculate_expected_status(
             gp, srf_status, soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
@@ -1473,7 +1638,7 @@ def payment_shortfall_check(servicer_inputs_df):
 ALL_CHECKS_META = [
     ("POP-01", "Population Check"),
     ("BAL-01", "Balance Continuity"),
-    ("BAL-02", "Liquidation Balance Validation"),
+    ("LIQ-01", "Liquidation Review"),
     ("STAT-01", "Status / Delinquency Match"),
     ("PAY-01", "Missing Payment Periods"),
     ("PAY-02", "Payment Shortfall Check"),
@@ -1506,12 +1671,12 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
     deal (from file_readers.extract_deal_from_note_series) scopes POP-01 to
     Servicer + Deal + normalized GP Number instead of Servicer + GP Number
     alone — see population_check's docstring-level comment for why. Only
-    affects POP-01; BAL-01, BAL-02, STAT-01, PAY-01/02, DUP-01, and NEG-01
+    affects POP-01; BAL-01, LIQ-01, STAT-01, PAY-01/02, DUP-01, and NEG-01
     are unchanged by this parameter."""
     results = [
         population_check(loan_terms_df, soup_servicer_df, servicer_name, deal=deal),
         balance_continuity_check(servicer_inputs_df, soup_servicer_df),
-        liquidation_balance_check(servicer_inputs_df),
+        liquidation_review_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name),
         status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name),
         missing_payment_periods_check(soup_servicer_df, loan_terms_df),
         payment_shortfall_check(servicer_inputs_df),

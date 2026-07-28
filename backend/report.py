@@ -128,6 +128,14 @@ CHECK_LEGEND = [
      "Confirms this cycle's reported Beginning Balance ties to SOUP's most recently recorded "
      "Ending Balance for that loan. Loans with more than one payment posted this cycle are "
      "called out separately (informational) rather than treated as a real break."),
+    ("Liquidation Review", "WARN",
+     "Every loan the servicer reports as Loan Status = LIQUIDATION this cycle, surfaced "
+     "unconditionally for review — not just loans with a balance problem. There is no "
+     "historical data to independently confirm or contest a LIQUIDATION status, so none is "
+     "attempted; the servicer's own report is what puts a loan here. A $0 Ending Balance is "
+     "still a review item; a nonzero Ending Balance is additionally flagged as a balance "
+     "issue, since liquidated loans are required to report $0. Delinquency Status is still "
+     "calculated using the same validated engine as any other loan, shown for reference."),
     ("Status / Delinquency Match", "WARN",
      "Confirms the servicer's reported Loan Status and Delinquency Status this cycle match "
      "SOUP's last recorded status for that loan. Status changes are often legitimate "
