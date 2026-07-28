@@ -19,6 +19,7 @@ Each check returns a dict:
 }
 """
 
+import math
 import pandas as pd
 from file_readers import normalize_id_series as _norm_id
 from file_readers import MEMO_LENDER_ALIASES
@@ -604,26 +605,72 @@ PAYMENT_SUFFICIENCY_THRESHOLD = 0.80
 
 
 def _apply_payment_transition(prior_missed_count, payment_received, scheduled_payment):
-    """Returns the new missed-payment count after this cycle's payment.
+    """Returns the new missed-payment count after this cycle's payment, OR
+    the sentinel string "UNVERIFIED" (never an int in that case) when a
+    genuine negative-payment reversal's exposure can't be measured against
+    a valid Scheduled Payment — callers MUST check for this sentinel before
+    passing the result to _missed_count_to_status.
 
     A period is only treated as "paid" if the amount received covers at
     least PAYMENT_SUFFICIENCY_THRESHOLD (80%) of the scheduled payment for
     that installment — receiving *some* payment isn't enough on its own.
-    A payment below that threshold moves the loan down one delinquency
-    rank, exactly the same as receiving nothing at all. Payments covering
-    multiple installments' worth (e.g. a catch-up payment) still reduce
-    the missed count by the number of full installments covered, each
-    judged against the same 80% threshold."""
+    Payments covering multiple installments' worth (e.g. a catch-up
+    payment) still reduce the missed count by the number of full
+    installments covered, each judged against the same 80% threshold.
+
+    CLIENT-CONFIRMED: a ZERO payment and a NEGATIVE payment are NOT the
+    same thing and must not be handled identically.
+      - payment_received == 0: always exactly one miss (+1), regardless of
+        Scheduled Payment — unchanged from before this reversal logic
+        existed. Some servicer submissions zero out BOTH fields together
+        for a no-payment month, which shouldn't be mistaken for "no
+        scheduled amount exists" and silently skipped.
+      - payment_received < 0: a REVERSAL. The prior posted payment was
+        clawed back AND this cycle's scheduled installment also went
+        unpaid, so the total delinquency EXPOSURE this cycle is the
+        current scheduled obligation PLUS the absolute value of the
+        reversed amount — two distinct unpaid obligations stacked, not
+        one. That combined exposure is measured in "installments" using
+        the SAME 80% sufficiency standard as every other ratio in this
+        engine (see PAYMENT_SUFFICIENCY_THRESHOLD): installments =
+        ceil(exposure/scheduled - (1 - THRESHOLD)) — i.e. reaching at
+        least 80% of the way into an additional installment counts that
+        installment as fully represented, exactly mirroring how 80% of a
+        single installment already counts as "paid" elsewhere in this
+        file. Client-confirmed against scheduled=$200: payment=-100 -> 2
+        ranks, payment=-200 -> 2 ranks, payment=-450 -> 4 ranks.
+        NO-GUESS: if Scheduled Payment is missing/zero/NaN, the exposure
+        can't be expressed as a number of installments at all — this
+        returns "UNVERIFIED" rather than fabricating a rank advancement.
+    """
     if payment_received is None or pd.isna(payment_received):
         payment_received = 0
     received = float(payment_received)
 
-    # a $0 payment is always a miss, regardless of what the Scheduled
-    # Payment field says — some servicer submissions zero out BOTH fields
-    # together for a no-payment month, which shouldn't be mistaken for
-    # "no scheduled amount exists" and silently skipped
-    if received <= 0:
+    if received == 0:
         return prior_missed_count + 1
+
+    if received < 0:
+        if scheduled_payment is None or pd.isna(scheduled_payment) or scheduled_payment == 0:
+            return "UNVERIFIED"
+        exposure = float(scheduled_payment) + abs(received)
+        ratio = exposure / float(scheduled_payment)
+        # Rounded to 9 decimal places -- just enough to absorb genuine
+        # float64 arithmetic noise (~1e-13 to 1e-15 in practice, e.g. from
+        # ratio*scheduled not landing on an exact value), while still
+        # correctly distinguishing a ratio that is genuinely, if only
+        # slightly, past a threshold boundary (e.g. 1.2000001 vs. exactly
+        # 1.2) from one that sits exactly on it. 6 decimal places was
+        # tried first and found to be too coarse -- it silently rounded
+        # 1.2000001 down to 1.2 and 2.2000001 down to 2.2, incorrectly
+        # suppressing a rank advance that should have fired. Verified
+        # against ratios of 1.00/1.19/1.20/1.2000001/1.79/1.80/1.8000001/
+        # 2.00/2.20/2.2000001 (scheduled=200): exactly-on-the-boundary
+        # ratios (1.20, 1.80, 2.20) correctly do NOT advance an extra
+        # rank; ratios even fractionally past a boundary (1.2000001,
+        # 2.2000001) correctly do.
+        installments = math.ceil(round(ratio - (1 - PAYMENT_SUFFICIENCY_THRESHOLD), 9))
+        return prior_missed_count + installments
 
     if scheduled_payment is None or pd.isna(scheduled_payment) or scheduled_payment == 0:
         # can't compute a ratio without a valid scheduled amount to divide
@@ -959,7 +1006,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             calculated_dq = "UNVERIFIED"
         elif has_payment_cols:
             new_missed = _apply_payment_transition(0, received, scheduled)
-            calculated_dq = _missed_count_to_status(new_missed)
+            calculated_dq = "UNVERIFIED" if new_missed == "UNVERIFIED" else _missed_count_to_status(new_missed)
         else:
             calculated_dq = "CURRENT"
 
@@ -1015,7 +1062,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             calculated_dq = "UNVERIFIED"
         elif has_payment_cols and prior_missed is not None:
             new_missed = _apply_payment_transition(prior_missed, received, scheduled)
-            calculated_dq = _missed_count_to_status(new_missed)
+            calculated_dq = "UNVERIFIED" if new_missed == "UNVERIFIED" else _missed_count_to_status(new_missed)
         else:
             calculated_dq = str(soup_dq_raw).strip().upper()
     elif has_payment_cols and prior_missed is not None:
@@ -1023,7 +1070,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             calculated_dq = "UNVERIFIED"
         else:
             new_missed = _apply_payment_transition(prior_missed, received, scheduled)
-            calculated_dq = _missed_count_to_status(new_missed)
+            calculated_dq = "UNVERIFIED" if new_missed == "UNVERIFIED" else _missed_count_to_status(new_missed)
     else:
         # fall back to the original straight string comparison if payment
         # columns aren't available or prior status is unparseable
@@ -1262,6 +1309,17 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
 
     calculated_dq_by_loan = {}
     prior_status_by_loan = {}
+    # For each GP, if the CONSOLIDATED net payment this cycle is itself
+    # negative, compute how many installments that net reversal represents
+    # by reusing the exact same _apply_payment_transition formula (starting
+    # from a hypothetical zero baseline — the increment a negative payment
+    # contributes doesn't depend on the prior missed count, so this yields
+    # the reversal's installment-equivalent directly without duplicating
+    # the math). This is deliberately a NET-CYCLE figure computed ONCE per
+    # GP, not per individual negative posting — per the client's explicit
+    # instruction not to double-count reversal impact when a GP has
+    # multiple postings this cycle.
+    reversal_installments_by_loan = {}
     for gp, row in si_grouped.iterrows():
         soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip() if gp in soup_latest.index else ""
         soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "") if gp in soup_latest.index else ""
@@ -1280,6 +1338,10 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
         # a real status label.
         calculated_dq_by_loan[gp] = calculated_dq
 
+        net_received = row.get("received")
+        if net_received is not None and pd.notna(net_received) and float(net_received) < 0:
+            reversal_installments_by_loan[gp] = _apply_payment_transition(0, net_received, row.get("scheduled"))
+
     # scan the RAW, un-aggregated rows -- a negative posting can be masked by
     # a positive one in the same cycle's summed total, so each posting needs
     # to be checked individually rather than relying on the aggregate sum
@@ -1287,12 +1349,30 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
     for _, row in negative_rows.iterrows():
         gp = row["SBA GP Number"]
         period = _fmt_date(row.get("Payment Receipt Date")) if "Payment Receipt Date" in si.columns else ""
+        consolidated_row = si_grouped.loc[gp] if gp in si_grouped.index else None
+        scheduled_val = consolidated_row.get("scheduled") if consolidated_row is not None else None
+        reversal_installments = reversal_installments_by_loan.get(gp)
+        if reversal_installments is None:
+            # This GP's net CONSOLIDATED cycle payment isn't itself negative
+            # (other postings offset it) — the installment-equivalent
+            # concept doesn't apply to the net cycle result, so it's not
+            # fabricated here; the individual posting is still shown above
+            # for transparency, per the client's explicit instruction.
+            reversal_display = "N/A — net cycle payment not negative"
+        elif reversal_installments == "UNVERIFIED":
+            reversal_display = "UNVERIFIED — Scheduled Payment insufficient to determine"
+        else:
+            reversal_display = reversal_installments
+
         records.append({
             "SBA GP Number": gp,
             "Period / Month": period,
             "Negative Payment Amount": round(float(row["Payment Received"]), 2),
+            "Scheduled Payment": round(float(scheduled_val), 2) if scheduled_val is not None and pd.notna(scheduled_val) else "",
             "Prior Period Status": prior_status_by_loan.get(gp, ""),
             "Current Period Status (Calculated)": calculated_dq_by_loan.get(gp, ""),
+            "Reversal Installment Equivalent": reversal_display,
+            "Rank Advancement Caused by Reversal": reversal_display,
             "Note": "Reversed payment — review delinquency status manually",
         })
 
@@ -1301,9 +1381,11 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
     return _result(
         "NEG-01", "Negative Payment Flags", "SBA Reconciliation", "WARN", records,
         lambda n: f"{n} payment posting(s) with a negative Payment Received amount this cycle "
-                  f"(typically a reversal) — flagged for manual review. Delinquency status "
-                  f"calculations are NOT auto-adjusted for these; a reviewer should confirm the "
-                  f"correct status by hand.",
+                  f"(typically a reversal) — flagged for visibility. The Calculated Delinquency "
+                  f"Status shown already accounts for the reversal automatically (treated as "
+                  f"additional unpaid obligation on top of this cycle's scheduled payment, per the "
+                  f"same 80% sufficiency engine used everywhere else) — this tab does not require "
+                  f"manual recalculation, only review of the resulting status.",
     )
 
 

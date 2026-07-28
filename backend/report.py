@@ -156,9 +156,11 @@ CHECK_LEGEND = [
      "(e.g. a catch-up payment) so they aren't mistaken for a data error elsewhere in the report."),
     ("Negative Payment Flags", "WARN",
      "Flags any individual payment posting this cycle with a negative amount received "
-     "(typically a reversal of a prior payment). This does NOT change the delinquency status "
-     "calculation shown elsewhere in this report — it's a visibility flag only, so these loans "
-     "can be manually reviewed and their status adjusted by hand if needed."),
+     "(typically a reversal of a prior payment). The Calculated Delinquency Status shown here "
+     "and in Status / Delinquency Match already accounts for the reversal automatically — "
+     "treated as additional unpaid obligation on top of this cycle's scheduled payment, using "
+     "the same 80% sufficiency standard as any other loan, not a flat one-rank miss like a $0 "
+     "payment. This tab is for visibility into which postings were reversals."),
 ]
 
 
