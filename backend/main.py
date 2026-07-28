@@ -38,9 +38,14 @@ load_dotenv(override=False)
 
 app = FastAPI(title="FalconBridge Audit Intelligence")
 
+ALLOWED_ORIGINS = [
+    "https://falconbridge-audit-frontend.onrender.com",  # production frontend
+    "http://localhost:5173",                             # local Vite dev server
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # POC — lock down after deployment
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,9 +56,12 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 
 # Holds the full SOUP dataset per audit session so the chatbot can look up
 # ANY account on demand (flagged or not), not just whatever was pre-loaded
-# into the chat context. Sessions expire after SESSION_TTL_SECONDS.
+# into the chat context. Sessions expire after SESSION_TTL_SECONDS, and the
+# cache is additionally hard-capped at MAX_SESSIONS entries (oldest evicted
+# first) so a burst of public traffic can't grow memory unbounded.
 SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 3600
+MAX_SESSIONS = 10
 
 
 def _cleanup_old_sessions():
@@ -61,6 +69,12 @@ def _cleanup_old_sessions():
     expired = [sid for sid, entry in SESSION_CACHE.items() if now - entry["created"] > SESSION_TTL_SECONDS]
     for sid in expired:
         del SESSION_CACHE[sid]
+
+    overflow = len(SESSION_CACHE) - MAX_SESSIONS
+    if overflow > 0:
+        oldest_first = sorted(SESSION_CACHE.items(), key=lambda kv: kv[1]["created"])
+        for sid, _ in oldest_first[:overflow]:
+            del SESSION_CACHE[sid]
 
 
 # Caps chosen against measured token cost at Lendistry scale (~1,444 rows,
@@ -288,6 +302,7 @@ async def audit(
         session_id = str(uuid.uuid4())
         _cleanup_old_sessions()
         SESSION_CACHE[session_id] = {"soup_df": soup_df, "created": time.time()}
+        _cleanup_old_sessions()
 
         return JSONResponse({
             "results": all_results,
