@@ -406,8 +406,13 @@ def _markdown_tables_to_excel_b64(tables):
     return b64, filename
 
 
+CHATBOT_ENABLED = False  # temporarily disabled pending review — flip to True to re-enable
+
+
 @app.post("/api/chat")
 async def chat(payload: dict):
+    if not CHATBOT_ENABLED:
+        return JSONResponse({"error": "Chat is temporarily unavailable."}, status_code=503)
     try:
         message = payload.get("message", "")
         history = payload.get("history", [])

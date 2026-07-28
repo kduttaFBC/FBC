@@ -167,7 +167,8 @@ export default function App() {
       {screen === 'results' && audit && (
         <div className="content">
           <ResultsScreen audit={audit} onNewAudit={resetAll} onExit={() => setScreen('ended')} />
-          <Chatbot auditContext={audit.chat_context} summary={audit.summary} results={audit.results} sessionId={audit.session_id} />
+          {/* Chatbot temporarily disabled pending review — uncomment to re-enable */}
+          {/* <Chatbot auditContext={audit.chat_context} summary={audit.summary} results={audit.results} sessionId={audit.session_id} /> */}
         </div>
       )}
     </>
