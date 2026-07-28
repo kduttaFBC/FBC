@@ -39,8 +39,8 @@ load_dotenv(override=False)
 app = FastAPI(title="FalconBridge Audit Intelligence")
 
 ALLOWED_ORIGINS = [
-    "https://falconbridge-audit-frontend.onrender.com",  # production frontend
-    "http://localhost:5173",                             # local Vite dev server
+    "https://falconbridge-audit-frontend-5tdw.onrender.com",  # production frontend
+    "http://localhost:5173",                                  # local Vite dev server
 ]
 
 app.add_middleware(

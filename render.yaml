@@ -15,7 +15,7 @@ services:
     staticPublishPath: frontend/dist
     envVars:
       - key: VITE_API_URL
-        value: https://falconbridge-audit-backend.onrender.com
+        value: https://falconbridge-audit-backend-8xmu.onrender.com
     routes:
       - type: rewrite
         source: /*
