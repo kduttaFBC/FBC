@@ -12,7 +12,7 @@ function FileRow({ label, state }) {
   )
 }
 
-export default function ReadyScreen({ soup, servicerFiles, onBack, onRun, loading, error }) {
+export default function ReadyScreen({ soup, memo, servicerFiles, onBack, onRun, loading, error }) {
   return (
     <div className="content">
       <div className="card">
@@ -22,8 +22,12 @@ export default function ReadyScreen({ soup, servicerFiles, onBack, onRun, loadin
         </p>
 
         <div className="mapper-section">
-          <h3>SOUP Performance Dataset</h3>
-          <FileRow label="SOUP Performance Dataset" state={soup} />
+          <h3>Source Files</h3>
+          <FileRow label="SOUP Master File" state={soup} />
+          <FileRow
+            label={`Servicer Memo Summary${memo?.reportingMonth ? ` (${memo.reportingMonth})` : ''}`}
+            state={memo}
+          />
         </div>
 
         <div className="mapper-section">

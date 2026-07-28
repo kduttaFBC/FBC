@@ -23,6 +23,17 @@ export const SERVICER_FIELDS = [
   'Delinquency Status', 'Beginning Balance', 'Ending Balance', 'Payment Received',
 ]
 
+// Second monthly source file, alongside SOUP — supporting servicing/deferral
+// information the audit cross-references against SOUP's loan performance
+// data (see file_readers.read_service_memo / checks._lookup_deferral on the
+// backend). Workbook structure is fixed; only the loan-level data changes
+// each month, same as SOUP and the servicer files.
+export const MEMO_FIELDS = [
+  'Report Date', 'Lender', 'SBA Loan ID', 'Lender Loan ID', 'Borrower Name',
+  'Servicer Action', 'Deferral Start Date', 'Deferral End Date',
+  'Regular Payment Resume Date',
+]
+
 // Right-side slot labels. First is Poppy Bank (the file we already have);
 // the rest are placeholders until each servicer's file is confirmed.
 // Both Lendistry and Millennium Bank submit two separate SBA note-series
@@ -53,6 +64,11 @@ export const SERVICER_SOUP_KEYS = {
   'Lendistry 2024': 'Lendistry',
   'Millennium 2025': 'Millennium Bank',
   'Millennium 2024': 'Millennium Bank',
+  // SOUP's Servicer column spells this with "&", not "and" — without this
+  // mapping, filter_soup_by_servicer finds zero matching SOUP rows for this
+  // servicer, which silently makes every history-dependent check (BAL-01,
+  // STAT-01, PAY-01...) skip every loan instead of actually checking it.
+  'Community Bank and Trust': 'Community Bank & Trust',
 }
 
 export default function App() {
@@ -61,14 +77,16 @@ export default function App() {
 
   // validated files (File objects) and their detected headers/rows
   const [soup, setSoup] = useState(null) // { file, headers, rowCount, sheetName }
+  const [memo, setMemo] = useState(null) // { file, headers, rowCount, sheetName } — optional
   const [servicerFiles, setServicerFiles] = useState(Array(SERVICER_SLOTS.length).fill(null))
 
   const [audit, setAudit] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  const goToReady = (soupFile, servicers) => {
+  const goToReady = (soupFile, memoFile, servicers) => {
     setSoup(soupFile)
+    setMemo(memoFile)
     setServicerFiles(servicers)
     setScreen('ready')
   }
@@ -79,6 +97,13 @@ export default function App() {
     try {
       const form = new FormData()
       form.append('soup_file', soup.file)
+      // Servicer Memo Summary is a separate source document — sent as its
+      // own field, never merged into soup_file. It's optional: the backend
+      // (checks.run_servicer_reconciliation) degrades gracefully to
+      // pre-deferral-aware behavior when it's not provided.
+      if (memo && memo.valid) {
+        form.append('memo_file', memo.file)
+      }
       servicerFiles.forEach((s, i) => {
         if (s && s.valid) {
           const label = SERVICER_SLOTS[i]
@@ -101,7 +126,7 @@ export default function App() {
     } catch (err) {
       const msg =
         err.response?.data?.error ||
-        'The audit backend has not been updated for the new files yet. Upload flow and validation are ready for UAT — audit logic is next.'
+        'The audit could not be completed. Please check your files and try again. If the issue continues, review the server error details.'
       setError(msg)
     } finally {
       setLoading(false)
@@ -110,6 +135,7 @@ export default function App() {
 
   const resetAll = () => {
     setSoup(null)
+    setMemo(null)
     setServicerFiles(Array(SERVICER_SLOTS.length).fill(null))
     setAudit(null)
     setError('')
@@ -129,6 +155,7 @@ export default function App() {
       {screen === 'ready' && (
         <ReadyScreen
           soup={soup}
+          memo={memo}
           servicerFiles={servicerFiles}
           onBack={() => setScreen('upload')}
           onRun={runAudit}

@@ -64,6 +64,34 @@ button { font-family: inherit; }
   padding: 22px;
 }
 
+/* ---------- Source files (SOUP + supporting monthly sources) ---------- */
+/* Auto-fit grid: two cards sit side by side once there's room for both at a
+   reasonable width, and stack on narrow screens — same responsive approach
+   as .servicer-grid, just with a wider minimum so these cards (which carry
+   more detail) don't get cramped. Using auto-fit rather than a hardcoded
+   column count also means a future third source file can be added here
+   without touching this layout at all. */
+.source-files-section { margin-top: -28px; margin-bottom: 22px; }
+.source-files-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 22px;
+  align-items: start;
+}
+
+.source-role {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--blue);
+  background: var(--blue-light);
+  border-radius: 5px;
+  padding: 3px 8px;
+  margin-bottom: 8px;
+}
+
 /* ---------- Upload ---------- */
 .upload-grid {
   display: grid;

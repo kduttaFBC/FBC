@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react'
 import * as XLSX from 'xlsx'
-import { SOUP_FIELDS, SERVICER_FIELDS, SERVICER_SLOTS } from '../App.jsx'
+import { SOUP_FIELDS, SERVICER_FIELDS, SERVICER_SLOTS, MEMO_FIELDS } from '../App.jsx'
 
 const MAX_HEADER_SCAN_ROWS = 15
 
@@ -81,7 +81,7 @@ function countActualDataRows(sheet, startRow, endRow, col) {
   return count
 }
 
-function parseWorkbookForFields(file, requiredFields) {
+function parseWorkbookForFields(file, requiredFields, monthColumn) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = (e) => {
@@ -89,27 +89,39 @@ function parseWorkbookForFields(file, requiredFields) {
       // state actually paints, then do the parse itself off the click handler
       setTimeout(() => {
         try {
-          const wb = XLSX.read(e.target.result, { type: 'array' })
+          const wb = XLSX.read(e.target.result, { type: 'array', cellDates: true })
           const best = findBestHeaderRow(wb, requiredFields)
 
           // require at least half the fields to show up somewhere, or we've
           // likely picked the wrong sheet/row entirely
           if (best.matches < Math.ceil(requiredFields.length / 2)) {
-            resolve({ headers: [], rowCount: 0, sheetName: null })
+            resolve({ headers: [], rowCount: 0, sheetName: null, reportingMonth: null })
             return
           }
 
           const headers = (best.headerRow || []).map((h) => String(h).trim()).filter((h) => h !== '')
           const sheet = wb.Sheets[best.sheetName]
           const fullRange = XLSX.utils.decode_range(sheet['!ref'])
+          // Check for data starting at the column where the header row's
+          // first real (non-blank) cell actually is, not blindly the
+          // sheet's absolute leftmost column — some files (e.g. the
+          // Servicer Memo Summary) leave column A entirely blank with real
+          // data starting in column B onward, which would otherwise make
+          // every row look empty and wrongly report 0 rows found.
+          const firstDataColOffset = (best.headerRow || []).findIndex(
+            (h) => h !== undefined && h !== null && String(h).trim() !== ''
+          )
           const rowCount = countActualDataRows(
             sheet,
             fullRange.s.r + best.rowIndex + 1,
             fullRange.e.r,
-            fullRange.s.c,
+            fullRange.s.c + Math.max(0, firstDataColOffset),
           )
+          const reportingMonth = monthColumn
+            ? extractLatestMonth(sheet, best.rowIndex, headers, monthColumn)
+            : null
 
-          resolve({ headers, rowCount, sheetName: best.sheetName })
+          resolve({ headers, rowCount, sheetName: best.sheetName, reportingMonth })
         } catch (err) {
           reject(err)
         }
@@ -125,7 +137,37 @@ function findMissing(requiredFields, headers) {
   return requiredFields.filter((f) => !lower.includes(f.toLowerCase()))
 }
 
-function UploadCard({ title, subtitle, requiredFields, state, onFile, compact, reading }) {
+// Scans a single column across ALL of a sheet's data rows (not just the
+// header-scan window) for the latest parseable date, used to surface a
+// "reporting month" for source files like the Servicer Memo Summary that
+// carry one row per entry rather than one value per file. Never hardcodes a
+// month — it's derived fresh from whatever file was actually uploaded, so a
+// new month's file just produces a new answer automatically. Returns a
+// formatted "Month YYYY" string, or null if no parseable date is found
+// (callers should show "Not available" rather than guessing).
+function extractLatestMonth(sheet, headerRowIndex, headers, columnName) {
+  const colIdx = headers.findIndex((h) => norm(h) === norm(columnName))
+  if (colIdx === -1 || !sheet['!ref']) return null
+
+  const fullRange = XLSX.utils.decode_range(sheet['!ref'])
+  const range = {
+    s: { r: fullRange.s.r + headerRowIndex + 1, c: fullRange.s.c + colIdx },
+    e: { r: fullRange.e.r, c: fullRange.s.c + colIdx },
+  }
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', range, raw: false })
+
+  let latest = null
+  rows.forEach((row) => {
+    const raw = row[0]
+    if (raw === '' || raw == null) return
+    const parsed = raw instanceof Date ? raw : new Date(raw)
+    if (!isNaN(parsed) && (!latest || parsed > latest)) latest = parsed
+  })
+  if (!latest) return null
+  return latest.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+}
+
+function UploadCard({ title, subtitle, roleLabel, requiredFields, state, onFile, compact, reading, showValidationLabel }) {
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef(null)
 
@@ -135,6 +177,7 @@ function UploadCard({ title, subtitle, requiredFields, state, onFile, compact, r
 
   return (
     <div className={`card upload-card ${compact ? 'upload-card-compact' : ''}`}>
+      {roleLabel && <div className="source-role">{roleLabel}</div>}
       <h3>{title}</h3>
       {subtitle && <div className="hint">{subtitle}</div>}
 
@@ -181,6 +224,10 @@ function UploadCard({ title, subtitle, requiredFields, state, onFile, compact, r
           <div className="meta">
             {state.rowCount} data row(s) detected{state.sheetName ? ` in "${state.sheetName}"` : ''} — looks good.
           </div>
+          {state.reportingMonth && (
+            <div className="meta">Reporting month: <strong>{state.reportingMonth}</strong></div>
+          )}
+          {showValidationLabel && <div className="meta">Validation status: <strong>Passed</strong></div>}
           <button className="link-btn" onClick={() => onFile(null)}>Replace file</button>
         </div>
       )}
@@ -189,6 +236,7 @@ function UploadCard({ title, subtitle, requiredFields, state, onFile, compact, r
         <div className="file-state error">
           <div className="fname">✗ {state.fileName || 'Upload failed'}</div>
           <div className="meta">{state.message}</div>
+          {showValidationLabel && <div className="meta">Validation status: <strong>Failed</strong></div>}
           <button className="link-btn" onClick={() => onFile(null)}>Replace file</button>
         </div>
       )}
@@ -199,10 +247,12 @@ function UploadCard({ title, subtitle, requiredFields, state, onFile, compact, r
 export default function UploadScreen({ onContinue }) {
   const [soup, setSoup] = useState(null)
   const [soupReading, setSoupReading] = useState(false)
+  const [memo, setMemo] = useState(null)
+  const [memoReading, setMemoReading] = useState(false)
   const [servicerFiles, setServicerFiles] = useState(Array(SERVICER_SLOTS.length).fill(null))
   const [servicerReading, setServicerReading] = useState(Array(SERVICER_SLOTS.length).fill(false))
 
-  const validateAndSet = (requiredFields, file, applyState, setReading) => async (fileArg) => {
+  const validateAndSet = (requiredFields, file, applyState, setReading, monthColumn) => async (fileArg) => {
     if (!fileArg) { applyState(null); return }
 
     const name = fileArg.name.toLowerCase()
@@ -217,7 +267,7 @@ export default function UploadScreen({ onContinue }) {
 
     setReading?.(true)
     try {
-      const { headers, rowCount, sheetName } = await parseWorkbookForFields(fileArg, requiredFields)
+      const { headers, rowCount, sheetName, reportingMonth } = await parseWorkbookForFields(fileArg, requiredFields, monthColumn)
       if (!headers.length || rowCount < 1) {
         applyState({
           valid: false,
@@ -235,7 +285,7 @@ export default function UploadScreen({ onContinue }) {
         })
         return
       }
-      applyState({ valid: true, fileName: fileArg.name, headers, rowCount, sheetName, file: fileArg })
+      applyState({ valid: true, fileName: fileArg.name, headers, rowCount, sheetName, reportingMonth, file: fileArg })
     } catch (err) {
       applyState({
         valid: false,
@@ -248,6 +298,8 @@ export default function UploadScreen({ onContinue }) {
   }
 
   const handleSoupFile = validateAndSet(SOUP_FIELDS, null, setSoup, setSoupReading)
+
+  const handleMemoFile = validateAndSet(MEMO_FIELDS, null, setMemo, setMemoReading, 'Report Date')
 
   const handleServicerFile = (idx) => validateAndSet(SERVICER_FIELDS, null, (state) => {
     setServicerFiles((cur) => {
@@ -267,18 +319,22 @@ export default function UploadScreen({ onContinue }) {
   const servicerErrorCount = servicerFiles.filter((s) => s && !s.valid).length
   const soupValid = soup?.valid
   const soupError = soup && !soup.valid
+  const memoError = memo && !memo.valid
 
-  // Ready to continue once soup is valid and at least one servicer file
-  // (any of the 8 slots) is valid.
-  const canContinue = soupValid && servicerFiles.some((s) => s?.valid)
+  // Servicer Memo Summary is optional (the backend degrades gracefully
+  // without it), so it never blocks continuing on its own — but if one was
+  // uploaded and failed validation, that's surfaced and must be resolved
+  // rather than silently ignored (per "do not silently process the file").
+  const canContinue = soupValid && servicerFiles.some((s) => s?.valid) && !memoError
 
   let status = { cls: 'gray', text: 'Upload the SOUP dataset and at least one servicer file to continue' }
-  if (soupError || servicerErrorCount > 0) {
+  if (soupError || servicerErrorCount > 0 || memoError) {
     status = { cls: 'red', text: 'Fix the file errors above before continuing' }
   } else if (canContinue) {
+    const memoNote = memo?.valid ? ', Servicer Memo Summary validated' : ''
     status = {
       cls: 'green',
-      text: `Ready — SOUP dataset validated, ${servicerValidCount} of ${SERVICER_SLOTS.length} servicer file(s) uploaded`,
+      text: `Ready — SOUP dataset validated${memoNote}, ${servicerValidCount} of ${SERVICER_SLOTS.length} servicer file(s) uploaded`,
     }
   } else if (soupValid && servicerValidCount === 0) {
     status = { cls: 'amber', text: 'Waiting for at least one servicer file' }
@@ -290,6 +346,9 @@ export default function UploadScreen({ onContinue }) {
     if (!canContinue) return
     onContinue(
       { valid: true, fileName: soup.fileName, file: soup.file, headers: soup.headers, rowCount: soup.rowCount, sheetName: soup.sheetName },
+      memo?.valid
+        ? { valid: true, fileName: memo.fileName, file: memo.file, headers: memo.headers, rowCount: memo.rowCount, sheetName: memo.sheetName, reportingMonth: memo.reportingMonth }
+        : null,
       servicerFiles,
     )
   }
@@ -302,37 +361,51 @@ export default function UploadScreen({ onContinue }) {
       </div>
 
       <div className="content">
-        <div className="split-layout">
-          <div className="split-col split-col-left">
+        {/* Source files: SOUP is the primary monthly performance data;
+            Servicer Memo Summary is a supporting source the audit engine
+            cross-references it against (currently for deferral info). Grid
+            is auto-fit so a future third source file can simply be added
+            here without any layout rework. */}
+        <div className="source-files-section">
+          <div className="source-files-row">
             <UploadCard
-              title="SOUP Performance Dataset"
-              subtitle="Standard loan performance file (~25,000 records)"
+              title="SOUP Master File"
+              roleLabel="Primary source"
+              subtitle="Primary monthly loan performance data (~25,000 records)"
               requiredFields={SOUP_FIELDS}
               state={soup}
               onFile={handleSoupFile}
               reading={soupReading}
             />
+            <UploadCard
+              title="Servicer Memo Summary"
+              roleLabel="Supporting source"
+              subtitle="Supporting monthly servicing and deferral information"
+              requiredFields={MEMO_FIELDS}
+              state={memo}
+              onFile={handleMemoFile}
+              reading={memoReading}
+              showValidationLabel
+            />
           </div>
+        </div>
 
-          <div className="split-col split-col-right">
-            <div className="servicer-panel-header">
-              <h3>Servicer Files</h3>
-              <div className="hint">Poppy Bank + up to 7 additional servicer SRF files (same template)</div>
-            </div>
-            <div className="servicer-grid">
-              {SERVICER_SLOTS.map((label, idx) => (
-                <UploadCard
-                  key={label}
-                  title={label}
-                  requiredFields={SERVICER_FIELDS}
-                  state={servicerFiles[idx]}
-                  onFile={handleServicerFile(idx)}
-                  compact
-                  reading={servicerReading[idx]}
-                />
-              ))}
-            </div>
-          </div>
+        <div className="servicer-panel-header">
+          <h3>Servicer Files</h3>
+          <div className="hint">Poppy Bank + up to 7 additional servicer SRF files (same template)</div>
+        </div>
+        <div className="servicer-grid">
+          {SERVICER_SLOTS.map((label, idx) => (
+            <UploadCard
+              key={label}
+              title={label}
+              requiredFields={SERVICER_FIELDS}
+              state={servicerFiles[idx]}
+              onFile={handleServicerFile(idx)}
+              compact
+              reading={servicerReading[idx]}
+            />
+          ))}
         </div>
 
         <div className={`status-bar ${status.cls}`}>{status.text}</div>

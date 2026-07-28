@@ -6,6 +6,11 @@ Endpoints:
   POST /api/chat             chat with FalconBridge AI about the audit
 """
 
+# Makes 3.10+ union type-hint syntax (e.g. `list | None`) work on Python
+# 3.9 by deferring annotation evaluation to strings instead of evaluating
+# them eagerly at import time — no behavior change, just compatibility.
+from __future__ import annotations
+
 import io
 import os
 import sys
@@ -171,6 +176,7 @@ def health():
 async def audit(
     soup_file: UploadFile = File(...),
     servicer_files: List[UploadFile] = File(...),
+    memo_file: UploadFile = File(None),
 ):
     try:
         _cleanup_old_reports()
@@ -185,13 +191,28 @@ async def audit(
         del soup_bytes
         gc.collect()
 
+        # Servicer Memo Summary is optional — STAT-01 degrades gracefully to
+        # its pre-deferral-aware behavior without it (see
+        # checks.run_servicer_reconciliation docstring).
+        memo_df = None
+        if memo_file is not None:
+            memo_bytes = await memo_file.read()
+            try:
+                memo_df = file_readers.read_service_memo(memo_bytes)
+            except ValueError as exc:
+                return JSONResponse(status_code=400, content={
+                    "error": f"Could not read the Servicer Memo Summary: {exc}",
+                })
+            del memo_bytes
+            gc.collect()
+
         all_results = []
         servicer_loan_counts = {}
 
         for uploaded in servicer_files:
             file_bytes = await uploaded.read()
             try:
-                soup_key, display_label, loan_terms_df, servicer_inputs_df = file_readers.read_servicer_file(
+                soup_key, display_label, loan_terms_df, servicer_inputs_df, deal = file_readers.read_servicer_file(
                     file_bytes, filename=uploaded.filename
                 )
             except ValueError as exc:
@@ -210,23 +231,46 @@ async def audit(
 
             results = checks_mod.run_servicer_reconciliation(
                 display_label, loan_terms_df, servicer_inputs_df, soup_servicer_df,
+                memo_df=memo_df, memo_lender_key=soup_key, deal=deal,
             )
             all_results.extend(results)
             servicer_loan_counts[display_label] = len(servicer_inputs_df)
 
         summary = checks_mod.summarize(all_results, len(soup_df), servicer_loan_counts)
 
-        # POP-01 is excluded from the downloadable report only — it still
-        # runs and still feeds the chatbot/summary, just skips the (mostly
-        # redundant) Excel tab per servicer to cut report generation work.
-        REPORT_EXCLUDED_CHECK_IDS = {"POP-01"}
+        # Client-facing Excel report: BAL-01 and STAT-01 are the primary
+        # controls (balance continuity, deferral-aware delinquency status).
+        # Everything else here still runs in full above (all_results is
+        # untouched) and still feeds the JSON response / chatbot / frontend
+        # dashboard — this set ONLY controls which checks get a tab in the
+        # downloadable Excel workbook.
+        #   POP-01: important control, kept running, but doesn't need its
+        #     own detail tab (174-loan Servicer + Deal population match is
+        #     unchanged — see population_check).
+        #   PAY-01, DUP-01, NEG-01: diagnostic/internal — informational,
+        #     not yet part of the client's core monthly SRF QC scope.
+        #   PAY-02: business rule (Scheduled Payment - (Payment Received +
+        #     Servicing Fee)) not yet validated against the client's
+        #     corrected SRF workbook — held out of the client-facing report
+        #     until that validation happens, NOT rewritten or disabled.
+        REPORT_EXCLUDED_CHECK_IDS = {"POP-01", "PAY-01", "PAY-02", "DUP-01", "NEG-01"}
         report_results = [
             r for r in all_results
             if r["id"].split("::")[0] not in REPORT_EXCLUDED_CHECK_IDS
         ]
 
+        # The Excel workbook's own Summary tab banner ("Total issues: N")
+        # must reflect only what the workbook actually contains (BAL-01 +
+        # STAT-01), not the full 7-check total — otherwise the banner would
+        # show issue counts (e.g. from PAY-02) that no visible tab explains.
+        # This is intentionally a SEPARATE summary from `summary` above:
+        # `summary` still reflects all_results and is what the JSON
+        # response / frontend dashboard scorecards / chatbot context use,
+        # unchanged.
+        report_summary = checks_mod.summarize(report_results, len(soup_df), servicer_loan_counts)
+
         excel_buffer = io.BytesIO()
-        report_mod.generate_report_bytes(report_results, summary, excel_buffer)
+        report_mod.generate_report_bytes(report_results, report_summary, excel_buffer)
         excel_b64 = base64.b64encode(excel_buffer.getvalue()).decode("utf-8")
 
         flagged_gps = _flagged_gp_numbers(all_results)  # already capped to MAX_FLAGGED_LOANS_FOR_HISTORY
