@@ -252,39 +252,17 @@ async def audit(
 
         summary = checks_mod.summarize(all_results, len(soup_df), servicer_loan_counts)
 
-        # Client-facing Excel report: BAL-01 and STAT-01 are the primary
-        # controls (balance continuity, deferral-aware delinquency status).
-        # Everything else here still runs in full above (all_results is
-        # untouched) and still feeds the JSON response / chatbot / frontend
-        # dashboard — this set ONLY controls which checks get a tab in the
-        # downloadable Excel workbook.
-        #   POP-01: important control, kept running, but doesn't need its
-        #     own detail tab (174-loan Servicer + Deal population match is
-        #     unchanged — see population_check).
-        #   PAY-01, DUP-01, NEG-01: diagnostic/internal — informational,
-        #     not yet part of the client's core monthly SRF QC scope.
-        #   PAY-02: business rule (Scheduled Payment - (Payment Received +
-        #     Servicing Fee)) not yet validated against the client's
-        #     corrected SRF workbook — held out of the client-facing report
-        #     until that validation happens, NOT rewritten or disabled.
-        REPORT_EXCLUDED_CHECK_IDS = {"POP-01", "PAY-01", "PAY-02", "DUP-01", "NEG-01"}
-        report_results = [
-            r for r in all_results
-            if r["id"].split("::")[0] not in REPORT_EXCLUDED_CHECK_IDS
-        ]
-
-        # The Excel workbook's own Summary tab banner ("Total issues: N")
-        # must reflect only what the workbook actually contains (BAL-01 +
-        # STAT-01), not the full 7-check total — otherwise the banner would
-        # show issue counts (e.g. from PAY-02) that no visible tab explains.
-        # This is intentionally a SEPARATE summary from `summary` above:
-        # `summary` still reflects all_results and is what the JSON
-        # response / frontend dashboard scorecards / chatbot context use,
-        # unchanged.
-        report_summary = checks_mod.summarize(report_results, len(soup_df), servicer_loan_counts)
-
+        # The downloadable Excel workbook is now a faithful export of the
+        # SAME all_results the JSON response / frontend dashboard / chatbot
+        # use — every check gets its own tab, with the same `summary`
+        # banner. (Previously a REPORT_EXCLUDED_CHECK_IDS set held POP-01,
+        # PAY-01, PAY-02, DUP-01, and NEG-01 out of the Excel export only;
+        # that exclusion was a stale holdover from an earlier point in the
+        # project and has been removed per client request — nothing about
+        # how those checks are calculated changed, only whether they get an
+        # Excel tab.)
         excel_buffer = io.BytesIO()
-        report_mod.generate_report_bytes(report_results, report_summary, excel_buffer)
+        report_mod.generate_report_bytes(all_results, summary, excel_buffer)
         excel_b64 = base64.b64encode(excel_buffer.getvalue()).decode("utf-8")
 
         flagged_gps = _flagged_gp_numbers(all_results)  # already capped to MAX_FLAGGED_LOANS_FOR_HISTORY

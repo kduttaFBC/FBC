@@ -833,13 +833,41 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month):
 
     # Securitization Action is the memo's own authoritative categorical
     # field for what kind of record this is (Deferred / Charge-off /
-    # Modification / an ad-hoc "Change Memo #N" note / etc.) — only rows
-    # explicitly marked "Deferred" are real deferral records. This matters:
-    # some administrative "Change Memo" rows carry the same Deferral Start/
-    # End Date values as a real deferral (apparently copied from it) but
-    # aren't deferrals themselves, and including them causes false matches.
+    # Modification / an ad-hoc "Change Memo #N" note / etc.) — rows
+    # explicitly marked "Deferred" are always real deferral records. This
+    # matters: some administrative "Change Memo" rows carry the same
+    # Deferral Start/End Date values as a real deferral (apparently copied
+    # from it) but aren't deferrals themselves, and including them causes
+    # false matches.
+    #
+    # However, an exact-label-only filter is too narrow: some genuine
+    # deferrals get recorded under a different Securitization Action label
+    # entirely (e.g. "CHANGE IN TERMS AGREEMENT", or a "Modification" row
+    # whose Servicer Action explicitly reads "One-Time 90-Day Deferment").
+    # Discarding those loses real deferral evidence rather than protecting
+    # against a false one. The safe way to recognize them WITHOUT reopening
+    # the prior "administrative row with copied dates" bug: require the
+    # FULL deferral lifecycle — Start, End, AND Resume dates ALL present —
+    # not just a Start Date. Checked exhaustively against every
+    # Securitization Action category present in the actual memo data: no
+    # Charge-off, blank, or incomplete "Change Memo" row EVER has all three
+    # dates populated; only genuine deferrals do, regardless of label. A
+    # fully-specified deferral timeline isn't something an unrelated
+    # administrative record would have by accident — it's evidence, not a
+    # label guess.
     if "Securitization Action" in candidates.columns:
-        candidates = candidates[candidates["Securitization Action"].astype("string").str.strip().str.lower() == "deferred"]
+        sec_action = candidates["Securitization Action"].astype("string").str.strip().str.lower()
+        is_labeled_deferred = sec_action == "deferred"
+        date_cols = {"Deferral Start Date", "Deferral End Date", "Regular Payment Resume Date"}
+        if date_cols.issubset(candidates.columns):
+            has_full_date_lifecycle = (
+                candidates["Deferral Start Date"].notna()
+                & candidates["Deferral End Date"].notna()
+                & candidates["Regular Payment Resume Date"].notna()
+            )
+        else:
+            has_full_date_lifecycle = pd.Series(False, index=candidates.index)
+        candidates = candidates[is_labeled_deferred | has_full_date_lifecycle]
 
     if candidates.empty or "Deferral Start Date" not in candidates.columns:
         return None, None, None
