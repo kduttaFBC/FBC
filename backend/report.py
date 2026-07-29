@@ -145,7 +145,7 @@ CHECK_LEGEND = [
      "month, or a loan that has stopped appearing in SOUP altogether even though it's still "
      "listed as active. Often the most actionable finding — it surfaces loans that have gone "
      "dark in the servicing data."),
-    ("Payment Shortfall Check", "FAIL",
+    ("Payment Shortfall Check", "INFO",
      "Compares the amount actually remitted (payment received plus the servicer's fee, which "
      "is normally netted out before remittance) against the scheduled payment for that loan. "
      "Flags a genuine shortfall or overage beyond a small tolerance. This check depends on "

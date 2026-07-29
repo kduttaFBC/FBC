@@ -1613,6 +1613,11 @@ def missing_payment_periods_check(soup_servicer_df, loan_terms_df):
 # before remittance — that's expected and NOT flagged. Only genuine
 # shortfalls (or overages) beyond the fee-adjusted amount are surfaced.
 #
+# CLIENT REQUEST: severity is INFO, not FAIL — a shortfall here doesn't
+# necessarily represent an actual servicing error worth hard-failing over,
+# so it's surfaced for informational visibility/review rather than as an
+# exception requiring resolution.
+#
 # Note: this check depends on Scheduled Payment and Servicing Fee columns
 # being present in the servicer's file — not every servicer template may
 # include Servicing Fee, so this check can be safely disabled if it doesn't
@@ -1634,7 +1639,7 @@ def payment_shortfall_check(servicer_inputs_df):
     if not required.issubset(servicer_inputs_df.columns):
         return {
             "id": "PAY-02", "name": "Payment Shortfall Check", "category": "SBA Reconciliation",
-            "severity": "FAIL", "status": "PASS", "issues_found": 0,
+            "severity": "INFO", "status": "PASS", "issues_found": 0,
             "details": "No issues found.", "records": [],
         }
 
@@ -1723,8 +1728,8 @@ def payment_shortfall_check(servicer_inputs_df):
         "id": "PAY-02",
         "name": "Payment Shortfall Check",
         "category": "SBA Reconciliation",
-        "severity": "FAIL",
-        "status": "PASS" if not records else "FAIL",
+        "severity": "INFO",
+        "status": "PASS" if not records else "INFO",
         "issues_found": len(records),
         "details": details,
         "records": records,
