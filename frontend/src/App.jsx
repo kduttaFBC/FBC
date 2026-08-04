@@ -53,6 +53,20 @@ export const SERVICER_SLOTS = [
   'Lendistry 2025',
   'Lendistry 2024',
   'Community Bank and Trust',
+  // Added 2026-08-04: 4 new banks, one file each (no note-series split
+  // confirmed for any of them, unlike Millennium/Lendistry above). These
+  // are the exact names as given — NOT yet verified against the actual
+  // spelling used in SOUP's "Servicer" column. Community Bank and Trust
+  // above needed a SERVICER_SOUP_KEYS mapping because SOUP spells it with
+  // "&" not "and" — if any of these 4 have a similar mismatch, their audit
+  // will silently find zero matching SOUP rows (every history-dependent
+  // check skips every loan) until a SERVICER_SOUP_KEYS entry is added
+  // below. Verify each of these against a real SOUP export before relying
+  // on a real audit for these banks.
+  'Shoreham',
+  'Cogent',
+  'FinWise',
+  'X-Caliber',
 ]
 
 // Maps a display label to the servicer name that actually appears in the
@@ -178,8 +192,7 @@ export default function App() {
       {screen === 'results' && audit && (
         <div className="content">
           <ResultsScreen audit={audit} onNewAudit={resetAll} onExit={() => setScreen('ended')} />
-          {/* Chatbot temporarily disabled pending review — uncomment to re-enable */}
-          {/* <Chatbot auditContext={audit.chat_context} summary={audit.summary} results={audit.results} sessionId={audit.session_id} /> */}
+          <Chatbot auditContext={audit.chat_context} summary={audit.summary} results={audit.results} sessionId={audit.session_id} />
         </div>
       )}
     </>

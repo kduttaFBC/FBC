@@ -57,6 +57,18 @@ MEMO_LENDER_ALIASES = {
     "Mission Valley Bank": ["Mission Valley Bank", "Mission Valley Bank, CA"],
     "Peoples Bank": ["Peoples Bank", "Peoples Bank, MS"],
     "Poppy Bank": ["Poppy Bank"],
+    # Added 2026-08-04, PLACEHOLDER single-alias entries only -- no real
+    # Servicer Memo Summary data has been seen yet for these 4 banks. Given
+    # this exact gap silently broke ALL Millennium Bank deferral matching
+    # until a real memo file surfaced the actual spelling variant, treat
+    # these as provisional: the first real memo file received for each of
+    # these banks should be checked for its actual "Lender" column
+    # spelling, and this list expanded to match if it differs from the
+    # plain name below.
+    "Shoreham": ["Shoreham"],
+    "Cogent": ["Cogent"],
+    "FinWise": ["FinWise"],
+    "X-Caliber": ["X-Caliber"],
 }
 
 # Servicer Action free text that identifies a PRINCIPAL-ONLY (or interest-only)
@@ -94,6 +106,13 @@ def classify_deferral_type(servicer_action):
 KNOWN_SERVICERS = [
     "Poppy Bank", "Millennium Bank", "Mission Valley Bank",
     "Peoples Bank", "Lendistry", "Community Bank and Trust",
+    # Added 2026-08-04. This list is only consulted as a fallback for
+    # filenames that don't follow the frontend's current
+    # "{soupKey}||{displayLabel}__{filename}" convention (see
+    # _parse_servicer_filename) -- effectively dead code for uploads through
+    # the current UI, kept updated anyway as defense-in-depth against any
+    # future upload path that bypasses that convention.
+    "Shoreham", "Cogent", "FinWise", "X-Caliber",
 ]
 
 SOUP_FIELDS = [
