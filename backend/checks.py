@@ -616,8 +616,11 @@ def _apply_payment_transition(prior_missed_count, payment_received, scheduled_pa
         total_payment_deficiency = float(scheduled_payment) + abs(received)
         payment_equivalents_removed = max(
             1,
-            math.floor(total_payment_deficiency / float(scheduled_payment)),
-        )
+           math.floor(
+        total_payment_deficiency /
+        (float(scheduled_payment) * PAYMENT_SUFFICIENCY_THRESHOLD)
+    ),
+)
         return prior_missed_count + payment_equivalents_removed, payment_equivalents_removed
 
     # a $0 payment is always a miss, regardless of what the Scheduled
