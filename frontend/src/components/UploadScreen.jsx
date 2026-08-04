@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react'
 import * as XLSX from 'xlsx'
-import { SOUP_FIELDS, SERVICER_FIELDS, SERVICER_SLOTS, MEMO_FIELDS } from '../App.jsx'
+import { SOUP_FIELDS, SERVICER_FIELDS, SERVICER_SLOTS, MEMO_FIELDS, SERVICER_SLOT_LABELS } from '../App.jsx'
 
 const MAX_HEADER_SCAN_ROWS = 15
 
@@ -81,7 +81,7 @@ function countActualDataRows(sheet, startRow, endRow, col) {
   return count
 }
 
-function parseWorkbookForFields(file, requiredFields, monthColumn) {
+function parseWorkbookForFields(file, requiredFields, monthColumn, identityDetect) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = (e) => {
@@ -120,8 +120,11 @@ function parseWorkbookForFields(file, requiredFields, monthColumn) {
           const reportingMonth = monthColumn
             ? extractLatestMonth(sheet, best.rowIndex, headers, monthColumn)
             : null
+          const identity = identityDetect
+            ? detectServicerIdentity(sheet, best.rowIndex, headers, best.sheetName, file.name)
+            : null
 
-          resolve({ headers, rowCount, sheetName: best.sheetName, reportingMonth })
+          resolve({ headers, rowCount, sheetName: best.sheetName, reportingMonth, identity })
         } catch (err) {
           reject(err)
         }
@@ -135,6 +138,118 @@ function parseWorkbookForFields(file, requiredFields, monthColumn) {
 function findMissing(requiredFields, headers) {
   const lower = headers.map((h) => h.toLowerCase().trim())
   return requiredFields.filter((f) => !lower.includes(f.toLowerCase()))
+}
+
+// --- Servicer identity detection ---------------------------------------
+// A comparison file's institution must come from the file itself (or an
+// explicit person's confirmation), never from which upload slot it landed
+// in. This looks for identity signals already present in the file — an
+// identity-style column's actual values, the sheet name, and the filename —
+// and only reports a confident match when exactly one institution (and,
+// for Millennium/Lendistry, exactly one note-series year) shows up across
+// those signals. Anything ambiguous or absent is reported as not confident
+// rather than guessed; the person always gets a chance to confirm or
+// correct the result before it's used (see the identity picker below).
+
+const IDENTITY_COLUMN_CANDIDATES = ['servicer', 'lender', 'institution', 'bank']
+const NOTE_SERIES_COLUMN_CANDIDATES = ['noteseries', 'pool', 'notepool', 'fbc']
+
+// Institutions that submit a single file. Patterns are matched against a
+// fully compacted (lowercase, non-alphanumerics stripped) form of the text,
+// so both "Mission Valley Bank" and a filename like "MissionValley_July.xlsx"
+// match the same pattern.
+const BASE_INSTITUTIONS = [
+  { name: 'Mission Valley Bank', patterns: ['missionvalleybank', 'missionvalley'] },
+  { name: 'Community Bank and Trust', patterns: ['communitybankandtrust', 'communitybanktrust', 'communitybank'] },
+  { name: 'Peoples Bank', patterns: ['peoplesbank'] },
+  { name: 'Poppy Bank', patterns: ['poppybank', 'poppy'] },
+  { name: 'Millennium Bank', patterns: ['millenniumbank', 'millennium'] },
+  { name: 'Lendistry', patterns: ['lendistry'] },
+]
+
+// Institutions that submit two note-series files and therefore need an
+// additional, unambiguous year signal before they resolve to one specific
+// SERVICER_SLOTS entry (e.g. "Millennium 2025").
+const NOTE_SERIES_INSTITUTIONS = new Set(['Millennium Bank', 'Lendistry'])
+
+const compactNorm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '')
+
+function matchInstitution(text) {
+  const t = compactNorm(text)
+  if (!t) return null
+  for (const inst of BASE_INSTITUTIONS) {
+    if (inst.patterns.some((p) => t.includes(p))) return inst.name
+  }
+  return null
+}
+
+function matchNoteSeriesYear(text) {
+  const t = String(text || '')
+  if (/2025/.test(t)) return '2025'
+  if (/2024/.test(t)) return '2024'
+  return null
+}
+
+// Reads a handful of non-blank values from a named column — used to sample
+// an identity-style column's actual data, not just its header text.
+function sampleColumn(sheet, headerRowIndex, headers, columnName, maxSamples) {
+  const colIdx = headers.findIndex((h) => norm(h) === norm(columnName))
+  if (colIdx === -1 || !sheet['!ref']) return []
+  const fullRange = XLSX.utils.decode_range(sheet['!ref'])
+  const range = {
+    s: { r: fullRange.s.r + headerRowIndex + 1, c: fullRange.s.c + colIdx },
+    e: { r: Math.min(fullRange.e.r, fullRange.s.r + headerRowIndex + maxSamples), c: fullRange.s.c + colIdx },
+  }
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', range, raw: false })
+  return rows.map((r) => r[0]).filter((v) => v !== '' && v != null)
+}
+
+function findColumnMatching(headers, candidates) {
+  return headers.find((h) => candidates.some((c) => compactNorm(h).includes(c)))
+}
+
+// Returns { confident, label, institution, noteSeries }. `label`, when
+// confident, is one of the exact SERVICER_SLOTS strings (e.g. "Poppy Bank",
+// "Millennium 2025") — the same pool of identities the manual picker offers,
+// so a detected result and a manually chosen one are indistinguishable to
+// the rest of the app.
+function detectServicerIdentity(sheet, headerRowIndex, headers, sheetName, fileName) {
+  const identityCol = findColumnMatching(headers, IDENTITY_COLUMN_CANDIDATES)
+  const sampleValues = identityCol ? sampleColumn(sheet, headerRowIndex, headers, identityCol, 25) : []
+
+  const candidateTexts = [...sampleValues, sheetName, fileName].filter(Boolean)
+  const institutionsFound = new Set()
+  candidateTexts.forEach((text) => {
+    const m = matchInstitution(text)
+    if (m) institutionsFound.add(m)
+  })
+
+  if (institutionsFound.size !== 1) {
+    return { confident: false, label: null, institution: null, noteSeries: null }
+  }
+  const institution = [...institutionsFound][0]
+
+  if (!NOTE_SERIES_INSTITUTIONS.has(institution)) {
+    return { confident: true, label: institution, institution, noteSeries: null }
+  }
+
+  // Millennium/Lendistry also need an unambiguous note-series year before
+  // they can resolve to one specific SERVICER_SLOTS entry.
+  const seriesCol = findColumnMatching(headers, NOTE_SERIES_COLUMN_CANDIDATES)
+  const seriesSamples = seriesCol ? sampleColumn(sheet, headerRowIndex, headers, seriesCol, 25) : []
+  const yearTexts = [...seriesSamples, sheetName, fileName].filter(Boolean)
+  const yearsFound = new Set()
+  yearTexts.forEach((text) => {
+    const y = matchNoteSeriesYear(text)
+    if (y) yearsFound.add(y)
+  })
+
+  if (yearsFound.size !== 1) {
+    return { confident: false, label: null, institution, noteSeries: null }
+  }
+  const year = [...yearsFound][0]
+  const shortName = institution === 'Millennium Bank' ? 'Millennium' : 'Lendistry'
+  return { confident: true, label: `${shortName} ${year}`, institution, noteSeries: `${year} FBC-1` }
 }
 
 // Scans a single column across ALL of a sheet's data rows (not just the
@@ -167,7 +282,7 @@ function extractLatestMonth(sheet, headerRowIndex, headers, columnName) {
   return latest.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
 }
 
-function UploadCard({ title, subtitle, roleLabel, requiredFields, state, onFile, compact, reading, showValidationLabel }) {
+function UploadCard({ title, subtitle, roleLabel, requiredFields, state, onFile, compact, reading, showValidationLabel, showIdentityPicker, identityOptions, onIdentityChange, onConfirmIdentity }) {
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef(null)
 
@@ -184,7 +299,7 @@ function UploadCard({ title, subtitle, roleLabel, requiredFields, state, onFile,
       {!compact && (
         <div className="required-cols">
           <strong>Expected columns</strong>
-          {requiredFields.join(', ')}
+          This file must include the standard column set for this dataset type.
         </div>
       )}
 
@@ -228,6 +343,45 @@ function UploadCard({ title, subtitle, roleLabel, requiredFields, state, onFile,
             <div className="meta">Reporting month: <strong>{state.reportingMonth}</strong></div>
           )}
           {showValidationLabel && <div className="meta">Validation status: <strong>Passed</strong></div>}
+
+          {showIdentityPicker && (
+            <div className="identity-picker" style={{ marginTop: 8 }}>
+              {state.detectedConfident ? (
+                <div className="meta">
+                  Detected institution: <strong>{state.detectedInstitution}</strong>
+                  {state.detectedNoteSeries && (
+                    <>
+                      <br />Detected note series: <strong>{state.detectedNoteSeries}</strong>
+                    </>
+                  )}
+                </div>
+              ) : (
+                <div className="meta">Institution could not be determined automatically — please select it below.</div>
+              )}
+              <select
+                value={state.servicerLabel || ''}
+                onChange={(e) => onIdentityChange(e.target.value)}
+                style={{ marginTop: 4 }}
+              >
+                <option value="">— Select institution —</option>
+                {identityOptions.map((opt) => (
+                  <option key={opt} value={opt}>{opt}</option>
+                ))}
+              </select>
+              {state.confirmed ? (
+                <div className="meta" style={{ color: 'var(--teal)' }}>✓ Institution confirmed: {state.servicerLabel}</div>
+              ) : (
+                <button
+                  className="link-btn"
+                  disabled={!state.servicerLabel}
+                  onClick={onConfirmIdentity}
+                >
+                  Confirm institution
+                </button>
+              )}
+            </div>
+          )}
+
           <button className="link-btn" onClick={() => onFile(null)}>Replace file</button>
         </div>
       )}
@@ -252,7 +406,7 @@ export default function UploadScreen({ onContinue }) {
   const [servicerFiles, setServicerFiles] = useState(Array(SERVICER_SLOTS.length).fill(null))
   const [servicerReading, setServicerReading] = useState(Array(SERVICER_SLOTS.length).fill(false))
 
-  const validateAndSet = (requiredFields, file, applyState, setReading, monthColumn) => async (fileArg) => {
+  const validateAndSet = (requiredFields, file, applyState, setReading, monthColumn, identityDetect) => async (fileArg) => {
     if (!fileArg) { applyState(null); return }
 
     const name = fileArg.name.toLowerCase()
@@ -267,7 +421,7 @@ export default function UploadScreen({ onContinue }) {
 
     setReading?.(true)
     try {
-      const { headers, rowCount, sheetName, reportingMonth } = await parseWorkbookForFields(fileArg, requiredFields, monthColumn)
+      const { headers, rowCount, sheetName, reportingMonth, identity } = await parseWorkbookForFields(fileArg, requiredFields, monthColumn, identityDetect)
       if (!headers.length || rowCount < 1) {
         applyState({
           valid: false,
@@ -281,11 +435,11 @@ export default function UploadScreen({ onContinue }) {
         applyState({
           valid: false,
           fileName: fileArg.name,
-          message: `Missing expected columns: ${missing.join(', ')}`,
+          message: `This file is missing ${missing.length} expected column(s). Please check it is the correct export.`,
         })
         return
       }
-      applyState({ valid: true, fileName: fileArg.name, headers, rowCount, sheetName, reportingMonth, file: fileArg })
+      applyState({ valid: true, fileName: fileArg.name, headers, rowCount, sheetName, reportingMonth, file: fileArg, identity })
     } catch (err) {
       applyState({
         valid: false,
@@ -304,7 +458,22 @@ export default function UploadScreen({ onContinue }) {
   const handleServicerFile = (idx) => validateAndSet(SERVICER_FIELDS, null, (state) => {
     setServicerFiles((cur) => {
       const next = [...cur]
-      next[idx] = state
+      if (state && state.valid) {
+        const identity = state.identity || { confident: false, label: null, institution: null, noteSeries: null }
+        next[idx] = {
+          ...state,
+          // The file's identity lives on the file's own state from here on —
+          // never derived from SERVICER_SLOTS[idx]. A confident detection
+          // still requires an explicit confirm click before it's used.
+          servicerLabel: identity.confident ? identity.label : '',
+          confirmed: false,
+          detectedInstitution: identity.institution,
+          detectedNoteSeries: identity.noteSeries,
+          detectedConfident: identity.confident,
+        }
+      } else {
+        next[idx] = state
+      }
       return next
     })
   }, (isReading) => {
@@ -313,7 +482,23 @@ export default function UploadScreen({ onContinue }) {
       next[idx] = isReading
       return next
     })
-  })
+  }, undefined, true)
+
+  const setServicerIdentity = (idx, label) => {
+    setServicerFiles((cur) => {
+      const next = [...cur]
+      if (next[idx]) next[idx] = { ...next[idx], servicerLabel: label, confirmed: false }
+      return next
+    })
+  }
+
+  const confirmServicerIdentity = (idx) => {
+    setServicerFiles((cur) => {
+      const next = [...cur]
+      if (next[idx] && next[idx].servicerLabel) next[idx] = { ...next[idx], confirmed: true }
+      return next
+    })
+  }
 
   const servicerValidCount = servicerFiles.filter((s) => s?.valid).length
   const servicerErrorCount = servicerFiles.filter((s) => s && !s.valid).length
@@ -321,25 +506,39 @@ export default function UploadScreen({ onContinue }) {
   const soupError = soup && !soup.valid
   const memoError = memo && !memo.valid
 
+  const validServicerFiles = servicerFiles.filter((s) => s?.valid)
+  const unconfirmedServicerCount = validServicerFiles.filter((s) => !s.confirmed || !s.servicerLabel).length
+  const confirmedLabels = validServicerFiles.filter((s) => s.confirmed).map((s) => s.servicerLabel)
+  const hasDuplicateIdentity = new Set(confirmedLabels).size !== confirmedLabels.length
+
   // Servicer Memo Summary is optional (the backend degrades gracefully
   // without it), so it never blocks continuing on its own — but if one was
   // uploaded and failed validation, that's surfaced and must be resolved
   // rather than silently ignored (per "do not silently process the file").
-  const canContinue = soupValid && servicerFiles.some((s) => s?.valid) && !memoError
+  const canContinue =
+    soupValid &&
+    validServicerFiles.length > 0 &&
+    unconfirmedServicerCount === 0 &&
+    !hasDuplicateIdentity &&
+    !memoError
 
-  let status = { cls: 'gray', text: 'Upload the SOUP dataset and at least one servicer file to continue' }
+  let status = { cls: 'gray', text: 'Upload the primary dataset and at least one comparison file to continue' }
   if (soupError || servicerErrorCount > 0 || memoError) {
     status = { cls: 'red', text: 'Fix the file errors above before continuing' }
+  } else if (hasDuplicateIdentity) {
+    status = { cls: 'red', text: 'Two comparison files are confirmed as the same institution — please correct one before continuing' }
+  } else if (validServicerFiles.length > 0 && unconfirmedServicerCount > 0) {
+    status = { cls: 'amber', text: 'Confirm the institution for each uploaded comparison file before continuing' }
   } else if (canContinue) {
-    const memoNote = memo?.valid ? ', Servicer Memo Summary validated' : ''
+    const memoNote = memo?.valid ? ', supporting dataset validated' : ''
     status = {
       cls: 'green',
-      text: `Ready — SOUP dataset validated${memoNote}, ${servicerValidCount} of ${SERVICER_SLOTS.length} servicer file(s) uploaded`,
+      text: `Ready — primary dataset validated${memoNote}, ${servicerValidCount} of ${SERVICER_SLOTS.length} comparison file(s) uploaded`,
     }
-  } else if (soupValid && servicerValidCount === 0) {
-    status = { cls: 'amber', text: 'Waiting for at least one servicer file' }
-  } else if (servicerValidCount > 0 && !soupValid) {
-    status = { cls: 'amber', text: 'Waiting for the SOUP Performance Dataset' }
+  } else if (soupValid && validServicerFiles.length === 0) {
+    status = { cls: 'amber', text: 'Waiting for at least one comparison file' }
+  } else if (validServicerFiles.length > 0 && !soupValid) {
+    status = { cls: 'amber', text: 'Waiting for the primary dataset' }
   }
 
   const handleContinue = () => {
@@ -369,7 +568,7 @@ export default function UploadScreen({ onContinue }) {
         <div className="source-files-section">
           <div className="source-files-row">
             <UploadCard
-              title="SOUP Master File"
+              title="Primary Dataset"
               roleLabel="Primary source"
               subtitle="Primary monthly loan performance data (~25,000 records)"
               requiredFields={SOUP_FIELDS}
@@ -378,7 +577,7 @@ export default function UploadScreen({ onContinue }) {
               reading={soupReading}
             />
             <UploadCard
-              title="Servicer Memo Summary"
+              title="Supporting Dataset"
               roleLabel="Supporting source"
               subtitle="Supporting monthly servicing and deferral information"
               requiredFields={MEMO_FIELDS}
@@ -391,19 +590,23 @@ export default function UploadScreen({ onContinue }) {
         </div>
 
         <div className="servicer-panel-header">
-          <h3>Servicer Files</h3>
-          <div className="hint">Poppy Bank + up to 7 additional servicer SRF files (same template)</div>
+          <h3>Comparison Datasets</h3>
+          <div className="hint">Up to {SERVICER_SLOTS.length} comparison files (same template)</div>
         </div>
         <div className="servicer-grid">
           {SERVICER_SLOTS.map((label, idx) => (
             <UploadCard
               key={label}
-              title={label}
+              title={SERVICER_SLOT_LABELS[idx]}
               requiredFields={SERVICER_FIELDS}
               state={servicerFiles[idx]}
               onFile={handleServicerFile(idx)}
               compact
               reading={servicerReading[idx]}
+              showIdentityPicker
+              identityOptions={SERVICER_SLOTS}
+              onIdentityChange={(value) => setServicerIdentity(idx, value)}
+              onConfirmIdentity={() => confirmServicerIdentity(idx)}
             />
           ))}
         </div>

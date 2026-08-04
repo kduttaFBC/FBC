@@ -21,26 +21,33 @@ function DetailTable({ records }) {
   )
 }
 
+function downloadBase64File(base64, filename, mimeType) {
+  const byteCharacters = atob(base64)
+  const byteNumbers = Array.from(byteCharacters, c => c.charCodeAt(0))
+  const byteArray = new Uint8Array(byteNumbers)
+  const blob = new Blob([byteArray], { type: mimeType })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
 export default function ResultsScreen({ audit, onNewAudit, onExit }) {
   const { results, summary, report_id } = audit
+  const correctedWorkbooks = audit.corrected_workbooks || []
+  const correctionsSkipped = audit.corrections_skipped || []
   const [expanded, setExpanded] = useState(null)
   const timestamp = new Date().toLocaleString()
 
   const toggle = (id) => setExpanded((cur) => (cur === id ? null : id))
 
-const handleDownload = () => {
-  console.log('report_b64 exists:', !!audit.report_b64, 'length:', audit.report_b64?.length)
-  const byteCharacters = atob(audit.report_b64)
-  const byteNumbers = Array.from(byteCharacters, c => c.charCodeAt(0))
-  const byteArray = new Uint8Array(byteNumbers)
-  const blob = new Blob([byteArray], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = audit.report_filename || 'FalconBridge_Audit.xlsx'
-  a.click()
-  URL.revokeObjectURL(url)
-}
+  const handleDownload = () => {
+    downloadBase64File(audit.report_b64, audit.report_filename || 'Audit_Intelligence_Report.xlsx', XLSX_MIME)
+  }
 
   return (
     <>
@@ -116,6 +123,48 @@ const handleDownload = () => {
           </tbody>
         </table>
       </div>
+
+      {/* Corrected servicer workbooks — only shown when the audit engine
+          found at least one high-confidence, auto-correctable field for a
+          servicer's file. Absent entirely when there's nothing eligible,
+          rather than showing an empty or misleading section. */}
+      {correctedWorkbooks.length > 0 && (
+        <div className="card" style={{ marginBottom: 22 }}>
+          <h3 style={{ marginTop: 0 }}>Corrected servicer workbooks</h3>
+          <p style={{ color: 'var(--text-secondary)', marginTop: 0 }}>
+            A copy of each servicer file below with only its high-confidence corrections applied,
+            plus a Correction Log tab documenting every change. The original uploaded file is never modified.
+          </p>
+          {correctedWorkbooks.map((cw) => (
+            <div className="map-row" style={{ gridTemplateColumns: '1.4fr 1fr' }} key={cw.filename}>
+              <div className="field-name">
+                {cw.servicer}
+                <div className="hint" style={{ marginTop: 2 }}>
+                  {cw.correction_count} correction{cw.correction_count === 1 ? '' : 's'} applied
+                </div>
+              </div>
+              <a
+                className="btn btn-teal"
+                onClick={() => downloadBase64File(cw.file_b64, cw.filename, XLSX_MIME)}
+              >
+                Download Corrected File
+              </a>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {correctionsSkipped.length > 0 && (
+        <div className="card" style={{ marginBottom: 22 }}>
+          <h3 style={{ marginTop: 0 }}>Corrected file unavailable</h3>
+          {correctionsSkipped.map((item, index) => (
+            <div key={`${item.servicer}-${index}`} style={{ marginBottom: 10 }}>
+              <strong>{item.servicer}</strong>
+              <div className="hint">{item.reason}</div>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="btn-row" style={{ marginBottom: 8 }}>
         <button className="btn btn-primary" onClick={onNewAudit}>Upload New Files</button>

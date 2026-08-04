@@ -32,6 +32,7 @@ import checks as checks_mod
 import report as report_mod
 import chatbot as chatbot_mod
 import file_readers
+import corrections as corrections_mod
 
 
 load_dotenv(override=False)
@@ -222,6 +223,8 @@ async def audit(
 
         all_results = []
         servicer_loan_counts = {}
+        corrected_workbooks = []
+        corrections_skipped = []
 
         for uploaded in servicer_files:
             file_bytes = await uploaded.read()
@@ -233,8 +236,10 @@ async def audit(
                 return JSONResponse(status_code=400, content={
                     "error": f"Could not read servicer file '{uploaded.filename}': {exc}",
                 })
-            del file_bytes
-            gc.collect()
+            # file_bytes is deliberately NOT deleted yet — the correction
+            # engine below needs the file's ORIGINAL bytes to build a
+            # corrected copy. Released right after that step, same as
+            # before, just a few lines later.
 
             # soup_key is what actually matches SOUP's Servicer column (e.g.
             # "Lendistry"); display_label is what shows up in results/report
@@ -247,6 +252,39 @@ async def audit(
                 display_label, loan_terms_df, servicer_inputs_df, soup_servicer_df,
                 memo_df=memo_df, memo_lender_key=soup_key, deal=deal,
             )
+
+            # Corrected servicer workbook generation is entirely a backend
+            # implementation detail (see backend/corrections.py) — it reads
+            # this file's STAT-01 result's correction_data/_cycle_month,
+            # decides what's eligible under the v1 allow-list, and returns
+            # either a corrected workbook or a reason it didn't. Those two
+            # keys are stripped off the result below immediately afterward,
+            # so nothing about HOW a correction was decided ever reaches the
+            # API response — the audit API stays exactly "audit results."
+            stat01_result = next((r for r in results if r["id"].split("::")[0] == "STAT-01"), None)
+            correction_outcome = corrections_mod.generate_corrected_workbook(
+                file_bytes, uploaded.filename, display_label, stat01_result,
+            )
+            del file_bytes
+            gc.collect()
+
+            if correction_outcome["file_bytes"]:
+                corrected_workbooks.append({
+                    "servicer": display_label,
+                    "filename": correction_outcome["filename"],
+                    "file_b64": base64.b64encode(correction_outcome["file_bytes"]).decode("utf-8"),
+                    "correction_count": correction_outcome["correction_count"],
+                })
+            elif correction_outcome["skip_reason"]:
+                corrections_skipped.append({
+                    "servicer": display_label,
+                    "reason": correction_outcome["skip_reason"],
+                })
+
+            if stat01_result is not None:
+                stat01_result.pop("correction_data", None)
+                stat01_result.pop("_cycle_month", None)
+
             all_results.extend(results)
             servicer_loan_counts[display_label] = len(servicer_inputs_df)
 
@@ -289,6 +327,8 @@ async def audit(
             "report_filename": report_mod.report_filename(),
             "chat_context": chat_context,
             "session_id": session_id,
+            "corrected_workbooks": corrected_workbooks,
+            "corrections_skipped": corrections_skipped,
         })
 
     except Exception as exc:

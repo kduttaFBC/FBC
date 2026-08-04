@@ -154,14 +154,52 @@ def _find_best_header(wb, required_fields, sheet_filter=None, _rows_cache=None):
     return best
 
 
-def _rows_to_df(rows, header_row_idx):
+def _rows_to_df(rows, header_row_idx, sheet_name=None):
     """Builds a DataFrame from a list-of-lists sheet, starting at a given
-    header row index (0-based)."""
+    header row index (0-based).
+
+    When sheet_name is provided, also attaches three extra columns used only
+    by the correction engine (backend/corrections.py) to later re-locate the
+    exact source cell for a value that gets corrected:
+      - "_sheet_name":        the sheet this row came from (constant)
+      - "_header_excel_row":  the 1-based Excel row of the header row itself
+      - "_excel_row":         this row's own 1-based Excel row number
+
+    Row numbers are computed BEFORE the blank-row filter below runs, and
+    carried forward as an explicit column rather than relying on the
+    DataFrame's positional index — the index gets reset to a fresh
+    0..N-1 range by the filter (and by any later reset_index/groupby/
+    sort_values a check might do), so it can't be trusted to mean "the
+    original sheet row" by the time a check actually uses it. An explicit
+    column rides along through those operations the same way "SBA GP
+    Number" already does.
+
+    Callers that don't pass sheet_name (SOUP, Loan Terms, Servicer Memo)
+    get back exactly the same DataFrame as before this change — this is
+    purely additive for the one caller that opts in."""
     data_section = rows[header_row_idx:]
     if not data_section:
         return pd.DataFrame()
     header_row = data_section[0]
     headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(header_row)]
+
+    if sheet_name is not None:
+        header_excel_row = header_row_idx + 1  # 1-based Excel row of the header itself
+        # Enumerate BEFORE filtering blanks, so a blank row earlier in the
+        # sheet can never shift a later real row's recorded position.
+        numbered = list(enumerate(data_section[1:]))
+        kept = [(i, r) for i, r in numbered if any(c is not None and str(c).strip() != "" for c in r)]
+        data_rows = [r for _, r in kept]
+        df = pd.DataFrame(data_rows, columns=headers)
+        df = df.loc[:, ~df.columns.duplicated()]
+        df["_sheet_name"] = sheet_name
+        df["_header_excel_row"] = header_excel_row
+        # i is 0-based offset into data_section[1:]; the header itself is at
+        # Excel row `header_excel_row`, so the i-th data row is at
+        # header_excel_row + 1 + i.
+        df["_excel_row"] = [header_excel_row + 1 + i for i, _ in kept]
+        return df
+
     data_rows = [r for r in data_section[1:] if any(c is not None and str(c).strip() != "" for c in r)]
     df = pd.DataFrame(data_rows, columns=headers)
     df = df.loc[:, ~df.columns.duplicated()]
@@ -265,7 +303,7 @@ def read_servicer_file(file_bytes, filename=None):
         si_best = _find_best_header(wb, SERVICER_INPUTS_FIELDS, _rows_cache=rows_cache)
     if si_best["matches"] < len(SERVICER_INPUTS_FIELDS) // 2:
         raise ValueError("Could not find the Servicer Inputs columns in this file.")
-    servicer_inputs_df = _rows_to_df(rows_cache[si_best["sheet_name"]], si_best["row_idx"])
+    servicer_inputs_df = _rows_to_df(rows_cache[si_best["sheet_name"]], si_best["row_idx"], sheet_name=si_best["sheet_name"])
 
     lt_best = _find_best_header(wb, LOAN_TERMS_FIELDS, sheet_filter="loan terms", _rows_cache=rows_cache)
     if lt_best["matches"] < len(LOAN_TERMS_FIELDS) // 2:

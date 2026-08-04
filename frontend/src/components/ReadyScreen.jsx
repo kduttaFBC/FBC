@@ -1,10 +1,13 @@
 import React from 'react'
-import { SERVICER_SLOTS } from '../App.jsx'
+import { SERVICER_SLOTS, SERVICER_SLOT_LABELS } from '../App.jsx'
 
-function FileRow({ label, state }) {
+function FileRow({ label, state, institution }) {
   return (
     <div className="map-row" style={{ gridTemplateColumns: '1.4fr 1fr' }}>
-      <div className="field-name">{label}</div>
+      <div className="field-name">
+        {label}
+        {institution && <div className="hint" style={{ marginTop: 2 }}>{institution}</div>}
+      </div>
       <div style={{ color: state?.valid ? 'var(--teal)' : 'var(--text-secondary)' }}>
         {state?.valid ? `✓ ${state.fileName} — ${state.rowCount} rows` : '— not provided —'}
       </div>
@@ -23,17 +26,22 @@ export default function ReadyScreen({ soup, memo, servicerFiles, onBack, onRun, 
 
         <div className="mapper-section">
           <h3>Source Files</h3>
-          <FileRow label="SOUP Master File" state={soup} />
+          <FileRow label="Primary Dataset" state={soup} />
           <FileRow
-            label={`Servicer Memo Summary${memo?.reportingMonth ? ` (${memo.reportingMonth})` : ''}`}
+            label={`Supporting Dataset${memo?.reportingMonth ? ` (${memo.reportingMonth})` : ''}`}
             state={memo}
           />
         </div>
 
         <div className="mapper-section">
-          <h3>Servicer Files</h3>
+          <h3>Comparison Datasets</h3>
           {SERVICER_SLOTS.map((label, idx) => (
-            <FileRow key={label} label={label} state={servicerFiles[idx]} />
+            <FileRow
+              key={label}
+              label={SERVICER_SLOT_LABELS[idx]}
+              institution={servicerFiles[idx]?.valid ? servicerFiles[idx].servicerLabel : null}
+              state={servicerFiles[idx]}
+            />
           ))}
         </div>
 

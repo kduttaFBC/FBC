@@ -71,6 +71,12 @@ export const SERVICER_SOUP_KEYS = {
   'Community Bank and Trust': 'Community Bank & Trust',
 }
 
+// Neutral on-screen labels for each comparison-file slot, shown in the UI in
+// place of the real servicer names. Purely cosmetic: SERVICER_SLOTS (and the
+// soupKey/backend-matching derived from it above) is completely unchanged —
+// this array only controls what's rendered as each upload card's title.
+export const SERVICER_SLOT_LABELS = SERVICER_SLOTS.map((_, i) => `Comparison Dataset ${i + 1}`)
+
 export default function App() {
   // screens: 'upload' | 'ready' | 'results' | 'ended'
   const [screen, setScreen] = useState('upload')
@@ -104,9 +110,14 @@ export default function App() {
       if (memo && memo.valid) {
         form.append('memo_file', memo.file)
       }
-      servicerFiles.forEach((s, i) => {
-        if (s && s.valid) {
-          const label = SERVICER_SLOTS[i]
+      servicerFiles.forEach((s) => {
+        // The file's servicer identity comes from what was detected/confirmed
+        // for THIS file (set in UploadScreen) — never from its slot position.
+        // SERVICER_SLOTS[i] must not be consulted here; a file dropped into
+        // any slot is tagged with whatever institution was actually confirmed
+        // for it.
+        if (s && s.valid && s.servicerLabel) {
+          const label = s.servicerLabel
           const soupKey = SERVICER_SOUP_KEYS[label] || label
           // Filename convention: "{soupKey}||{displayLabel}__{originalFilename}"
           // soupKey is what filter_soup_by_servicer matches against SOUP's

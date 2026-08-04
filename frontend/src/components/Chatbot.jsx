@@ -107,7 +107,7 @@ export default function Chatbot({ auditContext, summary, results, sessionId }) {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = filename || 'FalconBridge_Chat_Export.xlsx'
+    a.download = filename || 'Audit_Intelligence_Chat_Export.xlsx'
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -116,7 +116,7 @@ export default function Chatbot({ auditContext, summary, results, sessionId }) {
     <div className="chatbot">
       <div className="chat-header">
         <span className="status-dot" />
-        <span className="title">FalconBridge AI</span>
+        <span className="title">Audit Intelligence</span>
         <span className="powered">Powered by Claude</span>
       </div>
 
@@ -133,7 +133,7 @@ export default function Chatbot({ auditContext, summary, results, sessionId }) {
             )}
           </div>
         ))}
-        {sending && <div className="bubble bot typing">FalconBridge AI is typing…</div>}
+        {sending && <div className="bubble bot typing">Audit Intelligence is typing…</div>}
       </div>
 
       <div className="chat-input-row">

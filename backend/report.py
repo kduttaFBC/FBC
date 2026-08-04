@@ -189,7 +189,7 @@ def _build_legend(ws, start_row):
 
 
 def _build_summary(ws, results, summary):
-    ws.cell(row=1, column=1, value="FalconBridge SBA Reconciliation Summary").font = Font(bold=True, size=13)
+    ws.cell(row=1, column=1, value="Audit Intelligence Reconciliation Summary").font = Font(bold=True, size=13)
     ws.cell(row=2, column=1, value=f"Servicers processed: {', '.join(summary.get('servicers_processed', []))}")
     ws.cell(row=3, column=1, value=f"SOUP records: {summary.get('soup_records', 0)}  |  "
                                     f"Servicer records: {summary.get('servicer_records', 0)}  |  "
@@ -275,4 +275,4 @@ def generate_report_bytes(results, summary, buffer):
 
 
 def report_filename():
-    return f"FalconBridge_SBA_Reconciliation_{date.today().isoformat()}.xlsx"
+    return f"Audit_Intelligence_Reconciliation_{date.today().isoformat()}.xlsx"

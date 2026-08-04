@@ -26,8 +26,8 @@ export default function Navbar() {
     <nav className="navbar">
       <ShieldCheck />
       <div>
-        <div className="brand">FalconBridge</div>
-        <div className="subtitle">Audit Intelligence</div>
+        <div className="brand">Audit Intelligence</div>
+        <div className="subtitle">Data Audit &amp; Compliance</div>
       </div>
     </nav>
   )

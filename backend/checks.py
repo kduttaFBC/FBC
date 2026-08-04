@@ -28,8 +28,8 @@ from file_readers import MEMO_LENDER_ALIASES
 BALANCE_TOLERANCE = 1.00  # dollars
 
 
-def _result(check_id, name, category, severity, records, details_fn):
-    issues = len(records)
+def _result(check_id, name, category, severity, records, details_fn, issues_found=None):
+    issues = len(records) if issues_found is None else issues_found
     status = "PASS" if issues == 0 else severity
     details = "No issues found." if issues == 0 else details_fn(issues)
     return {
@@ -63,29 +63,77 @@ def _result(check_id, name, category, severity, records, details_fn):
 #   3. original row order (stable sort preserves this as the final fallback)
 # ---------------------------------------------------------------------------
 
+def _resolve_scheduled_payment_step_pattern(group, sched_series):
+    """CLIENT-CONFIRMED (2026-08-04): more than one distinct nonzero
+    Scheduled Payment value in a cycle doesn't automatically mean genuine
+    ambiguity — the field can legitimately change mid-cycle (a
+    re-amortization or correction taking effect). This checks whether the
+    CHRONOLOGICAL sequence of nonzero values forms a clean, one-directional
+    step pattern: each distinct value forms exactly one contiguous run,
+    with no reversion to an earlier value once the sequence has moved past
+    it. This allows any number of sequential updates (A, then B, then C)
+    while still rejecting real oscillation (A, then B, then back to A) as
+    genuinely ambiguous — oscillation is not a "later correction," it's
+    exactly the kind of instability that should stay UNVERIFIED.
+
+    When a "Last Payment Instance?" column is present, the final run's
+    value is also cross-checked against whichever row is flagged 'Y' there
+    — a contradiction is treated as ambiguous rather than trusted, an
+    extra safety margin beyond the pattern shape alone.
+
+    Returns the final chronological value if the pattern qualifies,
+    otherwise None (caller falls back to today's UNVERIFIED behavior)."""
+    nonzero_mask = sched_series.notna() & (sched_series != 0)
+    chronological_values = sched_series[nonzero_mask].tolist()
+    if not chronological_values:
+        return None
+
+    # Run-length compress: collapse consecutive duplicates into one entry
+    # each, so we're checking the SHAPE of the sequence, not raw repeats.
+    runs = []
+    for v in chronological_values:
+        if not runs or runs[-1] != v:
+            runs.append(v)
+
+    # A value reappearing in a later, non-adjacent run means the sequence
+    # went back to something it had already moved past -- oscillation, not
+    # a one-directional update.
+    if len(set(runs)) != len(runs):
+        return None
+
+    final_value = runs[-1]
+
+    if "Last Payment Instance?" in group.columns:
+        last_flagged = group[group["Last Payment Instance?"].astype("string").str.strip().str.upper() == "Y"]
+        if not last_flagged.empty:
+            flagged_scheduled = pd.to_numeric(last_flagged.iloc[-1].get("Scheduled Payment"), errors="coerce")
+            if pd.notna(flagged_scheduled) and flagged_scheduled != 0 and flagged_scheduled != final_value:
+                return None  # contradicts the servicer's own "last posting" flag -- don't trust the pattern
+
+    return final_value
+
+
 def consolidate_cycle_postings(servicer_inputs_df):
     """Returns one consolidated cycle record per SBA GP Number:
       posting_count, loan_status, dq_status (both from the LAST chronological
       posting), received/principal/net_interest (SUMMED), scheduled (a
       single value — see below), scheduled_ambiguous (bool),
-      scheduled_distinct_values (list, diagnostic), beginning_balance
-      (FIRST posting), ending_balance (LAST posting), interest_from (FIRST),
-      interest_to (LAST), lender_loan_number (FIRST).
-
-    Does NOT include the four liquidation-specific fields (Liquidation Date,
-    Liquidation Proceeds, Subsequent Recoveries/(Losses), Liquidation Loss)
-    — LIQ-01 (liquidation_review_check) computes those itself directly from
-    the raw postings via _consolidate_liquidation_fields, since a naive
-    first/last choice here would silently hide genuine multi-posting
-    disagreement rather than surface it for review.
+      scheduled_payment_updated_during_cycle (bool), scheduled_distinct_values
+      (list, diagnostic), beginning_balance (FIRST posting), ending_balance
+      (LAST posting), interest_from (FIRST), interest_to (LAST),
+      lender_loan_number (FIRST).
 
     Scheduled Payment is never summed — there is one scheduled obligation
     per cycle. If every nonzero Scheduled Payment value for a loan this
     cycle agrees, that value is used. If two or more DISTINCT nonzero
-    values exist for the same loan in the same cycle, `scheduled` is None
-    and `scheduled_ambiguous` is True — callers must not silently sum, max,
-    or pick one; the cycle obligation is genuinely ambiguous and should be
-    surfaced, not guessed at.
+    values exist, this first checks whether they form a clean, one-
+    directional step pattern (see _resolve_scheduled_payment_step_pattern)
+    — a legitimate mid-cycle update/correction, not genuine ambiguity. If
+    so, `scheduled` is the final chronological value and
+    scheduled_payment_updated_during_cycle is True. Otherwise `scheduled`
+    is None and `scheduled_ambiguous` is True — callers must not silently
+    sum, max, or pick one; the cycle obligation is genuinely ambiguous and
+    should be surfaced, not guessed at.
     """
     si = servicer_inputs_df.copy()
     si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
@@ -110,15 +158,25 @@ def consolidate_cycle_postings(servicer_inputs_df):
         sched_series = group["Scheduled Payment"] if "Scheduled Payment" in group.columns else pd.Series(dtype=float)
         nonzero = sched_series[(sched_series.notna()) & (sched_series != 0)]
         distinct_nonzero = sorted(nonzero.unique().tolist())
-        scheduled_ambiguous = len(distinct_nonzero) > 1
-        if scheduled_ambiguous:
-            scheduled = None
+        scheduled_payment_updated_during_cycle = False
+        if len(distinct_nonzero) > 1:
+            step_value = _resolve_scheduled_payment_step_pattern(group, sched_series)
+            if step_value is not None:
+                scheduled = step_value
+                scheduled_ambiguous = False
+                scheduled_payment_updated_during_cycle = True
+            else:
+                scheduled = None
+                scheduled_ambiguous = True
         elif distinct_nonzero:
             scheduled = distinct_nonzero[0]
+            scheduled_ambiguous = False
         elif sched_series.notna().any():
             scheduled = 0.0
+            scheduled_ambiguous = False
         else:
             scheduled = None
+            scheduled_ambiguous = False
 
         rows.append({
             "SBA GP Number": gp,
@@ -130,17 +188,27 @@ def consolidate_cycle_postings(servicer_inputs_df):
             "net_interest": group["Net Interest"].sum(min_count=1) if "Net Interest" in group.columns else None,
             "scheduled": scheduled,
             "scheduled_ambiguous": scheduled_ambiguous,
+            "scheduled_payment_updated_during_cycle": scheduled_payment_updated_during_cycle,
             "scheduled_distinct_values": distinct_nonzero,
             "beginning_balance": first.get("Beginning Balance"),
             "ending_balance": last.get("Ending Balance"),
             "interest_from": first.get("Interest-From", ""),
             "interest_to": last.get("Interest-To", ""),
             "lender_loan_number": first.get("Lender Loan Number", ""),
+            # Source-location metadata for the correction engine (backend/
+            # corrections.py) only — these come from the SAME chronologically
+            # LAST posting whose loan_status/dq_status are used above, since
+            # that's the row a correction would actually need to overwrite.
+            # Not used by any existing check or the audit report.
+            "_excel_row": last.get("_excel_row"),
+            "_sheet_name": last.get("_sheet_name"),
+            "_header_excel_row": last.get("_header_excel_row"),
         })
 
     return pd.DataFrame(rows).set_index("SBA GP Number") if rows else pd.DataFrame(
         columns=["posting_count", "loan_status", "dq_status", "received", "principal", "net_interest",
-                 "scheduled", "scheduled_ambiguous", "scheduled_distinct_values", "beginning_balance",
+                 "scheduled", "scheduled_ambiguous", "scheduled_payment_updated_during_cycle",
+                 "scheduled_distinct_values", "beginning_balance",
                  "ending_balance", "interest_from", "interest_to", "lender_loan_number"]
     )
 
@@ -291,111 +359,28 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
 
 
 # ---------------------------------------------------------------------------
-# LIQ-01 — Liquidation Review (formerly BAL-02, converted per client
-# clarification)
-#
-# CLIENT-CONFIRMED RULE: there is no historical data available to
-# independently determine that a loan "should" transition into LIQUIDATION.
-# The engine must NEVER infer, predict, approve, or reject a LIQUIDATION
-# status from a loan's prior SOUP status — if sufficient supporting data
-# doesn't exist, the engine does not guess. Instead, the servicer's own
-# report of Loan Status = LIQUIDATION is itself what triggers review: EVERY
-# such loan is surfaced here, unconditionally — this is NOT contingent on
-# any exception existing. A $0 Ending Balance is still a review item; a
-# nonzero Ending Balance is a review item PLUS a clearly identified balance
-# problem (the Remittance Form Instructions require LIQUIDATION loans to
-# report $0).
-#
-# This replaces the old BAL-02, which only ever surfaced the nonzero-balance
-# subset — silently passing every $0-balance LIQUIDATION loan with no
-# visibility at all. Converted rather than kept alongside a separate check
-# because every old BAL-02 exception is a strict subset of what LIQ-01 now
-# covers; keeping both would show the same loan twice for overlapping
-# reasons rather than complementary ones.
-#
-# Delinquency Status here is NOT invented separately — it reuses the exact
-# same shared _calculate_expected_status engine as STAT-01/NEG-01 (80%
-# threshold, zero-payment progression, prior baseline, deferral logic,
-# UNVERIFIED/REVIEW handling, all unchanged). See _calculate_expected_status's
-# is_liquidation_this_cycle carve-out for why LIQUIDATION loans now get a
-# real calculation instead of the old terminal-status CURRENT shortcut.
-#
-# A servicer-reported LIQUIDATION loan is presentation-excluded from STAT-01
-# (see status_match_check) — this check is where it belongs instead.
+# BAL-02 — Liquidation Balance Validation
+# The Remittance Form Instructions formally define LIQUIDATION as: the loan
+# has been charged off, the balance is reduced to $0, and the loan is no
+# longer expected to make regular payments. This is a CURRENT-CYCLE rule —
+# a loan reporting Loan Status = LIQUIDATION this cycle should report an
+# Ending Balance of $0 this cycle, full stop. Deliberately independent of
+# BAL-01: this doesn't look at prior SOUP balance at all, so a loan can fail
+# BAL-01 (continuity break vs. last cycle) and BAL-02 (current-cycle
+# LIQUIDATION balance rule) simultaneously, for two genuinely separate
+# reasons, exactly as validated against loan 4338609104.
 # ---------------------------------------------------------------------------
 
-_LIQUIDATION_KEYWORD = "LIQUIDAT"  # substring match — same convention as
-                                    # _TERMINAL_STATUS_KEYWORDS and the
-                                    # STAT-01 exclusion, so the two checks
-                                    # stay exact complements of each other.
-
-_LIQUIDATION_FIELD_COLUMNS = (
-    "Liquidation Date", "Liquidation Proceeds",
-    "Subsequent Recoveries/(Losses)", "Liquidation Loss",
-)
+_LIQUIDATION_STATUS_KEYWORD = "LIQUIDATION"
 
 
-def _json_safe_value(value, is_date_field=False):
-    """Converts one raw cell value into something json.dumps can handle.
-    Calamine/pandas can hand back datetime.date/Timestamp/numpy scalar
-    types depending on the source cell — none of those are JSON-
-    serializable as-is, which crashed the /api/audit response the first
-    time a real Liquidation Date reached this code path. Reuses the
-    existing _fmt_date formatting convention for date fields so the display
-    format matches every other date already shown elsewhere in the app."""
-    if is_date_field:
-        return _fmt_date(value)
-    if hasattr(value, "item"):  # numpy scalar (int64/float64/etc.)
-        return value.item()
-    return value
-
-
-def _consolidate_liquidation_fields(raw_group):
-    """For ONE GP's raw postings this cycle, returns {column: value} for
-    each of the four liquidation-specific fields, per the client's explicit
-    no-guess rule for this scenario:
-      - 0 or 1 posting, or all postings agree (including all-blank): that
-        single/agreed value is used directly — this is NOT an aggregation
-        choice, there's nothing to pick between.
-      - Multiple postings with genuinely DIFFERENT non-blank values: do NOT
-        pick first/last/max/min/sum. Instead the value becomes an explicit
-        "AMBIGUOUS — see raw values" marker listing every distinct value
-        found, and the field name is returned separately so the caller can
-        surface it as a data-quality warning rather than a confident number.
-    Returns (values: dict, ambiguous_fields: list[str])."""
-    values = {}
-    ambiguous_fields = []
-    for col in _LIQUIDATION_FIELD_COLUMNS:
-        if col not in raw_group.columns:
-            values[col] = ""
-            continue
-        col_values = raw_group[col].tolist()
-        non_blank = [v for v in col_values if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip() != ""]
-        distinct = []
-        for v in non_blank:
-            if v not in distinct:
-                distinct.append(v)
-        if len(distinct) <= 1:
-            values[col] = _json_safe_value(distinct[0], is_date_field=(col == "Liquidation Date")) if distinct else ""
-        else:
-            # Already JSON-safe: the f-string converts every element (dates
-            # included) to its string form via repr, same as the ambiguous
-            # branch anywhere else in this file.
-            values[col] = f"AMBIGUOUS — postings disagree: {distinct}"
-            ambiguous_fields.append(col)
-    return values, ambiguous_fields
-
-
-def liquidation_review_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None):
+def liquidation_balance_check(servicer_inputs_df):
     records = []
 
     required = {"SBA GP Number", "Loan Status", "Ending Balance"}
     if not required.issubset(servicer_inputs_df.columns):
-        return _result("LIQ-01", "Liquidation Review", "SBA Reconciliation", "WARN", records,
+        return _result("BAL-02", "Liquidation Balance Validation", "SBA Reconciliation", "FAIL", records,
                         lambda n: "")
-
-    cycle_month = _infer_cycle_month(soup_servicer_df)
-    has_payment_cols = {"Scheduled Payment", "Payment Received"}.issubset(servicer_inputs_df.columns)
 
     # Evaluate the CONSOLIDATED cycle record per GP — final chronological
     # Loan Status and final chronological Ending Balance — not each raw
@@ -405,115 +390,37 @@ def liquidation_review_check(servicer_inputs_df, soup_servicer_df, memo_df=None,
     # loan actually ended the cycle as.
     consolidated = consolidate_cycle_postings(servicer_inputs_df)
 
-    # Raw (pre-consolidation) rows, grouped by GP, used ONLY to check the
-    # four liquidation-specific fields for multi-posting disagreement — see
-    # _consolidate_liquidation_fields. Deliberately separate from the
-    # shared consolidate_cycle_postings() used by every other check, since
-    # no other check needs these fields or this ambiguity handling.
-    raw = servicer_inputs_df.copy()
-    raw["SBA GP Number"] = _norm_id(raw["SBA GP Number"])
-    raw_by_gp = {gp: group for gp, group in raw.groupby("SBA GP Number")}
-
-    soup = soup_servicer_df.copy() if soup_servicer_df is not None else pd.DataFrame()
-    soup_latest = pd.DataFrame()
-    if not soup.empty and "SBA GP Number" in soup.columns:
-        soup["SBA GP Number"] = _norm_id(soup["SBA GP Number"])
-        sort_month = "Payment Month" if "Payment Month" in soup.columns else None
-        if sort_month:
-            soup[sort_month] = pd.to_datetime(soup[sort_month], errors="coerce")
-        soup_latest = (soup.sort_values(["SBA GP Number", sort_month]) if sort_month else soup).groupby("SBA GP Number").tail(1)
-        soup_latest = soup_latest.set_index("SBA GP Number")
-
     for gp, row in consolidated.iterrows():
         loan_status = str(row.get("loan_status", "")).strip().upper()
-        if _LIQUIDATION_KEYWORD not in loan_status:
+        if loan_status != _LIQUIDATION_STATUS_KEYWORD:
             continue
 
-        soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip() if gp in soup_latest.index else ""
-        soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "") if gp in soup_latest.index else ""
-        srf_dq = str(row.get("dq_status", "")).strip()
-        scheduled_ambiguous = bool(row.get("scheduled_ambiguous"))
-
-        # Same shared engine as STAT-01/NEG-01 — no separate liquidation
-        # delinquency logic. NOT used to infer or contest the LIQUIDATION
-        # status itself (expected_loan_status is deliberately ignored below
-        # — the servicer's own report is what puts this loan here, full
-        # stop); only calculated_dq/memo_warning are used.
-        calculated_dq, _, _, memo_warning, warning_type, _ = _calculate_expected_status(
-            gp, row.get("loan_status", ""), soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
-            has_payment_cols, memo_df, servicer_name, cycle_month,
-            scheduled_ambiguous=scheduled_ambiguous,
-        )
-
-        if calculated_dq == "UNVERIFIED":
-            dq_match = "REVIEW"
-        else:
-            dq_match = srf_dq.upper() == calculated_dq.upper()
-
         ending_balance = row.get("ending_balance")
-        has_balance_figure = ending_balance is not None and not pd.isna(ending_balance)
-        ending_balance_is_zero = has_balance_figure and abs(ending_balance) <= BALANCE_TOLERANCE
-
-        balance_issue = ""
-        if has_balance_figure and not ending_balance_is_zero:
-            balance_issue = (
-                f"LIQUIDATION loans are required to report a $0 balance. "
-                f"Reported Ending Balance: {round(float(ending_balance), 2)}."
-            )
-
-        liq_field_values, liq_ambiguous_fields = _consolidate_liquidation_fields(raw_by_gp.get(gp, raw.iloc[0:0]))
-
-        data_quality_warning_parts = []
-        if memo_warning:
-            data_quality_warning_parts.append(memo_warning)
-        if liq_ambiguous_fields:
-            data_quality_warning_parts.append(
-                f"Multiple postings this cycle report DIFFERENT values for: "
-                f"{', '.join(liq_ambiguous_fields)}. No aggregation rule is confirmed for this "
-                f"case, so each field shows every distinct reported value rather than a single "
-                f"picked one — review the underlying postings directly."
-            )
-        if scheduled_ambiguous:
-            data_quality_warning_parts.append(
-                f"Multiple distinct nonzero Scheduled Payment values this cycle "
-                f"({row.get('scheduled_distinct_values')}) — cycle obligation is ambiguous; "
-                f"the Calculated Delinquency Status above is NOT definitive."
-            )
+        if ending_balance is None or pd.isna(ending_balance):
+            continue  # can't evaluate without a balance figure
+        if abs(ending_balance) <= BALANCE_TOLERANCE:
+            continue  # within tolerance of $0 -- PASS for this loan
 
         records.append({
             "SBA GP Number": gp,
-            "Lender Loan Number": row.get("lender_loan_number", ""),
-            "Prior SOUP Loan Status": soup_status,
-            "Servicer Loan Status": str(row.get("loan_status", "")).strip(),
-            "Prior SOUP Delinquency Status": str(soup_dq_raw).strip(),
-            "Servicer Delinquency Status": srf_dq,
-            "Calculated Delinquency Status": calculated_dq,
-            "DQ Status Match": dq_match if dq_match == "REVIEW" else ("YES" if dq_match else "NO"),
-            "Beginning Balance": round(float(row["beginning_balance"]), 2) if pd.notna(row.get("beginning_balance")) else "",
-            "Ending Balance": round(float(ending_balance), 2) if has_balance_figure else "",
-            "Ending Balance Is Zero": "YES" if ending_balance_is_zero else ("NO" if has_balance_figure else ""),
-            "Payment Received": round(float(row["received"]), 2) if has_payment_cols and pd.notna(row.get("received")) else "",
-            "Scheduled Payment": round(float(row["scheduled"]), 2) if has_payment_cols and pd.notna(row.get("scheduled")) else "",
-            "Liquidation Date": liq_field_values["Liquidation Date"],
-            "Liquidation Proceeds": liq_field_values["Liquidation Proceeds"],
-            "Subsequent Recoveries/(Losses)": liq_field_values["Subsequent Recoveries/(Losses)"],
-            "Liquidation Loss": liq_field_values["Liquidation Loss"],
-            "Posting Count": int(row.get("posting_count", 1)),
-            "Balance Issue": balance_issue,
-            "Data Quality Warning": " ".join(data_quality_warning_parts),
+            "Loan Status": str(row.get("loan_status", "")).strip(),
+            "Ending Balance": round(float(ending_balance), 2),
+            "Expected Ending Balance": 0.00,
+            "Difference": round(float(ending_balance), 2),
+            "Issue": "LIQUIDATION loans are required to report a $0 balance.",
         })
 
     details = "No issues found." if not records else (
-        f"{len(records)} loan(s) reported by the servicer as LIQUIDATION this cycle — every "
-        f"such loan is surfaced here for review, regardless of Ending Balance."
+        f"{len(records)} loan(s) reported as LIQUIDATION with a nonzero Ending Balance, "
+        f"contrary to the Remittance Form Instructions."
     )
 
     return {
-        "id": "LIQ-01",
-        "name": "Liquidation Review",
+        "id": "BAL-02",
+        "name": "Liquidation Balance Validation",
         "category": "SBA Reconciliation",
-        "severity": "WARN",
-        "status": "PASS" if not records else "WARN",
+        "severity": "FAIL",
+        "status": "PASS" if not records else "FAIL",
         "issues_found": len(records),
         "details": details,
         "records": records,
@@ -536,7 +443,26 @@ def liquidation_review_check(servicer_inputs_df, soup_servicer_df, memo_df=None,
 # starting missed-payment count and this cycle's Payment Received vs.
 # Scheduled Payment to determine the transition:
 #
-#   received <= 0                          -> missed_count + 1 (always a
+#   received < 0 (client-confirmed 2026-08-04 -- a reversal removing
+#   payment value, which also inherently means the current cycle's own
+#   scheduled payment went unpaid; NOTE this does NOT use the 80% threshold,
+#   unlike every other branch below)
+#                                           -> missed_count + max(
+#                                                  1,
+#                                                  floor(
+#                                                      (
+#                                                          scheduled_payment
+#                                                          + abs(received)
+#                                                      )
+#                                                      / scheduled_payment
+#                                                  )
+#                                              )
+#                                              (UNVERIFIED if Scheduled
+#                                              Payment isn't a valid positive
+#                                              number, or if the prior SOUP
+#                                              status can't be parsed into a
+#                                              missed count)
+#   received == 0                          -> missed_count + 1 (always a
 #                                              miss, client-confirmed,
 #                                              regardless of Scheduled
 #                                              Payment — see zero-payment
@@ -598,107 +524,158 @@ def _missed_count_to_status(missed_count):
 # client confirmation supplies the specific number that operationalizes it
 # (a payment below 80% of one scheduled installment counts as a miss; 80%
 # or above counts as that installment paid). No further confirmation
-# needed on this value. Every comparison in this file MUST reference this
-# constant, never a hardcoded literal, so any future change to the
-# confirmed value only needs to happen in this one place.
+# needed on this value. Every POSITIVE-payment-sufficiency comparison in
+# this file MUST reference this constant, never a hardcoded literal, so
+# any future change to the confirmed value only needs to happen in this
+# one place.
+#
+# EXCEPTION (client-confirmed 2026-08-04): the reversal-driven calculation
+# for a NEGATIVE Payment Received amount (_apply_payment_transition's
+# `received < 0` branch) does NOT use this threshold — it's a deliberate,
+# explicit departure specific to reversals. See that branch's own
+# docstring for the formula actually used there.
 PAYMENT_SUFFICIENCY_THRESHOLD = 0.80
 
 
 def _apply_payment_transition(prior_missed_count, payment_received, scheduled_payment):
-    """Returns the new missed-payment count after this cycle's payment, OR
-    the sentinel string "UNVERIFIED" (never an int in that case) when a
-    genuine negative-payment reversal's exposure can't be measured against
-    a valid Scheduled Payment — callers MUST check for this sentinel before
-    passing the result to _missed_count_to_status.
+    """Returns (new_missed_count, payment_equivalents_removed).
+
+    new_missed_count is None when the transition genuinely cannot be
+    computed — callers MUST treat None as "this cycle's result is
+    UNVERIFIED", never as zero or as "hold steady".
+
+    payment_equivalents_removed is None on every path except a NEGATIVE
+    Payment Received amount, where it's the integer count of scheduled-
+    payment equivalents that amount represents. Returned alongside the
+    missed count so callers (NEG-01 in particular) can describe a
+    reversal's impact without re-deriving this math independently, which
+    is exactly the kind of duplicated calculation this file was already
+    burned by once (see the module note on _calculate_expected_status).
 
     A period is only treated as "paid" if the amount received covers at
     least PAYMENT_SUFFICIENCY_THRESHOLD (80%) of the scheduled payment for
     that installment — receiving *some* payment isn't enough on its own.
-    Payments covering multiple installments' worth (e.g. a catch-up
-    payment) still reduce the missed count by the number of full
-    installments covered, each judged against the same 80% threshold.
+    A payment below that threshold moves the loan down one delinquency
+    rank, exactly the same as receiving nothing at all. Payments covering
+    multiple installments' worth (e.g. a catch-up payment) still reduce
+    the missed count by the number of full installments covered, each
+    judged against the same 80% threshold. This paragraph describes the
+    POSITIVE-payment branches only — see below for the separate, NOT-80%-
+    based formula that applies when payment_received is negative.
 
-    CLIENT-CONFIRMED: a ZERO payment and a NEGATIVE payment are NOT the
-    same thing and must not be handled identically.
-      - payment_received == 0: always exactly one miss (+1), regardless of
-        Scheduled Payment — unchanged from before this reversal logic
-        existed. Some servicer submissions zero out BOTH fields together
-        for a no-payment month, which shouldn't be mistaken for "no
-        scheduled amount exists" and silently skipped.
-      - payment_received < 0: a REVERSAL. The prior posted payment was
-        clawed back AND this cycle's scheduled installment also went
-        unpaid, so the total delinquency EXPOSURE this cycle is the
-        current scheduled obligation PLUS the absolute value of the
-        reversed amount — two distinct unpaid obligations stacked, not
-        one. That combined exposure is measured in "installments" using
-        the SAME 80% sufficiency standard as every other ratio in this
-        engine (see PAYMENT_SUFFICIENCY_THRESHOLD): installments =
-        ceil(exposure/scheduled - (1 - THRESHOLD)) — i.e. reaching at
-        least 80% of the way into an additional installment counts that
-        installment as fully represented, exactly mirroring how 80% of a
-        single installment already counts as "paid" elsewhere in this
-        file. Client-confirmed against scheduled=$200: payment=-100 -> 2
-        ranks, payment=-200 -> 2 ranks, payment=-450 -> 4 ranks.
-        NO-GUESS: if Scheduled Payment is missing/zero/NaN, the exposure
-        can't be expressed as a number of installments at all — this
-        returns "UNVERIFIED" rather than fabricating a rank advancement.
-    """
+    CLIENT-CONFIRMED (2026-08-04 — supersedes the 2026-08-03 version of this
+    calculation): a NEGATIVE Payment Received amount represents payment
+    value being actively removed from the loan, not simply "no payment
+    this cycle" — its magnitude matters, AND it inherently also means the
+    current cycle's own scheduled payment went unpaid (a negative net
+    total is, by definition, less than the scheduled amount). Both pieces
+    are combined into one total deficiency, measured in whole scheduled-
+    payment units:
+
+        total_payment_deficiency = scheduled_payment + abs(negative_amount)
+        payment_equivalents_removed = max(1, floor(
+            total_payment_deficiency / scheduled_payment
+        ))
+
+    Note this does NOT apply PAYMENT_SUFFICIENCY_THRESHOLD (80%) — it's a
+    straight, 100% scheduled-payment-unit division. This is a deliberate,
+    explicit departure from the 80% threshold used everywhere else in this
+    file (the normal positive-payment ratio below is unaffected and still
+    uses it); client-confirmed specifically for this reversal calculation,
+    verified against a worked example ($211.73 scheduled, -$301.38
+    received -> deficiency $513.11 -> 2.42 -> 2 levels -> 30 DAYS from a
+    CURRENT baseline).
+
+    Minimum one level applies regardless, since ANY negative net payment
+    means no valid payment was received this cycle even if the total
+    deficiency is below one full scheduled-payment unit. The ladder then
+    advances that many levels from whatever rank the loan carried in
+    (prior_missed_count), NOT from a fixed baseline — this is deliberately
+    the same "+N from wherever it already was" pattern used by every other
+    branch in this function, not an attempt to identify which specific
+    prior payment was reversed."""
     if payment_received is None or pd.isna(payment_received):
         payment_received = 0
     received = float(payment_received)
 
-    if received == 0:
-        return prior_missed_count + 1
-
     if received < 0:
-        if scheduled_payment is None or pd.isna(scheduled_payment) or scheduled_payment == 0:
-            return "UNVERIFIED"
-        exposure = float(scheduled_payment) + abs(received)
-        ratio = exposure / float(scheduled_payment)
-        # Rounded to 9 decimal places -- just enough to absorb genuine
-        # float64 arithmetic noise (~1e-13 to 1e-15 in practice, e.g. from
-        # ratio*scheduled not landing on an exact value), while still
-        # correctly distinguishing a ratio that is genuinely, if only
-        # slightly, past a threshold boundary (e.g. 1.2000001 vs. exactly
-        # 1.2) from one that sits exactly on it. 6 decimal places was
-        # tried first and found to be too coarse -- it silently rounded
-        # 1.2000001 down to 1.2 and 2.2000001 down to 2.2, incorrectly
-        # suppressing a rank advance that should have fired. Verified
-        # against ratios of 1.00/1.19/1.20/1.2000001/1.79/1.80/1.8000001/
-        # 2.00/2.20/2.2000001 (scheduled=200): exactly-on-the-boundary
-        # ratios (1.20, 1.80, 2.20) correctly do NOT advance an extra
-        # rank; ratios even fractionally past a boundary (1.2000001,
-        # 2.2000001) correctly do.
-        installments = math.ceil(round(ratio - (1 - PAYMENT_SUFFICIENCY_THRESHOLD), 9))
-        return prior_missed_count + installments
+        if (
+            scheduled_payment is None
+            or pd.isna(scheduled_payment)
+            or float(scheduled_payment) <= 0
+        ):
+            # Can't convert a negative amount into payment equivalents
+            # without a valid, POSITIVE Scheduled Payment to measure it
+            # against. A negative Scheduled Payment isn't just "missing" --
+            # dividing by it would flip the sign of the ratio, and max(1, ...)
+            # below would then silently mask that invalid input by always
+            # reporting at least one equivalent regardless of what the
+            # (wrong) math actually produced. Every caller must surface this
+            # as UNVERIFIED, never guess.
+            return None, None
+        total_payment_deficiency = float(scheduled_payment) + abs(received)
+        payment_equivalents_removed = max(
+            1,
+            math.floor(total_payment_deficiency / float(scheduled_payment)),
+        )
+        return prior_missed_count + payment_equivalents_removed, payment_equivalents_removed
+
+    # a $0 payment is always a miss, regardless of what the Scheduled
+    # Payment field says — some servicer submissions zero out BOTH fields
+    # together for a no-payment month, which shouldn't be mistaken for
+    # "no scheduled amount exists" and silently skipped
+    if received == 0:
+        return prior_missed_count + 1, None
 
     if scheduled_payment is None or pd.isna(scheduled_payment) or scheduled_payment == 0:
         # can't compute a ratio without a valid scheduled amount to divide
         # by — hold steady rather than risk a divide-by-zero
-        return prior_missed_count
+        return prior_missed_count, None
 
     ratio = received / float(scheduled_payment)
 
     if ratio < PAYMENT_SUFFICIENCY_THRESHOLD:
         # received something, but less than 80% of one scheduled payment --
         # treated as insufficient, same as a full miss
-        return prior_missed_count + 1
+        return prior_missed_count + 1, None
     if ratio < 1.0:
         # received at least 80% but less than 100% of one installment --
         # counts as that installment paid (held steady, not reduced)
-        return prior_missed_count
+        return prior_missed_count, None
     # ratio >= 1.0: this is a catch-up payment covering one or more
-    # installments. The 80% sufficiency threshold only governs whether a
-    # SINGLE period counts as paid (per the business rule above) -- it does
-    # not redefine how multi-installment catch-up payments are measured, so
-    # this uses standard rounding to the nearest whole installment, exactly
-    # as before (e.g. a payment of 1.77x one scheduled installment rounds to
-    # covering 2 installments, correctly catching up a loan that missed one
-    # prior payment).
-    installments_covered = round(ratio)
+    # installments.
+    #
+    # CLIENT-CONFIRMED (2026-08-04 — supersedes the prior round(ratio)
+    # approach): installment counting here must use the SAME 80%
+    # sufficiency threshold as every other judgment in this function, not
+    # a raw round() of the ratio. round() could credit a second installment
+    # with as little as 50% of it actually paid (anything from 1.5x to
+    # 2.49x scheduled rounds to "2 installments"), which is inconsistent
+    # with the 80% bar applied everywhere else (single-period sufficiency,
+    # the reversal deficiency formula). Caught empirically on loan
+    # 5571508408: a $635.00 payment against a $412.20 scheduled payment is
+    # 1.54x — round(1.54) = 2, incorrectly crediting a second installment
+    # off only 54% of it ($222.80 of the $329.76 needed), which reduced a
+    # DELINQUENT loan to CURRENT with no real second installment paid.
+    #
+    # This instead walks the payment one installment at a time: the current
+    # cycle's own installment is satisfied first (guaranteed here, since
+    # ratio >= 1.0 already clears the 80% bar on its own), and each
+    # ADDITIONAL installment only counts if the amount still remaining
+    # after consuming the previous one clears 80% of one scheduled payment.
+    # The full scheduled amount is consumed per credited installment (not
+    # just the 80% portion), consistent with how an 80-100% single-period
+    # payment is already treated as "that installment fully satisfied,"
+    # never partially credited.
+    installments_covered = 0
+    remaining = received
+    threshold_amount = float(scheduled_payment) * PAYMENT_SUFFICIENCY_THRESHOLD
+    while remaining >= threshold_amount:
+        installments_covered += 1
+        remaining -= float(scheduled_payment)
     if installments_covered <= 1:
-        return prior_missed_count
-    return max(0, prior_missed_count - (installments_covered - 1))
+        return prior_missed_count, None
+    return max(0, prior_missed_count - (installments_covered - 1)), None
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +732,98 @@ def _infer_cycle_month(soup_servicer_df):
     return (latest + pd.DateOffset(months=1)).replace(day=1)
 
 
-def _lookup_deferral(memo_df, gp, servicer_key, cycle_month):
+# CLIENT-CONFIRMED (2026-08-04): Securitization Action = "CHANGE IN TERMS
+# AGREEMENT" may confirm that an EXISTING prior deferral is resuming this
+# cycle — it is NEVER treated as evidence of a NEW deferral (that still
+# requires Securitization Action = "Deferred", unchanged). Deliberately
+# does NOT generalize to MODIFICATION, CHANGE MEMO, or any other
+# Securitization Action value — real memo data shows those categories mix
+# genuine temporary deferrals with permanent restructurings (e.g. "Extend
+# the maturity date... Reduce the fixed interest rate...") with no reliable
+# way to distinguish them from this one field alone. Widening this beyond
+# CHANGE IN TERMS AGREEMENT requires a separate, explicitly confirmed rule.
+#
+# Text fields like "Other" are deliberately NOT used as evidence here —
+# re-amortization language is consistent with a deferral having occurred,
+# but the same language can also describe a permanent restructuring, so it
+# doesn't independently prove anything. Instead, every condition below is
+# either a structural fact (dates, their ordering) or a cross-check against
+# SOUP's own independently-recorded history (condition 2) — nothing here
+# depends on interpreting free-text.
+_CHANGE_IN_TERMS_TERMINAL_DISQUALIFIERS = ("CHARGE", "LIQUIDAT", "BANKRUPT", "FORECLOS", "REO")
+
+
+def _check_change_in_terms_resume(candidates, soup_status, cycle_month):
+    """Implements all six client-specified conditions for the CHANGE IN
+    TERMS AGREEMENT resume-only exception. Returns None if the exception
+    doesn't apply (caller falls through to the standard Deferred-only
+    logic), otherwise a deferral_info dict with phase="resume" and a
+    diagnostic marker (resume_via_change_in_terms_exception=True) so the
+    result stays visible for review rather than looking identical to a
+    normal, standard-path resume."""
+    if candidates is None or candidates.empty or cycle_month is None:
+        return None
+    if "Securitization Action" not in candidates.columns:
+        return None
+
+    # Condition 1: Securitization Action is exactly "CHANGE IN TERMS AGREEMENT".
+    cit_rows = candidates[
+        candidates["Securitization Action"].astype("string").str.strip().str.lower() == "change in terms agreement"
+    ]
+    if cit_rows.empty:
+        return None
+
+    # Condition 2: Prior SOUP Loan Status for this loan must be DEFERRED —
+    # this is what makes the memo evidence of a RESUME, not a new deferral.
+    # Checked against SOUP's own independent history, not the memo itself.
+    if "DEFERRED" not in str(soup_status or "").upper():
+        return None
+
+    cycle_period = cycle_month.to_period("M").to_timestamp()
+
+    for _, row in cit_rows.iterrows():
+        # Condition 6: explicit, redundant safety check against a terminal
+        # event — even though condition 1's exact match already structurally
+        # excludes "Charge Off"/"Liquidation"/etc. as the ACTION value
+        # itself, this guards against a future variant spelling or a
+        # terminal event described only in Servicer Action.
+        combined_text = " ".join(
+            str(row.get(col, "")) for col in ("Securitization Action", "Servicer Action") if col in row.index
+        ).upper()
+        if any(k in combined_text for k in _CHANGE_IN_TERMS_TERMINAL_DISQUALIFIERS):
+            continue
+
+        # Condition 3: Regular Payment Resume Date present.
+        resume_date = row.get("Regular Payment Resume Date")
+        if pd.isna(resume_date):
+            continue
+
+        # Condition 5: Deferral Start/End Date present and chronologically valid.
+        start_date = row.get("Deferral Start Date")
+        end_date = row.get("Deferral End Date")
+        if pd.isna(start_date) or pd.isna(end_date):
+            continue
+        start_ts, end_ts, resume_ts = pd.Timestamp(start_date), pd.Timestamp(end_date), pd.Timestamp(resume_date)
+        if not (start_ts <= end_ts <= resume_ts):
+            continue
+
+        # Condition 4: the current audit cycle matches the Resume Date's month.
+        resume_month = resume_ts.to_period("M").to_timestamp()
+        if cycle_period != resume_month:
+            continue
+
+        # All six conditions satisfied — confirmed resume, never a new deferral.
+        return {
+            "deferral_type": "full",
+            "phase": "resume",
+            "months_since_start": None,
+            "resume_via_change_in_terms_exception": True,
+        }
+
+    return None
+
+
+def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     """Finds the memo row (if any) whose deferral window covers cycle_month
     for this loan, and returns (deferral_info, warning, warning_type):
 
@@ -771,6 +839,11 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month):
                this cycle in the deferral timeline" (deferral_dates). These
                get different Reason tags in status_match_check: "MEMO DATA
                QUALITY WARNING" vs "DEFERRAL DATA QUALITY WARNING".
+
+    soup_status is SOUP's last recorded Loan Status for this loan — needed
+    ONLY for the narrow CHANGE IN TERMS AGREEMENT resume exception below
+    (condition 2: confirms an EXISTING deferral is ending, never used to
+    establish a NEW one).
 
     servicer_key must be the canonical soup_key (e.g. "Millennium Bank",
     "Lendistry"), NOT a note-series-suffixed display label like "Millennium
@@ -829,45 +902,29 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month):
         )
         return None, warning, "lender_identity"
 
-    candidates = memo_df[id_match & lender_match].copy()
+    all_candidates = memo_df[id_match & lender_match].copy()
+
+    # CLIENT-CONFIRMED (2026-08-04): a narrow, RESUME-ONLY exception for
+    # Securitization Action = "CHANGE IN TERMS AGREEMENT". Checked before
+    # the standard "Deferred"-only logic below, and deliberately never
+    # treated as evidence of a NEW deferral — see _check_change_in_terms_resume
+    # for the full set of required conditions. Does not generalize to
+    # MODIFICATION, CHANGE MEMO, or any other Securitization Action value.
+    cit_result = _check_change_in_terms_resume(all_candidates, soup_status, cycle_month)
+    if cit_result is not None:
+        return cit_result, None, None
+
+    candidates = all_candidates.copy()
 
     # Securitization Action is the memo's own authoritative categorical
     # field for what kind of record this is (Deferred / Charge-off /
-    # Modification / an ad-hoc "Change Memo #N" note / etc.) — rows
-    # explicitly marked "Deferred" are always real deferral records. This
-    # matters: some administrative "Change Memo" rows carry the same
-    # Deferral Start/End Date values as a real deferral (apparently copied
-    # from it) but aren't deferrals themselves, and including them causes
-    # false matches.
-    #
-    # However, an exact-label-only filter is too narrow: some genuine
-    # deferrals get recorded under a different Securitization Action label
-    # entirely (e.g. "CHANGE IN TERMS AGREEMENT", or a "Modification" row
-    # whose Servicer Action explicitly reads "One-Time 90-Day Deferment").
-    # Discarding those loses real deferral evidence rather than protecting
-    # against a false one. The safe way to recognize them WITHOUT reopening
-    # the prior "administrative row with copied dates" bug: require the
-    # FULL deferral lifecycle — Start, End, AND Resume dates ALL present —
-    # not just a Start Date. Checked exhaustively against every
-    # Securitization Action category present in the actual memo data: no
-    # Charge-off, blank, or incomplete "Change Memo" row EVER has all three
-    # dates populated; only genuine deferrals do, regardless of label. A
-    # fully-specified deferral timeline isn't something an unrelated
-    # administrative record would have by accident — it's evidence, not a
-    # label guess.
+    # Modification / an ad-hoc "Change Memo #N" note / etc.) — only rows
+    # explicitly marked "Deferred" are real deferral records. This matters:
+    # some administrative "Change Memo" rows carry the same Deferral Start/
+    # End Date values as a real deferral (apparently copied from it) but
+    # aren't deferrals themselves, and including them causes false matches.
     if "Securitization Action" in candidates.columns:
-        sec_action = candidates["Securitization Action"].astype("string").str.strip().str.lower()
-        is_labeled_deferred = sec_action == "deferred"
-        date_cols = {"Deferral Start Date", "Deferral End Date", "Regular Payment Resume Date"}
-        if date_cols.issubset(candidates.columns):
-            has_full_date_lifecycle = (
-                candidates["Deferral Start Date"].notna()
-                & candidates["Deferral End Date"].notna()
-                & candidates["Regular Payment Resume Date"].notna()
-            )
-        else:
-            has_full_date_lifecycle = pd.Series(False, index=candidates.index)
-        candidates = candidates[is_labeled_deferred | has_full_date_lifecycle]
+        candidates = candidates[candidates["Securitization Action"].astype("string").str.strip().str.lower() == "deferred"]
 
     if candidates.empty or "Deferral Start Date" not in candidates.columns:
         return None, None, None
@@ -911,6 +968,7 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month):
 
     warning = None
     warning_type = None
+    months_since_start = (cycle_period.year - chosen_start_month.year) * 12 + (cycle_period.month - chosen_start_month.month)
     if deferral_type == "full":
         # Checked in this order:
         #   1. start — the cycle containing Deferral Start Date
@@ -949,7 +1007,7 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month):
     else:
         phase = None
 
-    return {"deferral_type": deferral_type, "phase": phase}, warning, warning_type
+    return {"deferral_type": deferral_type, "phase": phase, "months_since_start": months_since_start}, warning, warning_type
 
 
 # A Loan Status comparison of "prior != current" is not the same question as
@@ -971,6 +1029,31 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month):
 # BANKRUPTCY, CANCEL, WITHDRAWN) have NOT been confirmed the same way and
 # are intentionally left out rather than assumed to belong here too.
 _VALID_EXIT_TRANSITION_KEYWORDS = ("PAID-IN-FULL", "PIF")
+
+# CLIENT-CONFIRMED (2026-08-04): a terminal COLLECTION status appearing in
+# the SERVICER'S REPORTED DELINQUENCY STATUS field specifically (not Loan
+# Status, and not SOUP's history) is a fundamentally different situation
+# from a normal delinquency ranking disagreement — the servicer has put a
+# collection/legal-process descriptor into a field that's supposed to hold
+# a payment-ranking value. The calculated delinquency ranking must proceed
+# exactly as it always does (this never touches _calculate_expected_status
+# or _apply_payment_transition), and this value must never be parsed as a
+# ranking (_status_to_missed_count already returns None for non-numeric
+# text, so this is already structurally true — see status_match_check for
+# where the comparison itself is short-circuited to avoid a misleading
+# "DELINQUENCY STATUS MISMATCH" tag on what is really a different kind of
+# anomaly).
+#
+# Deliberately a SEPARATE, narrower constant from _TERMINAL_STATUS_KEYWORDS
+# and _VALID_EXIT_TRANSITION_KEYWORDS above — those serve different,
+# already-confirmed purposes (Loan Status terminal detection; a single
+# confirmed valid EXIT transition). This one covers exactly the three
+# values explicitly named by the client. Do NOT fold in PAID-IN-FULL,
+# CHARGE-OFF, or BANKRUPTCY here without a separate confirmed rule — the
+# client's request named FORECLOSURE/LIQUIDATION/REO specifically ("such
+# as" examples, not necessarily this exact final list), and widening it
+# should be a deliberate decision, not an assumption made here.
+_DQ_TERMINAL_COLLECTION_KEYWORDS = ("FORECLOSURE", "LIQUIDATION", "REO")
 
 
 def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, received, scheduled,
@@ -995,9 +1078,13 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     them.
 
     Returns (calculated_dq, expected_loan_status, deferral, memo_warning,
-    warning_type, is_terminal_this_cycle). expected_loan_status is None
-    when normal comparison against SOUP's last status applies (no deferral
-    override)."""
+    warning_type, is_terminal_this_cycle, reversal_info). expected_loan_status
+    is None when normal comparison against SOUP's last status applies (no
+    deferral override). reversal_info is None unless a negative Payment
+    Received amount actually drove calculated_dq this cycle, in which case
+    it's {"payment_equivalents_removed": N} — corrections.py uses this to
+    require manual review for any reversal-driven result rather than
+    auto-correcting it (client-confirmed 2026-08-03)."""
     srf_status_u = str(srf_status).upper()
     soup_status_u = str(soup_status).upper()
 
@@ -1010,20 +1097,22 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     is_terminal_this_cycle = any(
         k in srf_status_u or k in soup_status_u for k in _TERMINAL_STATUS_KEYWORDS
     )
-    # Client clarification: LIQUIDATION loans still need a REAL calculated
-    # Delinquency Status (same validated engine as any other loan — 80%
-    # threshold, zero-payment progression, prior baseline, etc.), routed to
-    # the dedicated LIQ-01 review rather than STAT-01. Every other terminal
-    # status (PAID-IN-FULL, FORECLOSURE, CHARGE-OFF, REO, CANCEL, WITHDRAWN)
-    # keeps the existing CURRENT shortcut below, unchanged.
-    is_liquidation_this_cycle = "LIQUIDAT" in srf_status_u or "LIQUIDAT" in soup_status_u
 
-    deferral, memo_warning, warning_type = (None, None, None) if is_terminal_this_cycle else _lookup_deferral(memo_df, gp, servicer_name, cycle_month)
+    deferral, memo_warning, warning_type = (None, None, None) if is_terminal_this_cycle else _lookup_deferral(memo_df, gp, servicer_name, cycle_month, soup_status=soup_status)
 
     prior_missed = _status_to_missed_count(soup_dq_raw) if has_payment_cols else None
     expected_loan_status = None
+    reversal_info = None
+    # Broadens the "prior_missed is not None" gate below just enough to
+    # catch a negative Payment Received whose prior SOUP status couldn't be
+    # parsed — that case must surface as UNVERIFIED (client-confirmed
+    # safeguard), not silently fall through to the generic raw-text-echo
+    # branch at the bottom of this function, which is what would otherwise
+    # happen since prior_missed being None would skip past the branch that
+    # would have handled it.
+    received_is_negative = received is not None and pd.notna(received) and float(received) < 0
 
-    if is_terminal_this_cycle and not is_liquidation_this_cycle:
+    if is_terminal_this_cycle:
         calculated_dq = "CURRENT"
     elif deferral and deferral["deferral_type"] == "full" and deferral["phase"] == "resume":
         # Client-confirmed: the cycle containing Regular Payment Resume
@@ -1033,8 +1122,10 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         if scheduled_ambiguous:
             calculated_dq = "UNVERIFIED"
         elif has_payment_cols:
-            new_missed = _apply_payment_transition(0, received, scheduled)
-            calculated_dq = "UNVERIFIED" if new_missed == "UNVERIFIED" else _missed_count_to_status(new_missed)
+            new_missed, payment_equivalents_removed = _apply_payment_transition(0, received, scheduled)
+            calculated_dq = "UNVERIFIED" if new_missed is None else _missed_count_to_status(new_missed)
+            if payment_equivalents_removed is not None:
+                reversal_info = {"payment_equivalents_removed": payment_equivalents_removed}
         else:
             calculated_dq = "CURRENT"
 
@@ -1078,27 +1169,57 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         calculated_dq = str(soup_dq_raw).strip().upper()
     elif deferral and deferral["deferral_type"] == "full":
         expected_loan_status = "DEFERRED"
-        if deferral["phase"] == "start":
-            calculated_dq = _missed_count_to_status(prior_missed) if prior_missed is not None else str(soup_dq_raw).strip().upper()
-        else:  # "mid"
-            calculated_dq = _missed_count_to_status(prior_missed + 1) if prior_missed is not None else str(soup_dq_raw).strip().upper()
+        # CLIENT-CONFIRMED (2026-08-03): an external deferral (one initiated
+        # by a servicer memo, not necessarily by a missed payment) does NOT
+        # pause the delinquency ranking ladder. Every month spent in
+        # deferral — including the first — is ranked as one more step up
+        # that ladder, exactly like a normal missed payment would be under
+        # _apply_payment_transition's "nothing received" branch (+1). This
+        # replaces the prior behavior, which incorrectly held the rank
+        # steady at whatever it was before the deferral began for the
+        # deferral's first month.
+        #
+        # This is deliberately just "+1", the SAME single-step-per-cycle
+        # formula every other branch in this function uses — NOT "+1 per
+        # elapsed month since deferral start". prior_missed already comes
+        # from SOUP's most recently recorded status, which in a real
+        # multi-month audit is itself last month's calculated/corrected
+        # value — SOUP's rolling history already carries the ladder forward
+        # month over month on its own. Adding an elapsed-month count on top
+        # of that would double-count every month after the first (caught by
+        # testing against a simulated 3-month deferral before this was
+        # deployed — month 3 came out at 120 DAYS instead of the correct 60
+        # DAYS).
+        calculated_dq = (
+            _missed_count_to_status(prior_missed + 1)
+            if prior_missed is not None else str(soup_dq_raw).strip().upper()
+        )
     elif deferral and deferral["deferral_type"] == "partial":
         # Loan Status should read DEFERRED for the window, but DQ still
         # follows normal payment-vs-scheduled math below.
         expected_loan_status = "DEFERRED"
         if scheduled_ambiguous:
             calculated_dq = "UNVERIFIED"
-        elif has_payment_cols and prior_missed is not None:
-            new_missed = _apply_payment_transition(prior_missed, received, scheduled)
-            calculated_dq = "UNVERIFIED" if new_missed == "UNVERIFIED" else _missed_count_to_status(new_missed)
+        elif has_payment_cols and (prior_missed is not None or received_is_negative):
+            if received_is_negative and prior_missed is None:
+                calculated_dq = "UNVERIFIED"
+            else:
+                new_missed, payment_equivalents_removed = _apply_payment_transition(prior_missed, received, scheduled)
+                calculated_dq = "UNVERIFIED" if new_missed is None else _missed_count_to_status(new_missed)
+                if payment_equivalents_removed is not None:
+                    reversal_info = {"payment_equivalents_removed": payment_equivalents_removed}
         else:
             calculated_dq = str(soup_dq_raw).strip().upper()
-    elif has_payment_cols and prior_missed is not None:
-        if scheduled_ambiguous:
+    elif has_payment_cols and (prior_missed is not None or received_is_negative):
+        if received_is_negative and prior_missed is None:
+            calculated_dq = "UNVERIFIED"
+        elif scheduled_ambiguous:
             calculated_dq = "UNVERIFIED"
         else:
-            new_missed = _apply_payment_transition(prior_missed, received, scheduled)
-            calculated_dq = "UNVERIFIED" if new_missed == "UNVERIFIED" else _missed_count_to_status(new_missed)
+            new_missed, payment_equivalents_removed = _apply_payment_transition(prior_missed, received, scheduled)
+            calculated_dq = "UNVERIFIED" if new_missed is None else _missed_count_to_status(new_missed)
+            if payment_equivalents_removed is not None:
+                reversal_info = {"payment_equivalents_removed": payment_equivalents_removed}
     else:
         # fall back to the original straight string comparison if payment
         # columns aren't available or prior status is unparseable
@@ -1138,16 +1259,53 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
                 "that status."
             )
 
-    return calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, is_terminal_this_cycle
+    # CLIENT-CONFIRMED (2026-08-03): the servicer's own reported BANKRUPTCY
+    # status is accepted as authoritative for LOAN STATUS purposes. There is
+    # no independent historical source (SOUP, the memo) that can confirm or
+    # dispute WHEN a bankruptcy began, so the prior SOUP status (e.g. ACTIVE)
+    # must never be used to contradict it — this is the same "arriving is not
+    # a mismatch" principle already applied to PAID-IN-FULL
+    # (_VALID_EXIT_TRANSITION_KEYWORDS), just implemented directly here by
+    # setting expected_loan_status rather than only suppressing the match
+    # boolean, so the displayed Expected Loan Status also reads BANKRUPTCY
+    # rather than misleadingly showing the pre-bankruptcy SOUP status.
+    #
+    # Deliberately does NOT touch calculated_dq — Delinquency Status keeps
+    # following its normal payment-history math regardless of bankruptcy,
+    # since nothing here was asked to change that, only Loan Status.
+    #
+    # Deliberately one-directional, same as PAID-IN-FULL: only overrides
+    # when the CURRENT servicer report says BANKRUPTCY. A loan LEAVING
+    # BANKRUPTCY for something else is a materially different, unvalidated
+    # scenario and stays subject to the normal comparison below.
+    #
+    # Placed last, after every deferral branch above, so it always wins as
+    # the final word on Loan Status — a real bankruptcy report should not be
+    # silently overridden by an old, no-longer-relevant deferral window.
+    if "BANKRUPT" in srf_status_u:
+        expected_loan_status = srf_status
+
+    return calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, is_terminal_this_cycle, reversal_info
 
 
 def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None):
     records = []
+    correction_data = []
+    # CLIENT-CONFIRMED (2026-08-04): a record whose ONLY reason is the
+    # informational "DEFERRAL RESUME INFORMATION" marker (both Loan Status
+    # and DQ Status genuinely match, no real warning) must stay visible in
+    # `records` for transparency, but must NOT count toward issues_found or
+    # flip STAT-01's overall status to WARN — it isn't a mismatch, warning,
+    # or audit error, it's a disclosure of how a clean result was reached.
+    real_issue_count = 0
 
     required = {"SBA GP Number", "Loan Status", "Delinquency Status"}
     if not required.issubset(servicer_inputs_df.columns) or not required.issubset(soup_servicer_df.columns):
-        return _result("STAT-01", "Status / Delinquency Match", "SBA Reconciliation", "WARN", records,
-                        lambda n: "")
+        result = _result("STAT-01", "Status / Delinquency Match", "SBA Reconciliation", "WARN", records,
+                          lambda n: "")
+        result["correction_data"] = []
+        result["_cycle_month"] = None
+        return result
 
     cycle_month = _infer_cycle_month(soup_servicer_df)
     has_payment_cols = {"Scheduled Payment", "Payment Received"}.issubset(servicer_inputs_df.columns)
@@ -1174,20 +1332,23 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip()
         soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "")
         scheduled_ambiguous = bool(row.get("scheduled_ambiguous"))
+        scheduled_payment_updated_during_cycle = bool(row.get("scheduled_payment_updated_during_cycle"))
 
-        # Client clarification: there is no historical data to independently
-        # establish that LIQUIDATION is an incorrect transition from any
-        # prior status, so a servicer-reported LIQUIDATION loan must never
-        # be flagged here as a Loan Status mismatch. It belongs exclusively
-        # in the dedicated LIQ-01 review instead — see liquidation_review_check.
-        if "LIQUIDAT" in srf_status.upper():
-            continue
-
-        calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, _ = _calculate_expected_status(
+        calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, _, reversal_info = _calculate_expected_status(
             gp, srf_status, soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
             has_payment_cols, memo_df, servicer_name, cycle_month,
             scheduled_ambiguous=scheduled_ambiguous,
         )
+
+        # CLIENT-CONFIRMED (2026-08-04): a terminal collection status
+        # (FORECLOSURE/LIQUIDATION/REO) in the SERVICER'S reported
+        # Delinquency Status is not a delinquency ranking to compare
+        # against — it's flagged as its own distinct review item below,
+        # separately from a normal calculation disagreement. The
+        # calculated_dq computation above is completely unaffected by this
+        # check (it never reads srf_dq at all), so the delinquency ranking
+        # itself continues exactly as normal.
+        srf_dq_is_terminal_collection = any(k in srf_dq.upper() for k in _DQ_TERMINAL_COLLECTION_KEYWORDS)
 
         # UNVERIFIED means the calculation branch that ran actually needed
         # Scheduled Payment and couldn't trust it — this is NOT the same as
@@ -1197,6 +1358,8 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # DELINQUENCY STATUS MISMATCH just because calculated_dq isn't a
         # real status string.
         if calculated_dq == "UNVERIFIED":
+            dq_match = "REVIEW"
+        elif srf_dq_is_terminal_collection:
             dq_match = "REVIEW"
         else:
             dq_match = srf_dq.upper() == calculated_dq.upper()
@@ -1212,6 +1375,15 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         is_valid_exit_transition = any(k in srf_status.upper() for k in _VALID_EXIT_TRANSITION_KEYWORDS)
         status_match = is_valid_exit_transition or (srf_status.upper() == (expected_loan_status or soup_status).upper())
 
+        # CLIENT-CONFIRMED (2026-08-04): whenever the CHANGE IN TERMS
+        # AGREEMENT resume exception (see _check_change_in_terms_resume)
+        # produced this cycle's result, that must stay visible for review
+        # even if Loan Status and DQ both come out clean — this is a
+        # narrow, exception-driven acceptance, not a routine match, and the
+        # client explicitly wants it distinguishable from an ordinary
+        # resume sourced from a standard "Deferred" memo record.
+        resume_via_change_in_terms_exception = bool(deferral.get("resume_via_change_in_terms_exception")) if deferral else False
+
         # A memo-related warning is surfaced even when the calculated status
         # happens to match what was reported — the point is that this
         # loan's deferral/memo context couldn't be verified at all, so a
@@ -1220,7 +1392,10 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # visible even if Loan Status happens to match, since the DQ side
         # is explicitly unresolved (dq_match == "REVIEW", never treated as
         # a silent pass).
-        if status_match and dq_match is True and not memo_warning and not scheduled_ambiguous:
+        if (
+            status_match and dq_match is True and not memo_warning and not scheduled_ambiguous
+            and not resume_via_change_in_terms_exception and not scheduled_payment_updated_during_cycle
+        ):
             continue
 
         # Two distinct memo-related problems get two distinct Reason tags
@@ -1250,12 +1425,38 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # what was reported, when the calculation itself couldn't run.
         if dq_match is False:
             reasons.append("DELINQUENCY STATUS MISMATCH")
+        # CLIENT-CONFIRMED (2026-08-04): distinct from DELINQUENCY STATUS
+        # MISMATCH on purpose -- a terminal collection status in the DQ
+        # field isn't a ranking disagreement, it's a different kind of
+        # anomaly needing manual attention. Unlike the two informational
+        # tags below, this DOES count toward real_issue_count (left out of
+        # that exclusion set deliberately) and IS added to corrections.py's
+        # WARNING_REASONS, since a loan with this flag should not have any
+        # field auto-corrected without a human looking at it first.
+        if srf_dq_is_terminal_collection:
+            reasons.append("TERMINAL STATUS REVIEW")
         if memo_warning and warning_type == "lender_identity":
             reasons.append("MEMO DATA QUALITY WARNING")
         if memo_warning and warning_type == "deferral_dates":
             reasons.append("DEFERRAL DATA QUALITY WARNING")
         if scheduled_ambiguous:
             reasons.append("SCHEDULED PAYMENT AMBIGUOUS")
+        # Deliberately NOT added to corrections.py's WARNING_REASONS set —
+        # this is an informational marker for a CONFIRMED, working-as-
+        # designed exception, not a problem or uncertainty, so it must
+        # never block auto-correction eligibility the way a real warning
+        # reason does.
+        if resume_via_change_in_terms_exception:
+            reasons.append("DEFERRAL RESUME INFORMATION")
+        # CLIENT-CONFIRMED (2026-08-04): same principle as the deferral
+        # resume exception above — a resolved step-pattern update is a
+        # confirmed, working-as-designed outcome, not a problem, so it must
+        # never count as an issue/warning or block auto-correction.
+        if scheduled_payment_updated_during_cycle:
+            reasons.append("SCHEDULED PAYMENT UPDATED DURING CYCLE")
+
+        if set(reasons) - {"DEFERRAL RESUME INFORMATION", "SCHEDULED PAYMENT UPDATED DURING CYCLE"}:
+            real_issue_count += 1
 
         records.append({
             "SBA GP Number": gp,
@@ -1270,6 +1471,18 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "Deferral Type": deferral["deferral_type"] if deferral else "",
             "Memo Lookup Warning": memo_warning if warning_type == "lender_identity" else "",
             "Deferral Data Quality Warning": memo_warning if warning_type == "deferral_dates" else "",
+            "Deferral Resume Source": "CHANGE IN TERMS AGREEMENT exception (not a standard Deferred record)" if resume_via_change_in_terms_exception else "",
+            "Scheduled Payment Update Detail": (
+                f"Distinct values reported this cycle: {row.get('scheduled_distinct_values')} — "
+                f"resolved as a one-directional step pattern; final chronological value "
+                f"${row.get('scheduled'):,.2f} used for the delinquency calculation."
+            ) if scheduled_payment_updated_during_cycle else "",
+            "Terminal Status Review Detail": (
+                f"Servicer Delinquency Status ({srf_dq!r}) contains a terminal collection status "
+                f"rather than a delinquency ranking. The Calculated DQ Status above was computed "
+                f"normally from payment history and is unaffected; this loan needs manual review "
+                f"rather than an automatic ranking comparison."
+            ) if srf_dq_is_terminal_collection else "",
             "Posting Count": int(row.get("posting_count", 1)),
             "Scheduled Payment Ambiguous": "YES" if scheduled_ambiguous else "NO",
             "Data Quality Issue": (
@@ -1281,13 +1494,56 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "Scheduled Payment (this cycle)": round(float(row.get("scheduled")), 2) if has_payment_cols and pd.notna(row.get("scheduled")) else "",
         })
 
-    return _result(
+        # Raw facts only — no eligibility judgment here. Whether any of this
+        # actually qualifies for auto-correction is decided entirely in
+        # backend/corrections.py, kept deliberately separate from this
+        # detection logic. expected_loan_status (NOT the "or soup_status"
+        # display fallback above) is the field that lets corrections.py tell
+        # "a confirmed deferral override" apart from "no override, happens
+        # to read the same as SOUP" — those must not be conflated.
+        correction_data.append({
+            "gp": gp,
+            "excel_row": row.get("_excel_row"),
+            "sheet_name": row.get("_sheet_name"),
+            "header_excel_row": row.get("_header_excel_row"),
+            "reasons": reasons,
+            "dq_match": dq_match,
+            "calculated_dq": calculated_dq,
+            "srf_dq": srf_dq,
+            "status_match": status_match,
+            "expected_loan_status_raw": expected_loan_status,
+            "srf_status": srf_status,
+            "soup_status": soup_status,
+            "deferral_type": deferral["deferral_type"] if deferral else None,
+            "deferral_phase": deferral["phase"] if deferral else None,
+            # CLIENT-CONFIRMED (2026-08-03): whenever a negative Payment
+            # Received amount actually drove calculated_dq this cycle, that
+            # result must require manual review before correction rather
+            # than being auto-correctable — controlled here by exposing the
+            # fact to corrections.py's eligibility logic (None when no
+            # reversal was involved), NOT by giving STAT-01 a different
+            # calculated_dq than NEG-01 would show for the same loan/cycle.
+            "reversal_equivalents": reversal_info["payment_equivalents_removed"] if reversal_info else None,
+        })
+
+    result = _result(
         "STAT-01", "Status / Delinquency Match", "SBA Reconciliation", "WARN", records,
         lambda n: f"{n} loan(s) where Loan Status doesn't match SOUP's last recorded status, or "
                   f"where Delinquency Status doesn't match the status calculated from "
                   f"missed-payment history (Payment Received vs. Scheduled Payment against the "
                   f"loan's prior recorded status).",
+        issues_found=real_issue_count,
     )
+    # Sibling key, deliberately NOT inside `records`: report.py's detail-tab
+    # builder derives Excel columns from `list(records[0].keys())`, so
+    # anything added to a record dict becomes a new visible column in the
+    # existing audit report. Keeping this on a sibling key means report.py,
+    # chatbot.py, and the frontend's rendering of `r.records` are completely
+    # unaffected — main.py reads this key internally to build corrected
+    # workbooks, then removes it before the API response is returned.
+    result["correction_data"] = correction_data
+    result["_cycle_month"] = cycle_month
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1337,24 +1593,14 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
 
     calculated_dq_by_loan = {}
     prior_status_by_loan = {}
-    # For each GP, if the CONSOLIDATED net payment this cycle is itself
-    # negative, compute how many installments that net reversal represents
-    # by reusing the exact same _apply_payment_transition formula (starting
-    # from a hypothetical zero baseline — the increment a negative payment
-    # contributes doesn't depend on the prior missed count, so this yields
-    # the reversal's installment-equivalent directly without duplicating
-    # the math). This is deliberately a NET-CYCLE figure computed ONCE per
-    # GP, not per individual negative posting — per the client's explicit
-    # instruction not to double-count reversal impact when a GP has
-    # multiple postings this cycle.
-    reversal_installments_by_loan = {}
+    reversal_info_by_loan = {}
     for gp, row in si_grouped.iterrows():
         soup_status = str(soup_latest.loc[gp].get("Loan Status", "")).strip() if gp in soup_latest.index else ""
         soup_dq_raw = soup_latest.loc[gp].get("Delinquency Status", "") if gp in soup_latest.index else ""
         prior_status_by_loan[gp] = str(soup_dq_raw).strip()
 
         srf_status = str(row.get("loan_status", "")).strip()
-        calculated_dq, _, _, _, _, _ = _calculate_expected_status(
+        calculated_dq, _, _, _, _, _, reversal_info = _calculate_expected_status(
             gp, srf_status, soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
             has_payment_cols, memo_df, servicer_name, cycle_month,
             scheduled_ambiguous=bool(row.get("scheduled_ambiguous")),
@@ -1365,10 +1611,7 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
         # through as plain text here rather than risking being treated as
         # a real status label.
         calculated_dq_by_loan[gp] = calculated_dq
-
-        net_received = row.get("received")
-        if net_received is not None and pd.notna(net_received) and float(net_received) < 0:
-            reversal_installments_by_loan[gp] = _apply_payment_transition(0, net_received, row.get("scheduled"))
+        reversal_info_by_loan[gp] = reversal_info
 
     # scan the RAW, un-aggregated rows -- a negative posting can be masked by
     # a positive one in the same cycle's summed total, so each posting needs
@@ -1377,31 +1620,57 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
     for _, row in negative_rows.iterrows():
         gp = row["SBA GP Number"]
         period = _fmt_date(row.get("Payment Receipt Date")) if "Payment Receipt Date" in si.columns else ""
-        consolidated_row = si_grouped.loc[gp] if gp in si_grouped.index else None
-        scheduled_val = consolidated_row.get("scheduled") if consolidated_row is not None else None
-        reversal_installments = reversal_installments_by_loan.get(gp)
-        if reversal_installments is None:
-            # This GP's net CONSOLIDATED cycle payment isn't itself negative
-            # (other postings offset it) — the installment-equivalent
-            # concept doesn't apply to the net cycle result, so it's not
-            # fabricated here; the individual posting is still shown above
-            # for transparency, per the client's explicit instruction.
-            reversal_display = "N/A — net cycle payment not negative"
-        elif reversal_installments == "UNVERIFIED":
-            reversal_display = "UNVERIFIED — Scheduled Payment insufficient to determine"
+        reversal_info = reversal_info_by_loan.get(gp)
+        # CLIENT-CONFIRMED (2026-08-03): state exactly how many payment
+        # equivalents this negative amount represented and how many
+        # delinquency levels that produced, rather than a generic "review
+        # manually" note with no numbers behind it. reversal_info is None
+        # when this loan's CONSOLIDATED (netted) cycle total wasn't actually
+        # negative -- e.g. a same-cycle positive posting fully offset this
+        # one -- in which case the normal (non-reversal) calculation ran
+        # instead, and the note reflects that rather than implying a
+        # reversal calculation happened when it didn't.
+        if reversal_info is not None:
+            n = reversal_info["payment_equivalents_removed"]
+            net_received = si_grouped.loc[gp].get("received")
+            scheduled_this_cycle = si_grouped.loc[gp].get("scheduled")
+            # CLIENT-CONFIRMED (2026-08-04): the calculation is based on the
+            # loan's CONSOLIDATED net Payment Received for the whole cycle,
+            # never an individual posting's own amount — a loan can have
+            # several negative postings this cycle, or a positive posting
+            # that partly offsets a negative one, and this row's own
+            # "Negative Payment Amount" would misdescribe the calculation if
+            # quoted here instead of the consolidated total that was
+            # actually used. The deficiency includes the current cycle's own
+            # unpaid scheduled payment, not just the removed amount — see
+            # _apply_payment_transition's docstring for the exact formula.
+            note = (
+                f"The consolidated net Payment Received for this loan this cycle was "
+                f"${net_received:,.2f} against a Scheduled Payment of ${scheduled_this_cycle:,.2f}, "
+                f"a total deficiency of {n} scheduled payment equivalent(s) (including the current "
+                f"cycle's own unpaid scheduled payment). The delinquency ranking advanced {n} "
+                f"level(s) from the prior SOUP status. Manual review is required before correction."
+            )
+        elif calculated_dq_by_loan.get(gp) == "UNVERIFIED":
+            note = (
+                "Reversed payment — the delinquency impact could not be determined (Scheduled Payment "
+                "or the prior SOUP delinquency status is missing/unusable for this loan). Flagged for "
+                "manual review."
+            )
         else:
-            reversal_display = reversal_installments
-
+            note = (
+                "Negative posting occurred this cycle, but the consolidated (netted) cycle total for "
+                "this loan was not negative — reviewed for visibility only; the standard calculation "
+                "applied."
+            )
         records.append({
             "SBA GP Number": gp,
             "Period / Month": period,
             "Negative Payment Amount": round(float(row["Payment Received"]), 2),
-            "Scheduled Payment": round(float(scheduled_val), 2) if scheduled_val is not None and pd.notna(scheduled_val) else "",
+            "Consolidated Net Payment This Cycle": round(float(si_grouped.loc[gp].get("received")), 2) if pd.notna(si_grouped.loc[gp].get("received")) else "",
             "Prior Period Status": prior_status_by_loan.get(gp, ""),
             "Current Period Status (Calculated)": calculated_dq_by_loan.get(gp, ""),
-            "Reversal Installment Equivalent": reversal_display,
-            "Rank Advancement Caused by Reversal": reversal_display,
-            "Note": "Reversed payment — review delinquency status manually",
+            "Note": note,
         })
 
     records.sort(key=lambda r: (r["SBA GP Number"], r["Period / Month"]))
@@ -1409,11 +1678,10 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
     return _result(
         "NEG-01", "Negative Payment Flags", "SBA Reconciliation", "WARN", records,
         lambda n: f"{n} payment posting(s) with a negative Payment Received amount this cycle "
-                  f"(typically a reversal) — flagged for visibility. The Calculated Delinquency "
-                  f"Status shown already accounts for the reversal automatically (treated as "
-                  f"additional unpaid obligation on top of this cycle's scheduled payment, per the "
-                  f"same 80% sufficiency engine used everywhere else) — this tab does not require "
-                  f"manual recalculation, only review of the resulting status.",
+                  f"(typically a reversal) — flagged for manual review. The calculated status "
+                  f"reflects a reversal-aware delinquency calculation (converting the negative "
+                  f"amount into scheduled-payment equivalents), but is NOT automatically written "
+                  f"to the corrected workbook; a reviewer should confirm the correct status by hand.",
     )
 
 
@@ -1641,11 +1909,6 @@ def missing_payment_periods_check(soup_servicer_df, loan_terms_df):
 # before remittance — that's expected and NOT flagged. Only genuine
 # shortfalls (or overages) beyond the fee-adjusted amount are surfaced.
 #
-# CLIENT REQUEST: severity is INFO, not FAIL — a shortfall here doesn't
-# necessarily represent an actual servicing error worth hard-failing over,
-# so it's surfaced for informational visibility/review rather than as an
-# exception requiring resolution.
-#
 # Note: this check depends on Scheduled Payment and Servicing Fee columns
 # being present in the servicer's file — not every servicer template may
 # include Servicing Fee, so this check can be safely disabled if it doesn't
@@ -1667,7 +1930,7 @@ def payment_shortfall_check(servicer_inputs_df):
     if not required.issubset(servicer_inputs_df.columns):
         return {
             "id": "PAY-02", "name": "Payment Shortfall Check", "category": "SBA Reconciliation",
-            "severity": "INFO", "status": "PASS", "issues_found": 0,
+            "severity": "FAIL", "status": "PASS", "issues_found": 0,
             "details": "No issues found.", "records": [],
         }
 
@@ -1756,8 +2019,8 @@ def payment_shortfall_check(servicer_inputs_df):
         "id": "PAY-02",
         "name": "Payment Shortfall Check",
         "category": "SBA Reconciliation",
-        "severity": "INFO",
-        "status": "PASS" if not records else "INFO",
+        "severity": "FAIL",
+        "status": "PASS" if not records else "FAIL",
         "issues_found": len(records),
         "details": details,
         "records": records,
@@ -1771,7 +2034,7 @@ def payment_shortfall_check(servicer_inputs_df):
 ALL_CHECKS_META = [
     ("POP-01", "Population Check"),
     ("BAL-01", "Balance Continuity"),
-    ("LIQ-01", "Liquidation Review"),
+    ("BAL-02", "Liquidation Balance Validation"),
     ("STAT-01", "Status / Delinquency Match"),
     ("PAY-01", "Missing Payment Periods"),
     ("PAY-02", "Payment Shortfall Check"),
@@ -1804,12 +2067,12 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
     deal (from file_readers.extract_deal_from_note_series) scopes POP-01 to
     Servicer + Deal + normalized GP Number instead of Servicer + GP Number
     alone — see population_check's docstring-level comment for why. Only
-    affects POP-01; BAL-01, LIQ-01, STAT-01, PAY-01/02, DUP-01, and NEG-01
+    affects POP-01; BAL-01, BAL-02, STAT-01, PAY-01/02, DUP-01, and NEG-01
     are unchanged by this parameter."""
     results = [
         population_check(loan_terms_df, soup_servicer_df, servicer_name, deal=deal),
         balance_continuity_check(servicer_inputs_df, soup_servicer_df),
-        liquidation_review_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name),
+        liquidation_balance_check(servicer_inputs_df),
         status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name),
         missing_payment_periods_check(soup_servicer_df, loan_terms_df),
         payment_shortfall_check(servicer_inputs_df),
