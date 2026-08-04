@@ -1031,7 +1031,7 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
 # are intentionally left out rather than assumed to belong here too.
 _VALID_EXIT_TRANSITION_KEYWORDS = ("PAID-IN-FULL", "PIF")
 
-# CLIENT-CONFIRMED (2026-08-04, extended 2026-08-05): a terminal COLLECTION
+# CLIENT-CONFIRMED (2026-08-04): a terminal COLLECTION
 # status appearing in EITHER the SERVICER'S REPORTED DELINQUENCY STATUS or
 # the SERVICER'S REPORTED LOAN STATUS is a fundamentally different situation
 # from a normal delinquency ranking disagreement. Two distinct consequences,
@@ -1044,7 +1044,7 @@ _VALID_EXIT_TRANSITION_KEYWORDS = ("PAID-IN-FULL", "PIF")
 #      status_match_check). The calculated_dq computation itself is
 #      unaffected by this case.
 #
-#   2. When found in LOAN Status (client-confirmed 2026-08-05): FORECLOSURE/
+#   2. When found in LOAN Status (client-confirmed 2026-08-04): FORECLOSURE/
 #      LIQUIDATION/REO are ACTIVE, ongoing collection statuses, unlike
 #      PAID-IN-FULL/CHARGE-OFF (which are genuinely FINISHED loans where a
 #      delinquency ranking no longer applies). The generic terminal-status
@@ -1114,7 +1114,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         k in srf_status_u or k in soup_status_u for k in _TERMINAL_STATUS_KEYWORDS
     )
 
-    # CLIENT-CONFIRMED (2026-08-05): checked against the SERVICER'S CURRENT
+    # CLIENT-CONFIRMED (2026-08-04): checked against the SERVICER'S CURRENT
     # report specifically, not SOUP's history — this is about what the
     # servicer is reporting THIS cycle, per the client's explicit requirement
     # to detect this in the Servicer Loan Status field.
@@ -1136,15 +1136,65 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
 
     if is_terminal_this_cycle:
         if srf_status_is_terminal_collection:
-            # CLIENT-CONFIRMED (2026-08-05): FORECLOSURE/LIQUIDATION/REO are
-            # ACTIVE collection statuses, not finished loans -- do NOT blank
-            # the ranking to CURRENT like the generic terminal-status case
-            # below. Preserve the servicer's own reported Delinquency Status
-            # if it's a valid ladder value; otherwise this can't be trusted
-            # blindly, so it's UNVERIFIED rather than a guess. Normal
-            # payment/catch-up math never runs for these loans at all.
-            srf_dq_missed = _status_to_missed_count(srf_dq) if srf_dq else None
-            calculated_dq = _missed_count_to_status(srf_dq_missed) if srf_dq_missed is not None else "UNVERIFIED"
+            # CLIENT-CONFIRMED (2026-08-04): FORECLOSURE/
+            # LIQUIDATION/REO are ACTIVE collection statuses, not finished
+            # loans -- do NOT blank the ranking to CURRENT like the generic
+            # terminal-status case below, and do NOT apply catch-up credit
+            # that could IMPROVE the ranking (client Rule 1). The servicer's
+            # own reported Delinquency Status is trusted ONLY when it's a
+            # clean, precise ladder value -- an open-ended bucket label like
+            # "150+ Days" is NOT trusted numerically (the trailing "+" means
+            # "at least this much, exact figure unknown", and taking it at
+            # face value can silently UNDERSTATE the true ranking -- caught
+            # on loan 5387239101: Servicer DQ "150+ Days" parsed as
+            # missed=6, LOWER than the loan's own prior recorded 240 DAYS
+            # (missed=9), with zero payment evidence to justify that
+            # improvement — Payment Received was $0 this cycle).
+            #
+            # The final value is the greater of:
+            #   (a) a "degradation-only" floor -- the prior missed count
+            #       advanced by the SAME insufficient/no-payment rule used
+            #       everywhere else in this file, but NEVER reduced by a
+            #       catch-up credit (the explicit prohibition in Rule 1);
+            #   (b) the servicer's own reported value, but ONLY when it
+            #       parses cleanly with no trailing "+" -- a "+"-suffixed
+            #       bucket is never used numerically, since it's known to
+            #       potentially understate the truth.
+            # This lets a servicer's WORSE, precise report still be trusted
+            # (Rule 2), while never letting an imprecise bucket, or the
+            # absence of a payment, silently improve the ranking.
+            #
+            # *** PENDING BUSINESS RULE DECISION (as of 2026-08-04) ***
+            # A NEGATIVE Payment Received (a reversal) for a
+            # FORECLOSURE/LIQUIDATION/REO loan is CURRENTLY treated the
+            # same as "no payment" here (a flat +1), NOT run through the
+            # full reversal-equivalents formula (total_payment_deficiency /
+            # (scheduled_payment * PAYMENT_SUFFICIENCY_THRESHOLD)) used for
+            # non-terminal loans elsewhere in this function. That formula
+            # could advance the ranking by MORE than one level for a large
+            # reversal, which is plausible and arguably more accurate for
+            # these loans too — but this has NOT been explicitly confirmed,
+            # and must not be assumed or silently changed here. See
+            # test_delinquency_ladder.py's
+            # TerminalCollectionNegativePaymentPendingDecisionTests for a
+            # regression test documenting the CURRENT flat-+1 behavior —
+            # when this decision is made, that test's expectations must be
+            # updated deliberately, alongside this comment, not silently.
+            degradation_floor = None
+            if prior_missed is not None:
+                if received is None or pd.isna(received) or float(received) <= 0:
+                    degradation_floor = prior_missed + 1
+                elif scheduled is None or pd.isna(scheduled) or float(scheduled) <= 0:
+                    degradation_floor = prior_missed  # can't judge sufficiency without a valid scheduled amount -- hold, don't guess
+                else:
+                    ratio = float(received) / float(scheduled)
+                    degradation_floor = prior_missed + 1 if ratio < PAYMENT_SUFFICIENCY_THRESHOLD else prior_missed
+
+            srf_dq_is_open_ended = "+" in str(srf_dq)
+            srf_dq_missed = _status_to_missed_count(srf_dq) if srf_dq and not srf_dq_is_open_ended else None
+
+            candidates = [v for v in (degradation_floor, srf_dq_missed) if v is not None]
+            calculated_dq = _missed_count_to_status(max(candidates)) if candidates else "UNVERIFIED"
         else:
             calculated_dq = "CURRENT"
     elif deferral and deferral["deferral_type"] == "full" and deferral["phase"] == "resume":
@@ -1318,16 +1368,15 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     if "BANKRUPT" in srf_status_u:
         expected_loan_status = srf_status
 
-    # CLIENT-CONFIRMED (2026-08-05): same "arriving is not a mismatch"
+    # CLIENT-CONFIRMED (2026-08-04): same "arriving is not a mismatch"
     # principle as BANKRUPTCY above — FORECLOSURE/LIQUIDATION/REO reported
     # by the servicer this cycle is accepted as authoritative for Loan
     # Status, regardless of what SOUP's prior status was. One-directional,
     # same as BANKRUPTCY/PAID-IN-FULL: only overrides when the CURRENT
     # servicer report says one of these; leaving one of these statuses for
     # something else stays subject to the normal comparison. Does not touch
-    # calculated_dq here — that's handled separately above, by preserving
-    # the servicer's own reported ladder value rather than blanking to
-    # CURRENT.
+    # calculated_dq here — that's handled separately above, using a
+    # degradation-only floor rather than blanking to CURRENT.
     if srf_status_is_terminal_collection:
         expected_loan_status = srf_status
 
@@ -1386,16 +1435,16 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             srf_dq=srf_dq, scheduled_ambiguous=scheduled_ambiguous,
         )
 
-        # CLIENT-CONFIRMED (2026-08-04, extended 2026-08-05): a terminal
-        # collection status (FORECLOSURE/LIQUIDATION/REO) can appear in
-        # EITHER the SERVICER'S reported Delinquency Status OR the
-        # SERVICER'S reported Loan Status. Either one is flagged as its own
-        # distinct review item below, separately from a normal calculation
-        # disagreement. When found in Loan Status, calculated_dq above has
-        # already preserved the servicer's own reported ladder value (or
-        # UNVERIFIED if it wasn't a valid one) rather than blanking to
-        # CURRENT — this flag here is purely for the Reason tag and
-        # STAT-02 visibility, it doesn't change the calculation again.
+        # CLIENT-CONFIRMED (2026-08-04): a terminal collection status
+        # (FORECLOSURE/LIQUIDATION/REO) can appear in EITHER the SERVICER'S
+        # reported Delinquency Status OR the SERVICER'S reported Loan
+        # Status. Either one is flagged as its own distinct review item
+        # below, separately from a normal calculation disagreement. When
+        # found in Loan Status, calculated_dq above has already been set
+        # using a degradation-only floor (or UNVERIFIED if no floor was
+        # available) rather than blanking to CURRENT — this flag here is
+        # purely for the Reason tag and STAT-02 visibility, it doesn't
+        # change the calculation again.
         srf_dq_is_terminal_collection = any(k in srf_dq.upper() for k in _TERMINAL_COLLECTION_KEYWORDS)
         srf_status_is_terminal_collection = any(k in srf_status.upper() for k in _TERMINAL_COLLECTION_KEYWORDS)
 
@@ -1483,7 +1532,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # that exclusion set deliberately) and IS added to corrections.py's
         # WARNING_REASONS, since a loan with this flag should not have any
         # field auto-corrected without a human looking at it first.
-        # CLIENT-CONFIRMED (2026-08-04, extended 2026-08-05): distinct from
+        # CLIENT-CONFIRMED (2026-08-04): distinct from
         # DELINQUENCY STATUS MISMATCH on purpose -- a terminal collection
         # status in either field isn't a ranking disagreement, it's a
         # different kind of anomaly needing manual attention. Unlike the
@@ -1521,16 +1570,22 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         if srf_dq_is_terminal_collection and srf_status_is_terminal_collection:
             terminal_status_review_detail = (
                 f"Both the Servicer Loan Status ({srf_status!r}) and Servicer Delinquency Status "
-                f"({srf_dq!r}) contain a terminal collection status. The Calculated DQ Status above "
-                f"preserves the servicer's own reported ladder value rather than recalculating it; "
-                f"this loan needs manual review, not an automatic ranking comparison."
+                f"({srf_dq!r}) contain a terminal collection status. Normal catch-up logic was not "
+                f"applied. The Calculated DQ Status uses a degradation-only floor based on prior "
+                f"SOUP status and current payment activity. A precise servicer DQ value is retained "
+                f"only when it is equal to or worse than that floor. Open-ended values such as "
+                f"\"150+ Days\" remain visible for transparency but are not treated as exact ladder "
+                f"positions. This loan needs manual review, not an automatic ranking comparison."
             )
         elif srf_status_is_terminal_collection:
             terminal_status_review_detail = (
                 f"Servicer Loan Status ({srf_status!r}) contains a terminal collection status. "
-                f"Normal catch-up/payment logic was NOT applied — the Calculated DQ Status above "
-                f"preserves the servicer's own reported Delinquency Status ladder value instead. "
-                f"This loan needs manual review rather than an automatic ranking comparison."
+                f"Normal catch-up logic was not applied. The Calculated DQ Status uses a "
+                f"degradation-only floor based on prior SOUP status and current payment activity. "
+                f"A precise servicer DQ value is retained only when it is equal to or worse than "
+                f"that floor. Open-ended values such as \"150+ Days\" remain visible for "
+                f"transparency but are not treated as exact ladder positions. This loan needs "
+                f"manual review rather than an automatic ranking comparison."
             )
         elif srf_dq_is_terminal_collection:
             terminal_status_review_detail = (
@@ -1627,7 +1682,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
 
 # ---------------------------------------------------------------------------
 # STAT-02 — Terminal Status Review
-# CLIENT-CONFIRMED (2026-08-05): a separate, dedicated manual-review output
+# CLIENT-CONFIRMED (2026-08-04): a separate, dedicated manual-review output
 # for any loan whose SERVICER-reported Loan Status this cycle is FORECLOSURE,
 # LIQUIDATION, or REO. This is deliberately independent of STAT-01 — STAT-01
 # may or may not also flag the same loan (via its own "TERMINAL STATUS
@@ -1692,8 +1747,9 @@ def terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_
         "STAT-02", "Terminal Status Review", "SBA Reconciliation", "WARN", records,
         lambda n: f"{n} loan(s) reported by the servicer as FORECLOSURE, LIQUIDATION, or REO this "
                   f"cycle — surfaced for manual review. These loans are excluded from automatic "
-                  f"corrections; their Calculated DQ Status preserves the servicer's own reported "
-                  f"ladder value rather than being recalculated from payment history.",
+                  f"corrections; their Calculated DQ Status uses a degradation-only floor based on "
+                  f"prior SOUP status and current payment activity, retaining a precise servicer DQ "
+                  f"value only when it is equal to or worse than that floor.",
     )
 
 
