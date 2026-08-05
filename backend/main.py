@@ -298,6 +298,24 @@ async def audit(
                     "reason": correction_outcome["skip_reason"],
                 })
 
+            # CLIENT-CONFIRMED (2026-08-05): a correction that matched every
+            # business eligibility rule but had zero valid posting rows left
+            # to write to (see corrections.build_eligible_corrections'
+            # not_applied / corrections.py's corrections_not_applied) must
+            # not stay invisible inside corrections.py -- reused here via
+            # the SAME corrections_skipped structure the frontend already
+            # renders, rather than a new API field. Appended unconditionally
+            # (not only in the elif above), since a per-loan/field skip can
+            # happen even in a run where OTHER corrections for this same
+            # file succeeded and produced a corrected workbook.
+            for not_applied in correction_outcome.get("corrections_not_applied", []):
+                corrections_skipped.append({
+                    "servicer": display_label,
+                    "SBA GP Number": not_applied.get("gp"),
+                    "field": not_applied.get("field"),
+                    "reason": not_applied.get("reason"),
+                })
+
             # CLIENT-CONFIRMED (2026-08-04, revised): captured BEFORE the
             # _cycle_month pop below. Collect EVERY distinct nonblank cycle
             # month across servicers, not just the first — combining

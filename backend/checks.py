@@ -203,13 +203,25 @@ def consolidate_cycle_postings(servicer_inputs_df):
             "_excel_row": last.get("_excel_row"),
             "_sheet_name": last.get("_sheet_name"),
             "_header_excel_row": last.get("_header_excel_row"),
+            # CLIENT-CONFIRMED (2026-08-05): every posting row's Excel row
+            # number for this loan/cycle, in the same chronological order
+            # established above -- NOT just the last posting's row. Purely
+            # additive location metadata for corrections.py so an approved
+            # Loan Status/Delinquency Status correction can be written to
+            # every posting row for the loan, not only the row `last`
+            # happens to point at. Does not affect received/scheduled/
+            # loan_status/dq_status or any other consolidated value above;
+            # sheet_name and header_excel_row are unchanged (single file,
+            # single loan, single sheet/header row for all its postings).
+            "_all_excel_rows": group["_excel_row"].tolist() if "_excel_row" in group.columns else [],
         })
 
     return pd.DataFrame(rows).set_index("SBA GP Number") if rows else pd.DataFrame(
         columns=["posting_count", "loan_status", "dq_status", "received", "principal", "net_interest",
                  "scheduled", "scheduled_ambiguous", "scheduled_payment_updated_during_cycle",
                  "scheduled_distinct_values", "beginning_balance",
-                 "ending_balance", "interest_from", "interest_to", "lender_loan_number"]
+                 "ending_balance", "interest_from", "interest_to", "lender_loan_number",
+                 "_excel_row", "_sheet_name", "_header_excel_row", "_all_excel_rows"]
     )
 
 
@@ -1658,6 +1670,13 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         correction_data.append({
             "gp": gp,
             "excel_row": row.get("_excel_row"),
+            # CLIENT-CONFIRMED (2026-08-05): every posting row for this
+            # loan/cycle, not just the last -- see consolidate_cycle_postings'
+            # _all_excel_rows. corrections.py uses this to repeat an approved
+            # correction across every posting row for the loan rather than
+            # only the one `excel_row` (last posting) points at. `excel_row`
+            # above is left in place unchanged for any other consumer.
+            "excel_rows": row.get("_all_excel_rows") or [],
             "sheet_name": row.get("_sheet_name"),
             "header_excel_row": row.get("_header_excel_row"),
             "reasons": reasons,
@@ -2018,6 +2037,21 @@ def _build_portfolio_summary_record(si_grouped, servicer_name, dq_status_for_agi
         ending_balance = float(ending_balance_raw) if ending_balance_raw is not None and pd.notna(ending_balance_raw) else 0.0
         beginning_balance_raw = row.get("beginning_balance")
         beginning_balance = float(beginning_balance_raw) if beginning_balance_raw is not None and pd.notna(beginning_balance_raw) else 0.0
+
+        # CLIENT-CONFIRMED (2026-08-05): Portfolio Summary eligibility gate.
+        # A consolidated loan with Beginning Balance = 0 AND Ending Balance
+        # = 0 does not represent an active portfolio loan for this cycle
+        # and is excluded ENTIRELY, before any categorization -- it must
+        # not contribute to Outstanding, any aging bucket, Not Making
+        # Payment, Deferred, Bankruptcy, Foreclosure, Liquidation, or Paid
+        # In Full. Deliberately checked BEFORE loan_status/dq_status are
+        # even inspected, per the client's explicit preference for one
+        # single eligibility gate over scattering the condition into each
+        # category below. A loan with either balance greater than zero
+        # remains fully eligible and flows through the existing rules
+        # unchanged.
+        if beginning_balance == 0 and ending_balance == 0:
+            continue
 
         loan_status = str(row.get("loan_status", "")).strip().upper()
         # CLIENT-CONFIRMED (2026-08-04, corrected): exact matching only —

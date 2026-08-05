@@ -203,13 +203,21 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
 
       {correctionsSkipped.length > 0 && (
         <div className="card" style={{ marginBottom: 22 }}>
-          <h3 style={{ marginTop: 0 }}>Corrected file unavailable</h3>
-          {correctionsSkipped.map((item, index) => (
-            <div key={`${item.servicer}-${index}`} style={{ marginBottom: 10 }}>
-              <strong>{item.servicer}</strong>
-              <div className="hint">{item.reason}</div>
-            </div>
-          ))}
+          <h3 style={{ marginTop: 0 }}>Corrections Not Applied</h3>
+          {correctionsSkipped.map((item, index) => {
+            const gp = item['SBA GP Number']
+            const detailParts = []
+            if (gp) detailParts.push(`Loan ${gp}`)
+            if (item.field) detailParts.push(item.field)
+            const detail = detailParts.join(' — ')
+            return (
+              <div key={`${item.servicer}-${index}`} style={{ marginBottom: 10 }}>
+                <strong>{item.servicer}</strong>
+                {detail && <span style={{ marginLeft: 6, color: 'var(--text-secondary)' }}>({detail})</span>}
+                <div className="hint">{item.reason}</div>
+              </div>
+            )
+          })}
         </div>
       )}
 

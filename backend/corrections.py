@@ -87,10 +87,20 @@ def _is_terminal_loan_status(status_value):
     return any(k in s for k in _LOAN_STATUS_TERMINAL_KEYWORDS)
 
 CORRECTION_LOG_SHEET_NAME = "Correction Log"
+# CLIENT-CONFIRMED (2026-08-05): one log row per LOAN-LEVEL correction, not
+# one per Excel row updated -- a 3-posting loan whose Delinquency Status was
+# corrected produces ONE Correction Log row, with "Rows Updated" = 3 and
+# "Excel Row Numbers" listing all three, rather than three separate rows
+# that would misleadingly read as three distinct corrections.
+# CLIENT-CONFIRMED (2026-08-05): "Skipped Row References" records any row
+# reference that didn't get updated as part of this same correction —
+# invalid/duplicate references filtered out before writing, or a row whose
+# GP no longer matched at write time — so a partially-applied correction
+# never silently loses track of what it left out.
 CORRECTION_LOG_HEADERS = [
-    "Institution", "Source Worksheet", "Excel Row Number", "SBA GP Number",
+    "Institution", "Source Worksheet", "Excel Row Numbers", "Rows Updated", "SBA GP Number",
     "Field Updated", "Original Value", "Corrected Value", "Audit Check ID",
-    "Eligibility Rule", "Timestamp",
+    "Eligibility Rule", "Timestamp", "Skipped Row References",
 ]
 
 
@@ -124,11 +134,87 @@ def _normalize_gp_scalar(value):
     return digits or None
 
 
+def _coerce_excel_row(value):
+    """Returns a positive int Excel row number, or None if the value is
+    blank, null, nonnumeric, or otherwise not a valid row reference. Never
+    guesses — a value like 12.5 (not a whole number) or a negative/zero row
+    is rejected outright rather than rounded or substituted with a nearby
+    row."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return None
+        return int(value) if value.is_integer() and value > 0 else None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        f = float(s)
+    except (TypeError, ValueError):
+        return None
+    if f != f or not f.is_integer() or f <= 0:
+        return None
+    return int(f)
+
+
+def _clean_excel_rows(raw_rows):
+    """CLIENT-CONFIRMED (2026-08-05): validates and deduplicates a loan's
+    posting-row references BEFORE any correction is applied. Returns
+    (clean_rows, skipped) where clean_rows preserves the original
+    chronological order with invalid entries removed and duplicates
+    collapsed to their first occurrence, and skipped is a list of
+    {"row_ref": <original value>, "reason": <str>} for every entry that
+    didn't make it into clean_rows — surfaced later in the Correction Log
+    / returned metadata rather than silently dropped."""
+    clean = []
+    seen = set()
+    skipped = []
+    for raw in raw_rows or []:
+        row = _coerce_excel_row(raw)
+        if row is None:
+            skipped.append({
+                "row_ref": raw,
+                "reason": "blank, null, non-numeric, or invalid row reference — skipped without guessing",
+            })
+            continue
+        if row in seen:
+            skipped.append({
+                "row_ref": row,
+                "reason": "duplicate row reference — already scheduled for this correction",
+            })
+            continue
+        seen.add(row)
+        clean.append(row)
+    return clean, skipped
+
+
 def build_eligible_corrections(correction_data):
     """Applies the v1 allow-list to STAT-01's raw per-loan facts. Returns a
-    list of correction dicts, each describing ONE cell to change:
-    {gp, excel_row, sheet_name, header_excel_row, field, corrected_value,
-    eligibility_rule}.
+    list of correction dicts, each describing ONE loan-level field change to
+    apply across every one of that loan's posting rows this cycle:
+    {gp, excel_rows, skipped_row_refs, sheet_name, header_excel_row, field,
+    corrected_value, eligibility_rule}. excel_rows (CLIENT-CONFIRMED
+    2026-08-05) is every posting row for the loan, not just the last — see
+    checks.consolidate_cycle_postings' _all_excel_rows — so a corrected
+    Loan Status or Delinquency Status is written consistently to every
+    posting row for that loan/cycle, never leaving earlier postings with
+    the original, now-superseded value. excel_rows here is already
+    validated and deduplicated (CLIENT-CONFIRMED 2026-08-05) via
+    _clean_excel_rows — skipped_row_refs carries what was removed and why.
+
+    A loan/field that matches every business rule below is ALWAYS included
+    here — even if excel_rows ends up empty after validation (e.g. every
+    reference was invalid, or no location metadata existed at all).
+    _apply_one_correction is the single place that decides whether zero
+    valid rows means "not applied" (CLIENT-CONFIRMED 2026-08-05) — kept
+    there, not here, specifically so this function's return type stays the
+    single list it has always been. A loan that never matched any
+    eligibility rule in the first place (no warning-free mismatch, wrong
+    deferral phase, etc.) never appears here at all — there was never a
+    correction to report on.
 
     This is the single place v1's correction policy lives. Widening scope
     later (e.g. partial deferrals, the resume phase) means changing the
@@ -139,9 +225,6 @@ def build_eligible_corrections(correction_data):
         reasons = set(c.get("reasons") or [])
         if reasons & WARNING_REASONS:
             continue  # any data-quality warning excludes this loan entirely
-
-        if c.get("excel_row") is None or c.get("sheet_name") is None or c.get("header_excel_row") is None:
-            continue  # can't safely locate this row in the original file — skip, never guess
 
         # CLIENT-CONFIRMED (2026-08-03): a Delinquency Status driven by a
         # negative Payment Received amount (a reversal) requires manual
@@ -155,6 +238,19 @@ def build_eligible_corrections(correction_data):
             continue
 
         gp = c.get("gp")
+        excel_rows, skipped_row_refs = _clean_excel_rows(c.get("excel_rows"))
+
+        def _emit(field, corrected_value, eligibility_rule):
+            eligible.append({
+                "gp": gp,
+                "excel_rows": excel_rows,
+                "skipped_row_refs": skipped_row_refs,
+                "sheet_name": c.get("sheet_name"),
+                "header_excel_row": c.get("header_excel_row"),
+                "field": field,
+                "corrected_value": corrected_value,
+                "eligibility_rule": eligibility_rule,
+            })
 
         # --- Delinquency Status -------------------------------------------------
         if (
@@ -162,15 +258,7 @@ def build_eligible_corrections(correction_data):
             and c.get("dq_match") is False  # never True/"REVIEW" — REVIEW means UNVERIFIED, already excluded upstream
             and _is_real_dq_value(c.get("calculated_dq"))
         ):
-            eligible.append({
-                "gp": gp,
-                "excel_row": c["excel_row"],
-                "sheet_name": c["sheet_name"],
-                "header_excel_row": c["header_excel_row"],
-                "field": "Delinquency Status",
-                "corrected_value": str(c["calculated_dq"]).strip().upper(),
-                "eligibility_rule": "STAT-01 deterministic calculation",
-            })
+            _emit("Delinquency Status", str(c["calculated_dq"]).strip().upper(), "STAT-01 deterministic calculation")
 
         # --- Loan Status -> DEFERRED (confirmed Full P&I only, v1) --------------
         # expected_loan_status_raw == "DEFERRED" only ever gets set by a
@@ -196,15 +284,7 @@ def build_eligible_corrections(correction_data):
             and not _is_terminal_loan_status(c.get("srf_status"))
             and not _is_terminal_loan_status(c.get("soup_status"))
         ):
-            eligible.append({
-                "gp": gp,
-                "excel_row": c["excel_row"],
-                "sheet_name": c["sheet_name"],
-                "header_excel_row": c["header_excel_row"],
-                "field": "Loan Status",
-                "corrected_value": "DEFERRED",
-                "eligibility_rule": f"STAT-01 confirmed Full P&I deferral ({c.get('deferral_phase')})",
-            })
+            _emit("Loan Status", "DEFERRED", f"STAT-01 confirmed Full P&I deferral ({c.get('deferral_phase')})")
 
     return eligible
 
@@ -231,10 +311,44 @@ def _find_header_columns(ws, header_excel_row, field, gp_field="SBA GP Number"):
 
 
 def _apply_one_correction(wb, corr):
-    """Attempts to write one correction. Returns (True, log_row_dict) on
-    success, or (False, skip_reason_str) if any safety check fails — a
-    failed check always skips just this one correction, never raises and
-    never guesses at an alternate row/column."""
+    """Attempts to write one LOAN-LEVEL correction across every posting row
+    for that loan/cycle (corr["excel_rows"], already validated/deduplicated
+    by _clean_excel_rows). Returns (True, log_row_dict) on success —
+    log_row_dict describes the correction as a whole (all rows updated, all
+    their original values, in row order, plus any rows that were skipped
+    and why) — or (False, skip_reason_str) if the correction as a whole
+    can't be safely applied at all: zero valid row references to begin
+    with (CLIENT-CONFIRMED 2026-08-05 — e.g. no location metadata existed,
+    or every reference was invalid/duplicate), a missing sheet/column, or
+    every row failing its per-row GP check. This function is the single
+    place that decides "zero valid rows" means not applied — build_eligible_
+    corrections always includes a matched loan/field here regardless of
+    whether it has any valid excel_rows, specifically so that decision
+    lives in exactly one place and that function's return stays a plain
+    list.
+
+    Each row is still validated independently before being written — same
+    "never guess" posture as before, just applied per-row instead of once:
+    if one posting row's GP no longer matches (e.g. the template shifted),
+    that ROW alone is skipped and the rest of the loan's rows still get the
+    correction, since the safety concern is specific to that one row's
+    location, not to the loan or the correction itself. Only if EVERY row
+    fails does this correction get reported as fully skipped (never counted
+    as successful). Every skipped reference — whether filtered out earlier
+    for being invalid/duplicate, missing entirely, or skipped here for a GP
+    mismatch — is recorded so nothing disappears silently. Payment amounts,
+    dates, balances, formulas, and formatting are never touched — only the
+    single target field column, per row."""
+    skipped_row_refs = corr.get("skipped_row_refs") or []
+    if not corr.get("excel_rows"):
+        detail = (
+            "; ".join(f"{s['row_ref']} ({s['reason']})" for s in skipped_row_refs)
+            if skipped_row_refs else "no row location metadata available"
+        )
+        return False, (
+            f"No valid posting row reference for loan {corr['gp']} ({detail}) — skipped for safety."
+        )
+
     sheet_name = corr["sheet_name"]
     if sheet_name not in wb.sheetnames:
         return False, f"Sheet '{sheet_name}' not found in the original workbook."
@@ -253,37 +367,55 @@ def _apply_one_correction(wb, corr):
             f"in '{sheet_name}' — skipped for safety."
         )
 
-    excel_row = corr["excel_row"]
-    actual_gp = _normalize_gp_scalar(ws.cell(row=excel_row, column=gp_col).value)
-    if actual_gp != corr["gp"]:
-        return False, (
-            f"Row {excel_row} in '{sheet_name}' no longer matches loan {corr['gp']} "
-            f"(found {actual_gp!r}) — skipped for safety."
-        )
-
     # Final write-time safety net for Loan Status specifically: this module
     # must never write LIQUIDATION or PAID-IN-FULL/PIF automatically (client
     # safety rules 1 and 4), no matter what a future change to the allow-list
     # above might otherwise permit. This is intentionally redundant with
-    # build_eligible_corrections only ever producing "DEFERRED" today.
+    # build_eligible_corrections only ever producing "DEFERRED" today. Checked
+    # once for the whole correction, since corrected_value is the same value
+    # for every row.
     if corr["field"] == "Loan Status" and _is_terminal_loan_status(corr["corrected_value"]):
         return False, (
             f"Refused to write Loan Status '{corr['corrected_value']}' for loan {corr['gp']} — "
             f"automatic corrections may never create or remove a LIQUIDATION or PAID-IN-FULL status."
         )
 
-    cell = ws.cell(row=excel_row, column=field_col)
-    original_value = cell.value
-    cell.value = corr["corrected_value"]
+    updated_rows = []
+    original_values = []
+    skipped_rows = list(corr.get("skipped_row_refs") or [])  # invalid/duplicate refs already filtered out upstream
+    for excel_row in corr["excel_rows"]:
+        actual_gp = _normalize_gp_scalar(ws.cell(row=excel_row, column=gp_col).value)
+        if actual_gp != corr["gp"]:
+            skipped_rows.append({
+                "row_ref": excel_row,
+                "reason": f"GP mismatch — expected {corr['gp']!r}, found {actual_gp!r}",
+            })
+            continue
+        cell = ws.cell(row=excel_row, column=field_col)
+        original_values.append(cell.value)
+        cell.value = corr["corrected_value"]
+        updated_rows.append(excel_row)
+
+    if not updated_rows:
+        detail = (
+            "; ".join(f"{s['row_ref']} ({s['reason']})" for s in skipped_rows)
+            if skipped_rows else "no posting rows were available"
+        )
+        return False, (
+            f"No posting row for loan {corr['gp']} in '{sheet_name}' could be safely verified "
+            f"({detail}) — skipped for safety."
+        )
 
     return True, {
         "sheet_name": sheet_name,
-        "excel_row": excel_row,
+        "excel_rows": updated_rows,
+        "rows_updated": len(updated_rows),
         "gp": corr["gp"],
         "field": corr["field"],
-        "original_value": original_value,
+        "original_values": original_values,
         "corrected_value": corr["corrected_value"],
         "eligibility_rule": corr["eligibility_rule"],
+        "skipped_rows": skipped_rows,
     }
 
 
@@ -304,14 +436,16 @@ def _add_correction_log_sheet(wb, applied_rows, institution, timestamp):
         [
             institution,
             r["sheet_name"],
-            r["excel_row"],
+            ", ".join(str(x) for x in r["excel_rows"]),
+            r["rows_updated"],
             r["gp"],
             r["field"],
-            r["original_value"],
+            "; ".join("" if v is None else str(v) for v in r["original_values"]),
             r["corrected_value"],
             AUDIT_CHECK_ID,
             r["eligibility_rule"],
             timestamp,
+            "; ".join(f"{s['row_ref']} ({s['reason']})" for s in r.get("skipped_rows") or []),
         ]
         for r in applied_rows
     ]
@@ -351,8 +485,20 @@ def generate_corrected_workbook(file_bytes, original_filename, institution, stat
     Never raises for expected conditions (missing columns, mismatched rows,
     unsupported format) — those are all reported via skip_reason so a
     problem with ONE servicer's file never breaks the rest of the audit
-    response."""
-    empty = {"file_bytes": None, "filename": None, "correction_count": 0, "skip_reason": None}
+    response.
+
+    CLIENT-CONFIRMED (2026-08-05): the returned dict also carries
+    "corrections_not_applied" — a list of {gp, field, reason} for every
+    eligible correction that could NOT be safely written to even one row
+    (zero valid excel_rows to begin with, or every row failing its GP
+    check). Those corrections are never counted in correction_count and
+    never appear in the Correction Log sheet — they're reported as not
+    applied, never as successful — but the reason is still surfaced here
+    rather than disappearing silently."""
+    empty = {
+        "file_bytes": None, "filename": None, "correction_count": 0,
+        "skip_reason": None, "corrections_not_applied": [],
+    }
 
     correction_data = (stat01_result or {}).get("correction_data", [])
     eligible = build_eligible_corrections(correction_data)
@@ -374,17 +520,26 @@ def generate_corrected_workbook(file_bytes, original_filename, institution, stat
         return {**empty, "skip_reason": f"Could not reopen the original workbook: {exc}"}
 
     applied_rows = []
+    corrections_not_applied = []
     for corr in eligible:
         ok, detail = _apply_one_correction(wb, corr)
         if ok:
             applied_rows.append(detail)
-        # skipped corrections are silently omitted from the output (not from
-        # this function's return value's skip_reason, which describes the
-        # workbook as a whole) — a template-mismatch skip on one loan
-        # shouldn't block the rest of that same file's valid corrections.
+        else:
+            # A correction with zero valid rows (or any other full-loan
+            # safety failure) is reported here as not applied — it never
+            # contributes to correction_count and never gets a Correction
+            # Log row, but the reason isn't lost: it's returned so the
+            # caller can surface it if useful, rather than one servicer's
+            # template mismatch silently erasing all trace of the attempt.
+            corrections_not_applied.append({"gp": corr["gp"], "field": corr["field"], "reason": detail})
 
     if not applied_rows:
-        return {**empty, "skip_reason": "No corrections could be safely verified against this file's actual layout."}
+        return {
+            **empty,
+            "skip_reason": "No corrections could be safely verified against this file's actual layout.",
+            "corrections_not_applied": corrections_not_applied,
+        }
 
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     _add_correction_log_sheet(wb, applied_rows, institution, timestamp)
@@ -399,4 +554,5 @@ def generate_corrected_workbook(file_bytes, original_filename, institution, stat
         "filename": filename,
         "correction_count": len(applied_rows),
         "skip_reason": None,
+        "corrections_not_applied": corrections_not_applied,
     }
