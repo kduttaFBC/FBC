@@ -80,11 +80,18 @@ def _write_header(ws, headers):
 _CURRENCY_KEYWORDS = ("balance", "payment", "amount", "diff", "received", "interest", "loss")
 
 
-def _write_rows(ws, headers, rows, status_col=None):
-    currency_cols = {
-        i for i, h in enumerate(headers, start=1)
-        if any(k in str(h).lower() for k in _CURRENCY_KEYWORDS)
-    }
+def _write_rows(ws, headers, rows, status_col=None, currency_cols=None, percentage_cols=None):
+    """currency_cols and percentage_cols are optional explicit column-index
+    overrides (1-based). When not provided, currency_cols falls back to the
+    existing keyword auto-detection — this keeps every EXISTING call site
+    (the detailed reconciliation workbook) byte-for-byte unchanged. Only the
+    new Portfolio Summary workbook passes these explicitly."""
+    if currency_cols is None:
+        currency_cols = {
+            i for i, h in enumerate(headers, start=1)
+            if any(k in str(h).lower() for k in _CURRENCY_KEYWORDS)
+        }
+    percentage_cols = percentage_cols or set()
     for r_offset, row in enumerate(rows):
         excel_row = r_offset + 2
         fill = ALT_FILL if r_offset % 2 else WHITE_FILL
@@ -96,6 +103,13 @@ def _write_rows(ws, headers, rows, status_col=None):
             cell.alignment = Alignment(vertical="center", horizontal="left")
             if col_idx in currency_cols and isinstance(value, (int, float)) and not isinstance(value, bool):
                 cell.number_format = '"$"#,##0.00'
+                cell.alignment = Alignment(vertical="center", horizontal="right")
+            elif col_idx in percentage_cols and isinstance(value, (int, float)) and not isinstance(value, bool):
+                # Values are already scaled (e.g. 30.0 means "30.00%"), not
+                # Excel-native fractions (0.30) -- a literal "%" suffix on a
+                # plain number format, NOT Excel's "0.00%" which would
+                # multiply by 100 again and show "3000.00%".
+                cell.number_format = '0.00"%"'
                 cell.alignment = Alignment(vertical="center", horizontal="right")
             if status_col is not None and col_idx == status_col:
                 s_fill, s_font = _status_fill_font(str(value))
@@ -128,14 +142,6 @@ CHECK_LEGEND = [
      "Confirms this cycle's reported Beginning Balance ties to SOUP's most recently recorded "
      "Ending Balance for that loan. Loans with more than one payment posted this cycle are "
      "called out separately (informational) rather than treated as a real break."),
-    ("Liquidation Review", "WARN",
-     "Every loan the servicer reports as Loan Status = LIQUIDATION this cycle, surfaced "
-     "unconditionally for review — not just loans with a balance problem. There is no "
-     "historical data to independently confirm or contest a LIQUIDATION status, so none is "
-     "attempted; the servicer's own report is what puts a loan here. A $0 Ending Balance is "
-     "still a review item; a nonzero Ending Balance is additionally flagged as a balance "
-     "issue, since liquidated loans are required to report $0. Delinquency Status is still "
-     "calculated using the same validated engine as any other loan, shown for reference."),
     ("Status / Delinquency Match", "WARN",
      "Confirms the servicer's reported Loan Status and Delinquency Status this cycle match "
      "SOUP's last recorded status for that loan. Status changes are often legitimate "
@@ -145,7 +151,7 @@ CHECK_LEGEND = [
      "month, or a loan that has stopped appearing in SOUP altogether even though it's still "
      "listed as active. Often the most actionable finding — it surfaces loans that have gone "
      "dark in the servicing data."),
-    ("Payment Shortfall Check", "INFO",
+    ("Payment Shortfall Check", "FAIL",
      "Compares the amount actually remitted (payment received plus the servicer's fee, which "
      "is normally netted out before remittance) against the scheduled payment for that loan. "
      "Flags a genuine shortfall or overage beyond a small tolerance. This check depends on "
@@ -156,11 +162,9 @@ CHECK_LEGEND = [
      "(e.g. a catch-up payment) so they aren't mistaken for a data error elsewhere in the report."),
     ("Negative Payment Flags", "WARN",
      "Flags any individual payment posting this cycle with a negative amount received "
-     "(typically a reversal of a prior payment). The Calculated Delinquency Status shown here "
-     "and in Status / Delinquency Match already accounts for the reversal automatically — "
-     "treated as additional unpaid obligation on top of this cycle's scheduled payment, using "
-     "the same 80% sufficiency standard as any other loan, not a flat one-rank miss like a $0 "
-     "payment. This tab is for visibility into which postings were reversals."),
+     "(typically a reversal of a prior payment). This does NOT change the delinquency status "
+     "calculation shown elsewhere in this report — it's a visibility flag only, so these loans "
+     "can be manually reviewed and their status adjusted by hand if needed."),
 ]
 
 
@@ -276,3 +280,74 @@ def generate_report_bytes(results, summary, buffer):
 
 def report_filename():
     return f"Audit_Intelligence_Reconciliation_{date.today().isoformat()}.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Summary workbook — CLIENT-CONFIRMED (2026-08-04): a SEPARATE
+# downloadable workbook, entirely independent of the detailed reconciliation
+# workbook above. Built from the SAME PORT-01 records already produced by
+# checks.portfolio_summary_check for each servicer in a multi-servicer run —
+# this file does NOT re-derive anything from raw servicer/SOUP data itself,
+# it only formats records that were already computed and tested elsewhere.
+# ---------------------------------------------------------------------------
+
+PORTFOLIO_SUMMARY_CATEGORIES = [
+    "Outstanding", "Current", "Delinquent", "30 Days", "60 Days", "90 Days",
+    "120 Days", "150+ Days", "Not Making Payment", "Deferred", "Bankruptcy",
+    "Foreclosure", "Liquidation", "Paid In Full",
+]
+
+
+def generate_portfolio_summary_bytes(port01_records, buffer):
+    """port01_records: a list of the single-record dict each servicer's
+    PORT-01 result produces (checks.portfolio_summary_check's records[0]),
+    one per uploaded servicer file, in upload order. Every uploaded
+    servicer gets its own row on both sheets, in the same order — a
+    servicer split across multiple note-series files (e.g. "Lendistry
+    2025" / "Lendistry 2024") appears as two distinct rows, since each is
+    its own PORT-01 record with its own Servicer label already."""
+    wb = Workbook()
+
+    headers = ["Servicer"] + PORTFOLIO_SUMMARY_CATEGORIES
+    dollar_col_indices = set(range(2, len(headers) + 1))  # every column except "Servicer"
+
+    dollars_ws = wb.active
+    dollars_ws.title = "Portfolio Summary Dollars"
+    dollar_rows = [
+        [rec.get("Servicer", "")] + [rec.get(f"{c} ($)", 0) for c in PORTFOLIO_SUMMARY_CATEGORIES]
+        for rec in port01_records
+    ]
+    _write_header(dollars_ws, headers)
+    _write_rows(dollars_ws, headers, dollar_rows, currency_cols=dollar_col_indices)
+    _autofit(dollars_ws, headers, dollar_rows)
+    dollars_ws.sheet_properties.tabColor = NAVY
+
+    pct_ws = wb.create_sheet("Portfolio Summary Percentages")
+    pct_col_indices = set(range(2, len(headers) + 1))
+    pct_rows = [
+        [rec.get("Servicer", "")] + [rec.get(f"{c} (%)", 0.0) for c in PORTFOLIO_SUMMARY_CATEGORIES]
+        for rec in port01_records
+    ]
+    _write_header(pct_ws, headers)
+    _write_rows(pct_ws, headers, pct_rows, currency_cols=set(), percentage_cols=pct_col_indices)
+    _autofit(pct_ws, headers, pct_rows)
+    pct_ws.sheet_properties.tabColor = NAVY
+
+    wb.save(buffer)
+    buffer.seek(0)
+
+
+def portfolio_summary_filename(cycle_month=None):
+    """cycle_month, when available, is the audit's actual reporting period
+    (a pandas Timestamp from STAT-01's internal correction data, e.g.
+    representing June 2026) — NOT today's date, since this filename should
+    reflect what period the summary covers, not when the audit was run.
+    Falls back to today's date if no cycle month could be determined
+    (e.g. a servicer file was missing the columns STAT-01 needs), matching
+    the same graceful-degradation convention used elsewhere in this app."""
+    if cycle_month is not None:
+        try:
+            return f"Portfolio_Summary_{cycle_month.strftime('%B_%Y')}.xlsx"
+        except AttributeError:
+            pass
+    return f"Portfolio_Summary_{date.today().isoformat()}.xlsx"

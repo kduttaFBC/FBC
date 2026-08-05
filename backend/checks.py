@@ -1895,6 +1895,175 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
 
 
 # ---------------------------------------------------------------------------
+# PORT-01 — Portfolio Summary
+# CLIENT-CONFIRMED (2026-08-04, revised): a multi-dimensional dollar-balance
+# summary. Deliberately NOT a reconciliation check -- it never flags a
+# mismatch, never drives a correction, and does not touch or depend on any
+# delinquency/loan-status reconciliation logic elsewhere in this file. It
+# only reads the SAME per-loan consolidated record
+# (consolidate_cycle_postings) that STAT-01/NEG-01 already use.
+#
+# Two different dollar measures are used, by column, per explicit client
+# revision (2026-08-04) of the original "Ending Balance for every column"
+# spec:
+#   - Outstanding, every delinquency bucket, Not Making Payment, Deferred,
+#     Bankruptcy, and Foreclosure all use ENDING BALANCE.
+#   - Paid In Full and Liquidation use BEGINNING BALANCE instead -- these
+#     are treated as separate ACTIVITY metrics (how much left the portfolio
+#     this cycle), not part of the remaining outstanding balance. Their
+#     Ending Balance is expected to be $0 (confirmed against real CB&T
+#     data: all 3 PAID-IN-FULL loans had Ending Balance = $0, while their
+#     Beginning Balance summed to $679,563.79, matching the client's known
+#     target of $679,564) -- Beginning Balance is what actually answers
+#     "how much did we pay off / liquidate this cycle."
+#
+# Outstanding is ALSO no longer "every loan" -- it explicitly EXCLUDES
+# PAID-IN-FULL and LIQUIDATION loans, since those balances are activity
+# that has LEFT the remaining portfolio, not part of it. This makes
+# Outstanding + Paid In Full + Liquidation NOT simply "the whole
+# portfolio" in a single Ending-Balance sense -- Outstanding is Ending
+# Balance for what remains, Paid In Full/Liquidation are Beginning
+# Balance for what left.
+#
+# "Overlapping" still applies everywhere else: a loan's Delinquency
+# Status, payment activity, and Loan Status describe independent
+# characteristics, so a loan's Ending Balance can land in multiple
+# columns at once (e.g. "30 Days" AND "Deferred" AND "Not Making
+# Payment" simultaneously). A PAID-IN-FULL or LIQUIDATION loan is
+# EXCLUDED from Outstanding specifically, but is NOT excluded from the
+# other Ending-Balance columns (delinquency buckets, Not Making Payment,
+# Deferred/Bankruptcy/Foreclosure) if it happens to independently satisfy
+# one of them -- Loan Status is a reporting dimension, not a universal
+# filter, except for the one explicit Outstanding exclusion above.
+# ---------------------------------------------------------------------------
+
+def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
+    si_grouped = consolidate_cycle_postings(servicer_inputs_df)
+
+    category_order = [
+        "Current", "Delinquent", "30 Days", "60 Days", "90 Days", "120 Days", "150+ Days",
+        "Not Making Payment", "Deferred", "Bankruptcy", "Foreclosure", "Liquidation", "Paid In Full",
+    ]
+    totals = {c: 0.0 for c in category_order}
+    outstanding = 0.0
+
+    for gp, row in si_grouped.iterrows():
+        ending_balance_raw = row.get("ending_balance")
+        ending_balance = float(ending_balance_raw) if ending_balance_raw is not None and pd.notna(ending_balance_raw) else 0.0
+        beginning_balance_raw = row.get("beginning_balance")
+        beginning_balance = float(beginning_balance_raw) if beginning_balance_raw is not None and pd.notna(beginning_balance_raw) else 0.0
+
+        dq = str(row.get("dq_status", "")).strip().upper()
+        loan_status = str(row.get("loan_status", "")).strip().upper()
+        # CLIENT-CONFIRMED (2026-08-04, corrected): exact matching only —
+        # the prior substring check ("PAID" in loan_status) was too broad
+        # and could incorrectly classify values like PARTIALLY PAID,
+        # UNPAID, or PAID DOWN as Paid In Full.
+        paid_in_full_statuses = {"PAID-IN-FULL", "PAID IN FULL", "PIF"}
+        is_paid_in_full = loan_status in paid_in_full_statuses
+        is_liquidation = loan_status == "LIQUIDATION"
+
+        # CLIENT-CONFIRMED (2026-08-04, revised): Outstanding represents the
+        # remaining portfolio only -- excludes PAID-IN-FULL and LIQUIDATION
+        # loans entirely (their balances are tracked separately below).
+        if not is_paid_in_full and not is_liquidation:
+            outstanding += ending_balance
+
+        # Delinquency Status buckets — mutually exclusive with each other
+        # (a loan has exactly one Delinquency Status this cycle), but
+        # independent of every other category here, including Loan Status.
+        # Uses Ending Balance, unchanged from the original spec.
+        if dq == "CURRENT":
+            totals["Current"] += ending_balance
+        elif dq == "DELINQUENT":
+            totals["Delinquent"] += ending_balance
+        elif dq == "30 DAYS":
+            totals["30 Days"] += ending_balance
+        elif dq == "60 DAYS":
+            totals["60 Days"] += ending_balance
+        elif dq == "90 DAYS":
+            totals["90 Days"] += ending_balance
+        elif dq == "120 DAYS":
+            totals["120 Days"] += ending_balance
+        else:
+            # "150 DAYS or greater, including labels such as 150+ DAYS,
+            # 180 DAYS, 210 DAYS, 240 DAYS, and higher." Uses the SAME
+            # shared ladder parser as every other check in this file for
+            # classification purposes only — this is a descriptive bucket
+            # ("is this loan at least 150 days delinquent"), not a
+            # numeric override calculation, so an open-ended "150+ DAYS"
+            # label is legitimately treated as >= 150 days here (unlike
+            # STAT-01's terminal-collection branch, which never trusts a
+            # "+"-suffixed value as a PRECISE number to compute a new
+            # ranking from — a different question than this one).
+            missed = _status_to_missed_count(dq)
+            if missed is not None and missed >= 6:  # missed=6 == "150 DAYS"
+                totals["150+ Days"] += ending_balance
+
+        # CLIENT-CONFIRMED (2026-08-04): "Not Making Payment" is based
+        # SOLELY on consolidated Payment Received = 0. Loan Status is
+        # intentionally ignored. A deferred, bankruptcy, foreclosure,
+        # liquidation, or other special-status loan may still contribute to
+        # this metric if no payment was received during the cycle. This was
+        # explicitly re-confirmed after investigating why an earlier
+        # candidate target value ($665,889 for CB&T) appeared to exclude
+        # DEFERRED loans — traced down to the raw postings and found no
+        # data-quality explanation (no duplicate postings, no blank-vs-zero
+        # ambiguity, no reporting-period anomaly) for excluding them; the
+        # client confirmed the exclusion-based number reflected a
+        # different, no-longer-used business definition. The correct
+        # CB&T value under THIS rule is $2,490,776.81, not $665,889 — see
+        # test_portfolio_summary.py.
+        #
+        # CLIENT-CONFIRMED (2026-08-04, corrected): a blank/missing/NaN
+        # Payment Received value must NOT be treated as $0 here — the prior
+        # implementation silently defaulted a missing value to 0.0, which
+        # incorrectly classified a loan with no payment DATA at all
+        # (unknown) the same as a loan CONFIRMED to have received nothing.
+        # Only an explicitly present value that equals exactly 0 counts.
+        received_raw = row.get("received")
+        if (
+            received_raw is not None
+            and pd.notna(received_raw)
+            and float(received_raw) == 0
+        ):
+            totals["Not Making Payment"] += ending_balance
+
+        # Loan Status buckets. Deferred/Bankruptcy/Foreclosure are mutually
+        # exclusive with each other and use Ending Balance, unchanged from
+        # the original spec. Paid In Full and Liquidation are handled
+        # separately below using Beginning Balance instead, per the
+        # 2026-08-04 revision — NOT part of this elif chain, since they are
+        # activity metrics rather than a "current standing" bucket.
+        if loan_status == "DEFERRED":
+            totals["Deferred"] += ending_balance
+        elif "BANKRUPT" in loan_status:
+            totals["Bankruptcy"] += ending_balance
+        elif "FORECLOS" in loan_status:
+            totals["Foreclosure"] += ending_balance
+
+        if is_liquidation:
+            totals["Liquidation"] += beginning_balance
+        if is_paid_in_full:
+            totals["Paid In Full"] += beginning_balance
+
+    def pct(amount):
+        return round((amount / outstanding) * 100, 2) if outstanding else 0.0
+
+    record = {"Servicer": servicer_name or "", "Outstanding ($)": round(outstanding, 2), "Outstanding (%)": 100.0 if outstanding else 0.0}
+    for c in category_order:
+        record[f"{c} ($)"] = round(totals[c], 2)
+        record[f"{c} (%)"] = pct(totals[c])
+
+    result = _result(
+        "PORT-01", "Portfolio Summary", "SBA Reconciliation", "INFO", [record],
+        lambda n: "",
+        issues_found=0,  # a summary, never an "issue" -- stays visible via the informational override, doesn't count toward the audit's issue tally
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # DUP-01 — Duplicate Postings
 # Informational: a loan with more than one row in Servicer Inputs this cycle.
 # ---------------------------------------------------------------------------
@@ -2250,6 +2419,7 @@ ALL_CHECKS_META = [
     ("PAY-02", "Payment Shortfall Check"),
     ("DUP-01", "Duplicate Postings"),
     ("NEG-01", "Negative Payment Flags"),
+    ("PORT-01", "Portfolio Summary"),
 ]
 
 
@@ -2277,7 +2447,7 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
     deal (from file_readers.extract_deal_from_note_series) scopes POP-01 to
     Servicer + Deal + normalized GP Number instead of Servicer + GP Number
     alone — see population_check's docstring-level comment for why. Only
-    affects POP-01; BAL-01, BAL-02, STAT-01, STAT-02, PAY-01/02, DUP-01, and NEG-01
+    affects POP-01; BAL-01, BAL-02, STAT-01, STAT-02, PAY-01/02, DUP-01, NEG-01, and PORT-01
     are unchanged by this parameter."""
     results = [
         population_check(loan_terms_df, soup_servicer_df, servicer_name, deal=deal),
@@ -2289,6 +2459,7 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
         payment_shortfall_check(servicer_inputs_df),
         duplicate_postings_check(servicer_inputs_df),
         negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name),
+        portfolio_summary_check(servicer_inputs_df, servicer_name=servicer_name),
     ]
     # tag every result with which servicer it belongs to, so multi-servicer
     # runs can be told apart in the combined results list -- always the
