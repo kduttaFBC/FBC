@@ -337,17 +337,21 @@ def generate_portfolio_summary_bytes(port01_records, buffer):
     buffer.seek(0)
 
 
-def portfolio_summary_filename(cycle_month=None):
+def portfolio_summary_filename(cycle_month=None, label="Original"):
     """cycle_month, when available, is the audit's actual reporting period
     (a pandas Timestamp from STAT-01's internal correction data, e.g.
     representing June 2026) — NOT today's date, since this filename should
     reflect what period the summary covers, not when the audit was run.
     Falls back to today's date if no cycle month could be determined
     (e.g. a servicer file was missing the columns STAT-01 needs), matching
-    the same graceful-degradation convention used elsewhere in this app."""
+    the same graceful-degradation convention used elsewhere in this app.
+
+    label is "Original" or "Audited" (CLIENT-CONFIRMED 2026-08-04) — the
+    two workbooks are otherwise identical in structure and only differ in
+    which Delinquency Status source feeds the aging buckets."""
     if cycle_month is not None:
         try:
-            return f"Portfolio_Summary_{cycle_month.strftime('%B_%Y')}.xlsx"
+            return f"Portfolio_Summary_{label}_{cycle_month.strftime('%B_%Y')}.xlsx"
         except AttributeError:
             pass
-    return f"Portfolio_Summary_{date.today().isoformat()}.xlsx"
+    return f"Portfolio_Summary_{label}_{date.today().isoformat()}.xlsx"

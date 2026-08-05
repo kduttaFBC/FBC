@@ -49,16 +49,27 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
     downloadBase64File(audit.report_b64, audit.report_filename || 'Audit_Intelligence_Report.xlsx', XLSX_MIME)
   }
 
-  // CLIENT-CONFIRMED (2026-08-04): a SEPARATE downloadable workbook from
-  // the detailed reconciliation report above — only present when the
-  // backend actually produced one (portfolio_summary_b64 is null if no
-  // servicer's PORT-01 record was available, e.g. every uploaded file
-  // failed to parse before that point).
-  const hasPortfolioSummary = Boolean(audit.portfolio_summary_b64)
-  const handleDownloadPortfolioSummary = () => {
+  // CLIENT-CONFIRMED (2026-08-04, revised): TWO SEPARATE downloadable
+  // workbooks, both independent of the detailed reconciliation report
+  // above — Original uses the servicer's own reported Delinquency Status
+  // for the aging buckets, Audited uses STAT-01's reconciled status. Each
+  // is only present when the backend actually produced one (the b64
+  // field is null if no servicer record was available, e.g. every
+  // uploaded file failed to parse before that point).
+  const hasPortfolioSummaryOriginal = Boolean(audit.portfolio_summary_original_b64)
+  const handleDownloadPortfolioSummaryOriginal = () => {
     downloadBase64File(
-      audit.portfolio_summary_b64,
-      audit.portfolio_summary_filename || 'Portfolio_Summary.xlsx',
+      audit.portfolio_summary_original_b64,
+      audit.portfolio_summary_original_filename || 'Portfolio_Summary_Original.xlsx',
+      XLSX_MIME
+    )
+  }
+
+  const hasPortfolioSummaryAudited = Boolean(audit.portfolio_summary_audited_b64)
+  const handleDownloadPortfolioSummaryAudited = () => {
+    downloadBase64File(
+      audit.portfolio_summary_audited_b64,
+      audit.portfolio_summary_audited_filename || 'Portfolio_Summary_Audited.xlsx',
       XLSX_MIME
     )
   }
@@ -76,15 +87,26 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
             <a className="btn btn-teal" onClick={handleDownload} target="_blank" rel="noreferrer">
             Download Excel Report
           </a>
-          {hasPortfolioSummary && (
+          {hasPortfolioSummaryOriginal && (
             <a
               className="btn btn-teal"
-              onClick={handleDownloadPortfolioSummary}
+              onClick={handleDownloadPortfolioSummaryOriginal}
               target="_blank"
               rel="noreferrer"
               style={{ marginLeft: 10 }}
             >
-              Download Portfolio Summary
+              Download Original Portfolio Summary
+            </a>
+          )}
+          {hasPortfolioSummaryAudited && (
+            <a
+              className="btn btn-teal"
+              onClick={handleDownloadPortfolioSummaryAudited}
+              target="_blank"
+              rel="noreferrer"
+              style={{ marginLeft: 10 }}
+            >
+              Download Audited Portfolio Summary
             </a>
           )}
         </div>

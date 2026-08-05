@@ -1393,6 +1393,16 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
     # flip STAT-01's overall status to WARN — it isn't a mismatch, warning,
     # or audit error, it's a disclosure of how a clean result was reached.
     real_issue_count = 0
+    # CLIENT-CONFIRMED (2026-08-04): a COMPLETE per-loan dataset, unlike
+    # `records`/`correction_data` above which only ever contain the FLAGGED
+    # subset of loans (a loan that matches cleanly hits `continue` below and
+    # never reaches either list). Populated unconditionally for every loan,
+    # captured BEFORE that skip-check runs, specifically so the Portfolio
+    # Summary's Audited workbook can use STAT-01's real calculated_dq for
+    # EVERY loan, not just the ones STAT-01 chose to flag. This is the
+    # single authoritative source — see audited_portfolio_summary_record,
+    # which consumes this dict rather than recomputing anything.
+    audited_status_by_loan = {}
 
     required = {"SBA GP Number", "Loan Status", "Delinquency Status"}
     if not required.issubset(servicer_inputs_df.columns) or not required.issubset(soup_servicer_df.columns):
@@ -1400,6 +1410,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
                           lambda n: "")
         result["correction_data"] = []
         result["_cycle_month"] = None
+        result["audited_status_by_loan"] = {}
         return result
 
     cycle_month = _infer_cycle_month(soup_servicer_df)
@@ -1434,6 +1445,15 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             has_payment_cols, memo_df, servicer_name, cycle_month,
             srf_dq=srf_dq, scheduled_ambiguous=scheduled_ambiguous,
         )
+
+        # Captured HERE — unconditionally, before any skip-check below can
+        # short-circuit this iteration — so audited_status_by_loan ends up
+        # complete for every loan STAT-01 was able to evaluate at all (a
+        # loan absent from SOUP entirely is skipped even earlier than this
+        # point and simply has no entry here; callers fall back to the raw
+        # reported status for those, the same conservative "no information,
+        # don't guess" default used elsewhere in this codebase).
+        audited_status_by_loan[gp] = calculated_dq
 
         # CLIENT-CONFIRMED (2026-08-04): a terminal collection status
         # (FORECLOSURE/LIQUIDATION/REO) can appear in EITHER the SERVICER'S
@@ -1677,6 +1697,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
     # workbooks, then removes it before the API response is returned.
     result["correction_data"] = correction_data
     result["_cycle_month"] = cycle_month
+    result["audited_status_by_loan"] = audited_status_by_loan
     return result
 
 
@@ -1937,14 +1958,59 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
 # filter, except for the one explicit Outstanding exclusion above.
 # ---------------------------------------------------------------------------
 
-def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
-    si_grouped = consolidate_cycle_postings(servicer_inputs_df)
+def _classify_delinquency_bucket(dq_status_upper):
+    """Pure classification helper — no side effects, no balance math. Given
+    an already-uppercased Delinquency Status string, returns the exact
+    aging-bucket category name it belongs to, or None if unclassifiable
+    (blank, unrecognized text). Used for BOTH the Original and Audited
+    Portfolio Summary aging buckets via _build_portfolio_summary_record —
+    this is the ONLY place this classification logic exists, specifically
+    so the two workbooks can never diverge on how a given status string
+    gets bucketed, only on WHICH status string each one is given."""
+    if dq_status_upper == "CURRENT":
+        return "Current"
+    if dq_status_upper == "DELINQUENT":
+        return "Delinquent"
+    if dq_status_upper == "30 DAYS":
+        return "30 Days"
+    if dq_status_upper == "60 DAYS":
+        return "60 Days"
+    if dq_status_upper == "90 DAYS":
+        return "90 Days"
+    if dq_status_upper == "120 DAYS":
+        return "120 Days"
+    # "150 DAYS or greater, including labels such as 150+ DAYS, 180 DAYS,
+    # 210 DAYS, 240 DAYS, and higher." Uses the SAME shared ladder parser
+    # as every other check in this file for classification purposes only —
+    # this is a descriptive bucket ("is this loan at least 150 days
+    # delinquent"), not a numeric override calculation, so an open-ended
+    # "150+ DAYS" label is legitimately treated as >= 150 days here (unlike
+    # STAT-01's terminal-collection branch, which never trusts a
+    # "+"-suffixed value as a PRECISE number to compute a new ranking from
+    # — a different question than this one).
+    missed = _status_to_missed_count(dq_status_upper)
+    if missed is not None and missed >= 6:  # missed=6 == "150 DAYS"
+        return "150+ Days"
+    return None
 
-    category_order = [
-        "Current", "Delinquent", "30 Days", "60 Days", "90 Days", "120 Days", "150+ Days",
-        "Not Making Payment", "Deferred", "Bankruptcy", "Foreclosure", "Liquidation", "Paid In Full",
-    ]
-    totals = {c: 0.0 for c in category_order}
+
+_PORTFOLIO_SUMMARY_CATEGORY_ORDER = [
+    "Current", "Delinquent", "30 Days", "60 Days", "90 Days", "120 Days", "150+ Days",
+    "Not Making Payment", "Deferred", "Bankruptcy", "Foreclosure", "Liquidation", "Paid In Full",
+]
+
+
+def _build_portfolio_summary_record(si_grouped, servicer_name, dq_status_for_aging_fn):
+    """The SINGLE shared implementation behind both portfolio_summary_check
+    (Original) and audited_portfolio_summary_record (Audited) — every rule
+    lives here exactly once. dq_status_for_aging_fn(gp, row) -> str is the
+    ONLY thing that differs between the two callers: which Delinquency
+    Status value feeds the Current-through-150+ aging buckets. Every other
+    category (Outstanding, Not Making Payment, Deferred, Bankruptcy,
+    Foreclosure, Liquidation, Paid In Full) is computed identically
+    regardless, which is exactly why those columns are guaranteed identical
+    between the two workbooks — they never touch dq_status_for_aging_fn."""
+    totals = {c: 0.0 for c in _PORTFOLIO_SUMMARY_CATEGORY_ORDER}
     outstanding = 0.0
 
     for gp, row in si_grouped.iterrows():
@@ -1953,7 +2019,6 @@ def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
         beginning_balance_raw = row.get("beginning_balance")
         beginning_balance = float(beginning_balance_raw) if beginning_balance_raw is not None and pd.notna(beginning_balance_raw) else 0.0
 
-        dq = str(row.get("dq_status", "")).strip().upper()
         loan_status = str(row.get("loan_status", "")).strip().upper()
         # CLIENT-CONFIRMED (2026-08-04, corrected): exact matching only —
         # the prior substring check ("PAID" in loan_status) was too broad
@@ -1966,39 +2031,19 @@ def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
         # CLIENT-CONFIRMED (2026-08-04, revised): Outstanding represents the
         # remaining portfolio only -- excludes PAID-IN-FULL and LIQUIDATION
         # loans entirely (their balances are tracked separately below).
+        # Identical for Original and Audited — never depends on
+        # dq_status_for_aging_fn.
         if not is_paid_in_full and not is_liquidation:
             outstanding += ending_balance
 
-        # Delinquency Status buckets — mutually exclusive with each other
-        # (a loan has exactly one Delinquency Status this cycle), but
-        # independent of every other category here, including Loan Status.
-        # Uses Ending Balance, unchanged from the original spec.
-        if dq == "CURRENT":
-            totals["Current"] += ending_balance
-        elif dq == "DELINQUENT":
-            totals["Delinquent"] += ending_balance
-        elif dq == "30 DAYS":
-            totals["30 Days"] += ending_balance
-        elif dq == "60 DAYS":
-            totals["60 Days"] += ending_balance
-        elif dq == "90 DAYS":
-            totals["90 Days"] += ending_balance
-        elif dq == "120 DAYS":
-            totals["120 Days"] += ending_balance
-        else:
-            # "150 DAYS or greater, including labels such as 150+ DAYS,
-            # 180 DAYS, 210 DAYS, 240 DAYS, and higher." Uses the SAME
-            # shared ladder parser as every other check in this file for
-            # classification purposes only — this is a descriptive bucket
-            # ("is this loan at least 150 days delinquent"), not a
-            # numeric override calculation, so an open-ended "150+ DAYS"
-            # label is legitimately treated as >= 150 days here (unlike
-            # STAT-01's terminal-collection branch, which never trusts a
-            # "+"-suffixed value as a PRECISE number to compute a new
-            # ranking from — a different question than this one).
-            missed = _status_to_missed_count(dq)
-            if missed is not None and missed >= 6:  # missed=6 == "150 DAYS"
-                totals["150+ Days"] += ending_balance
+        # Delinquency Status aging buckets — the ONLY category that differs
+        # between Original and Audited. dq_status_for_aging_fn decides
+        # WHICH status string to classify; _classify_delinquency_bucket
+        # decides WHAT bucket it lands in — the same classifier either way.
+        dq_for_aging = str(dq_status_for_aging_fn(gp, row) or "").strip().upper()
+        bucket = _classify_delinquency_bucket(dq_for_aging)
+        if bucket is not None:
+            totals[bucket] += ending_balance
 
         # CLIENT-CONFIRMED (2026-08-04): "Not Making Payment" is based
         # SOLELY on consolidated Payment Received = 0. Loan Status is
@@ -2011,9 +2056,8 @@ def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
         # data-quality explanation (no duplicate postings, no blank-vs-zero
         # ambiguity, no reporting-period anomaly) for excluding them; the
         # client confirmed the exclusion-based number reflected a
-        # different, no-longer-used business definition. The correct
-        # CB&T value under THIS rule is $2,490,776.81, not $665,889 — see
-        # test_portfolio_summary.py.
+        # different, no-longer-used business definition. Identical for
+        # Original and Audited.
         #
         # CLIENT-CONFIRMED (2026-08-04, corrected): a blank/missing/NaN
         # Payment Received value must NOT be treated as $0 here — the prior
@@ -2030,11 +2074,10 @@ def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
             totals["Not Making Payment"] += ending_balance
 
         # Loan Status buckets. Deferred/Bankruptcy/Foreclosure are mutually
-        # exclusive with each other and use Ending Balance, unchanged from
-        # the original spec. Paid In Full and Liquidation are handled
-        # separately below using Beginning Balance instead, per the
-        # 2026-08-04 revision — NOT part of this elif chain, since they are
-        # activity metrics rather than a "current standing" bucket.
+        # exclusive with each other and use Ending Balance, identical for
+        # Original and Audited. Paid In Full and Liquidation are handled
+        # separately below using Beginning Balance instead — activity
+        # metrics, not a "current standing" bucket.
         if loan_status == "DEFERRED":
             totals["Deferred"] += ending_balance
         elif "BANKRUPT" in loan_status:
@@ -2051,9 +2094,20 @@ def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
         return round((amount / outstanding) * 100, 2) if outstanding else 0.0
 
     record = {"Servicer": servicer_name or "", "Outstanding ($)": round(outstanding, 2), "Outstanding (%)": 100.0 if outstanding else 0.0}
-    for c in category_order:
+    for c in _PORTFOLIO_SUMMARY_CATEGORY_ORDER:
         record[f"{c} ($)"] = round(totals[c], 2)
         record[f"{c} (%)"] = pct(totals[c])
+    return record
+
+
+def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
+    """PORT-01 — the ORIGINAL Portfolio Summary: aging buckets use the
+    consolidated, servicer-reported Delinquency Status as-is (dq_status
+    from consolidate_cycle_postings), unaudited."""
+    si_grouped = consolidate_cycle_postings(servicer_inputs_df)
+    record = _build_portfolio_summary_record(
+        si_grouped, servicer_name, lambda gp, row: row.get("dq_status", "")
+    )
 
     result = _result(
         "PORT-01", "Portfolio Summary", "SBA Reconciliation", "INFO", [record],
@@ -2061,6 +2115,29 @@ def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
         issues_found=0,  # a summary, never an "issue" -- stays visible via the informational override, doesn't count toward the audit's issue tally
     )
     return result
+
+
+def audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan, servicer_name=None):
+    """CLIENT-CONFIRMED (2026-08-04): the AUDITED Portfolio Summary record
+    — identical to portfolio_summary_check in every respect EXCEPT the
+    aging-bucket source, which uses STAT-01's real calculated_dq for every
+    loan (audited_status_by_loan, from status_match_check's
+    audited_status_by_loan — see that function's docstring for how it's
+    built as a COMPLETE per-loan dataset, not just the flagged subset).
+    Falls back to the loan's own raw dq_status when a loan has no entry in
+    audited_status_by_loan (e.g. it was never found in SOUP at all, so
+    STAT-01 could never evaluate it) — the same conservative "no
+    information, don't guess" default used elsewhere in this codebase.
+
+    Returns the raw record dict directly, NOT wrapped in _result() — this
+    isn't its own separate check shown in the reconciliation results
+    table, it exists purely to feed the Audited Portfolio Summary
+    workbook."""
+    si_grouped = consolidate_cycle_postings(servicer_inputs_df)
+    return _build_portfolio_summary_record(
+        si_grouped, servicer_name,
+        lambda gp, row: audited_status_by_loan.get(gp, row.get("dq_status", "")),
+    )
 
 
 # ---------------------------------------------------------------------------

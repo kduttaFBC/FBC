@@ -239,7 +239,8 @@ async def audit(
         servicer_loan_counts = {}
         corrected_workbooks = []
         corrections_skipped = []
-        portfolio_summary_records = []
+        portfolio_summary_original_records = []
+        portfolio_summary_audited_records = []
         portfolio_summary_cycle_months = set()
 
         for uploaded in servicer_files:
@@ -313,12 +314,29 @@ async def audit(
                 if cm is not None:
                     portfolio_summary_cycle_months.add(cm)
 
+            # CLIENT-CONFIRMED (2026-08-04): build this servicer's AUDITED
+            # Portfolio Summary record BEFORE popping audited_status_by_loan
+            # off stat01_result — this dict is the COMPLETE per-loan
+            # dataset STAT-01 produces (see status_match_check's own
+            # comments), reused here rather than recomputed, per the
+            # explicit "do not duplicate delinquency logic" requirement.
+            # Backend-internal only — audited_status_by_loan itself never
+            # reaches the API response.
+            if stat01_result is not None:
+                audited_status_by_loan = stat01_result.get("audited_status_by_loan", {})
+                portfolio_summary_audited_records.append(
+                    checks_mod.audited_portfolio_summary_record(
+                        servicer_inputs_df, audited_status_by_loan, servicer_name=display_label
+                    )
+                )
+
             if stat01_result is not None:
                 stat01_result.pop("correction_data", None)
                 stat01_result.pop("_cycle_month", None)
+                stat01_result.pop("audited_status_by_loan", None)
 
             # CLIENT-CONFIRMED (2026-08-04): collect this servicer's PORT-01
-            # record for the SEPARATE Portfolio Summary workbook (see
+            # record for the ORIGINAL Portfolio Summary workbook (see
             # report_mod.generate_portfolio_summary_bytes below) — built
             # entirely from the same tested PORT-01 records already
             # produced above, never re-derived from raw file data. A
@@ -329,7 +347,7 @@ async def audit(
             # display_label.
             port01_result = next((r for r in results if r["id"].split("::")[0] == "PORT-01"), None)
             if port01_result is not None and port01_result["records"]:
-                portfolio_summary_records.append(port01_result["records"][0])
+                portfolio_summary_original_records.append(port01_result["records"][0])
 
             all_results.extend(results)
             servicer_loan_counts[display_label] = len(servicer_inputs_df)
@@ -368,10 +386,11 @@ async def audit(
         #     Servicing Fee)) not yet validated against the client's
         #     corrected SRF workbook — held out of the client-facing report
         #     until that validation happens, NOT rewritten or disabled.
-        #   PORT-01: CLIENT-CONFIRMED (2026-08-04) — deliberately excluded
-        #     from THIS workbook entirely. It gets its own SEPARATE
-        #     downloadable Portfolio Summary workbook instead (see
-        #     portfolio_summary_records / generate_portfolio_summary_bytes
+        #   PORT-01: CLIENT-CONFIRMED (2026-08-04, revised) — deliberately
+        #     excluded from THIS workbook entirely. It gets its own two
+        #     SEPARATE downloadable Portfolio Summary workbooks instead —
+        #     Original and Audited (see portfolio_summary_original_records /
+        #     portfolio_summary_audited_records / generate_portfolio_summary_bytes
         #     below), not a tab inside the detailed reconciliation workbook.
         REPORT_EXCLUDED_CHECK_IDS = {"POP-01", "PAY-01", "PAY-02", "DUP-01", "NEG-01", "PORT-01"}
         report_results = [
@@ -393,22 +412,36 @@ async def audit(
         report_mod.generate_report_bytes(report_results, report_summary, excel_buffer)
         excel_b64 = base64.b64encode(excel_buffer.getvalue()).decode("utf-8")
 
-        # CLIENT-CONFIRMED (2026-08-04): a SEPARATE downloadable workbook,
-        # entirely independent of the detailed reconciliation workbook
-        # above — built from the SAME PORT-01 records already collected
-        # per servicer during the loop, never re-derived from raw file
-        # data. Only generated when at least one servicer's PORT-01 record
-        # was actually produced (always true for a normal successful run
-        # with 1+ servicer files; guarded here purely so an edge case
-        # upstream — e.g. every servicer file failing to parse before this
-        # point — can't produce an empty, meaningless workbook).
-        portfolio_summary_b64 = None
-        portfolio_summary_filename_value = None
-        if portfolio_summary_records:
-            portfolio_summary_buffer = io.BytesIO()
-            report_mod.generate_portfolio_summary_bytes(portfolio_summary_records, portfolio_summary_buffer)
-            portfolio_summary_b64 = base64.b64encode(portfolio_summary_buffer.getvalue()).decode("utf-8")
-            portfolio_summary_filename_value = report_mod.portfolio_summary_filename(portfolio_summary_cycle_month)
+        # CLIENT-CONFIRMED (2026-08-04, revised): TWO separate downloadable
+        # workbooks, entirely independent of the detailed reconciliation
+        # workbook above and of each other — built from the SAME per-
+        # servicer records already collected during the loop (Original
+        # from PORT-01's own records; Audited from
+        # audited_portfolio_summary_record, which reuses STAT-01's real
+        # calculated_dq via audited_status_by_loan). Neither is re-derived
+        # from raw file data here. Only generated when at least one
+        # servicer's record was actually produced (always true for a
+        # normal successful run; guarded purely so an edge case upstream
+        # can't produce an empty, meaningless workbook).
+        portfolio_summary_original_b64 = None
+        portfolio_summary_original_filename_value = None
+        if portfolio_summary_original_records:
+            original_buffer = io.BytesIO()
+            report_mod.generate_portfolio_summary_bytes(portfolio_summary_original_records, original_buffer)
+            portfolio_summary_original_b64 = base64.b64encode(original_buffer.getvalue()).decode("utf-8")
+            portfolio_summary_original_filename_value = report_mod.portfolio_summary_filename(
+                portfolio_summary_cycle_month, label="Original"
+            )
+
+        portfolio_summary_audited_b64 = None
+        portfolio_summary_audited_filename_value = None
+        if portfolio_summary_audited_records:
+            audited_buffer = io.BytesIO()
+            report_mod.generate_portfolio_summary_bytes(portfolio_summary_audited_records, audited_buffer)
+            portfolio_summary_audited_b64 = base64.b64encode(audited_buffer.getvalue()).decode("utf-8")
+            portfolio_summary_audited_filename_value = report_mod.portfolio_summary_filename(
+                portfolio_summary_cycle_month, label="Audited"
+            )
 
         flagged_gps = _flagged_gp_numbers(all_results)  # already capped to MAX_FLAGGED_LOANS_FOR_HISTORY
         flagged_loan_history_csv = _flagged_loan_history_csv(soup_df, flagged_gps, columns=SOUP_CHAT_COLUMNS)
@@ -431,8 +464,10 @@ async def audit(
             "summary": summary,
             "report_b64": excel_b64,
             "report_filename": report_mod.report_filename(),
-            "portfolio_summary_b64": portfolio_summary_b64,
-            "portfolio_summary_filename": portfolio_summary_filename_value,
+            "portfolio_summary_original_b64": portfolio_summary_original_b64,
+            "portfolio_summary_original_filename": portfolio_summary_original_filename_value,
+            "portfolio_summary_audited_b64": portfolio_summary_audited_b64,
+            "portfolio_summary_audited_filename": portfolio_summary_audited_filename_value,
             "chat_context": chat_context,
             "session_id": session_id,
             "corrected_workbooks": corrected_workbooks,

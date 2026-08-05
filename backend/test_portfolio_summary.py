@@ -370,5 +370,102 @@ class PortfolioSummaryCBTValidationTests(unittest.TestCase):
                 self.assertAlmostEqual(r[f"{cat} ($)"], expected, delta=1.0)
 
 
+class AuditedPortfolioSummarySharedArchitectureTests(unittest.TestCase):
+    """CLIENT-CONFIRMED (2026-08-04): the Audited Portfolio Summary must
+    reuse STAT-01's real calculated_dq via audited_status_by_loan, never
+    reimplement delinquency logic. These tests confirm the shared
+    architecture behaves correctly using status_match_check's actual
+    output, not a hand-constructed stand-in."""
+
+    def _build_files(self, servicer_dq, prior_soup_dq, received=0, scheduled=500.0, servicer_loan_status="ACTIVE"):
+        servicer_inputs_df = pd.DataFrame([{
+            "SBA GP Number": "1", "Lender Loan Number": "L-1", "Loan Status": servicer_loan_status,
+            "Delinquency Status": servicer_dq, "Beginning Balance": 100000, "Ending Balance": 100000,
+            "Payment Received": received, "Scheduled Payment": scheduled,
+        }])
+        soup_servicer_df = pd.DataFrame([{
+            "SBA GP Number": "1", "Servicer": "Test Bank", "Payment Month": "2026-05-01",
+            "Loan Status": "ACTIVE", "Delinquency Status": prior_soup_dq,
+            "Beginning Actual Balance": 100000, "Ending Actual Balance": 100000,
+        }])
+        return servicer_inputs_df, soup_servicer_df
+
+    def test_audited_status_by_loan_is_complete_not_just_flagged_subset(self):
+        servicer_inputs_df, soup_servicer_df = self._build_files("CURRENT", "CURRENT", received=500, scheduled=500)
+        result = checks.status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name="Test Bank")
+        self.assertEqual(len(result["records"]), 0)
+        self.assertIn("1", result["audited_status_by_loan"])
+        self.assertEqual(result["audited_status_by_loan"]["1"], "CURRENT")
+
+    def test_loan_corrected_current_to_delinquent_moves_only_in_audited(self):
+        servicer_inputs_df, soup_servicer_df = self._build_files("CURRENT", "CURRENT", received=0, scheduled=500)
+        stat01 = checks.status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name="Test Bank")
+        audited_status_by_loan = stat01["audited_status_by_loan"]
+        self.assertEqual(audited_status_by_loan["1"], "DELINQUENT")
+
+        original = checks.portfolio_summary_check(servicer_inputs_df, servicer_name="Test Bank")["records"][0]
+        audited = checks.audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan, servicer_name="Test Bank")
+
+        self.assertEqual(original["Current ($)"], 100000)
+        self.assertEqual(original["Delinquent ($)"], 0)
+        self.assertEqual(audited["Current ($)"], 0)
+        self.assertEqual(audited["Delinquent ($)"], 100000)
+
+    def test_loan_corrected_90_days_to_60_days_moves_only_in_audited(self):
+        servicer_inputs_df, soup_servicer_df = self._build_files("90 DAYS", "60 DAYS", received=500, scheduled=500)
+        stat01 = checks.status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name="Test Bank")
+        audited_status_by_loan = stat01["audited_status_by_loan"]
+        self.assertEqual(audited_status_by_loan["1"], "60 DAYS")
+
+        original = checks.portfolio_summary_check(servicer_inputs_df, servicer_name="Test Bank")["records"][0]
+        audited = checks.audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan, servicer_name="Test Bank")
+
+        self.assertEqual(original["90 Days ($)"], 100000)
+        self.assertEqual(original["60 Days ($)"], 0)
+        self.assertEqual(audited["90 Days ($)"], 0)
+        self.assertEqual(audited["60 Days ($)"], 100000)
+
+    def test_shared_categories_identical_between_original_and_audited(self):
+        servicer_inputs_df, soup_servicer_df = self._build_files(
+            "CURRENT", "CURRENT", received=0, scheduled=500, servicer_loan_status="DEFERRED"
+        )
+        stat01 = checks.status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name="Test Bank")
+        audited_status_by_loan = stat01["audited_status_by_loan"]
+        original = checks.portfolio_summary_check(servicer_inputs_df, servicer_name="Test Bank")["records"][0]
+        audited = checks.audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan, servicer_name="Test Bank")
+
+        for cat in ["Outstanding", "Not Making Payment", "Deferred", "Bankruptcy", "Foreclosure", "Liquidation", "Paid In Full"]:
+            with self.subTest(category=cat):
+                self.assertEqual(original[f"{cat} ($)"], audited[f"{cat} ($)"])
+
+    def test_fallback_to_raw_status_when_loan_absent_from_audited_dataset(self):
+        servicer_inputs_df = pd.DataFrame([{
+            "SBA GP Number": "999", "Loan Status": "ACTIVE", "Delinquency Status": "60 DAYS",
+            "Beginning Balance": 5000, "Ending Balance": 5000, "Payment Received": 500, "Scheduled Payment": 500,
+        }])
+        empty_audited_status = {}
+        result = checks.audited_portfolio_summary_record(servicer_inputs_df, empty_audited_status, servicer_name="Test Bank")
+        self.assertEqual(result["60 Days ($)"], 5000)
+
+    def test_real_cbt_data_audited_differs_from_original_exactly_as_investigated(self):
+        rows = [
+            {"SBA GP Number": "A", "Loan Status": "ACTIVE", "Delinquency Status": "CURRENT",
+             "Beginning Balance": 322621.20, "Ending Balance": 322621.20, "Payment Received": 500, "Scheduled Payment": 500},
+            {"SBA GP Number": "B", "Loan Status": "DEFERRED", "Delinquency Status": "90 DAYS",
+             "Beginning Balance": 173000.26, "Ending Balance": 173000.26, "Payment Received": 224.36, "Scheduled Payment": 500},
+        ]
+        servicer_inputs_df = pd.DataFrame(rows)
+        audited_status_by_loan = {"A": "DELINQUENT", "B": "60 DAYS"}
+
+        original = checks.portfolio_summary_check(servicer_inputs_df, servicer_name="Test")["records"][0]
+        audited = checks.audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan, servicer_name="Test")
+
+        self.assertEqual(original["Current ($)"], 322621.20)
+        self.assertEqual(original["90 Days ($)"], 173000.26)
+        self.assertEqual(audited["Delinquent ($)"], 322621.20)
+        self.assertEqual(audited["60 Days ($)"], 173000.26)
+        self.assertEqual(original["Outstanding ($)"], audited["Outstanding ($)"])
+
+
 if __name__ == "__main__":
     unittest.main()
