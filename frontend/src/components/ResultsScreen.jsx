@@ -49,6 +49,20 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
     downloadBase64File(audit.report_b64, audit.report_filename || 'Audit_Intelligence_Report.xlsx', XLSX_MIME)
   }
 
+  // CLIENT-CONFIRMED (2026-08-04): a SEPARATE downloadable workbook from
+  // the detailed reconciliation report above — only present when the
+  // backend actually produced one (portfolio_summary_b64 is null if no
+  // servicer's PORT-01 record was available, e.g. every uploaded file
+  // failed to parse before that point).
+  const hasPortfolioSummary = Boolean(audit.portfolio_summary_b64)
+  const handleDownloadPortfolioSummary = () => {
+    downloadBase64File(
+      audit.portfolio_summary_b64,
+      audit.portfolio_summary_filename || 'Portfolio_Summary.xlsx',
+      XLSX_MIME
+    )
+  }
+
   return (
     <>
       {/* Summary card */}
@@ -62,6 +76,17 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
             <a className="btn btn-teal" onClick={handleDownload} target="_blank" rel="noreferrer">
             Download Excel Report
           </a>
+          {hasPortfolioSummary && (
+            <a
+              className="btn btn-teal"
+              onClick={handleDownloadPortfolioSummary}
+              target="_blank"
+              rel="noreferrer"
+              style={{ marginLeft: 10 }}
+            >
+              Download Portfolio Summary
+            </a>
+          )}
         </div>
 
         <div className="scorecards">
