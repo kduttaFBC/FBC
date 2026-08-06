@@ -113,6 +113,16 @@ def _resolve_scheduled_payment_step_pattern(group, sched_series):
     return final_value
 
 
+def _is_blank_value(value):
+    """CLIENT-CONFIRMED (2026-08-06): a value counts as blank for the
+    incomplete-final-posting fallback below if it's NaN/None, OR an
+    empty/whitespace-only string. Deliberately does NOT treat a real 0 or
+    a real, meaningful zero-length business value as blank -- this is
+    purely about detecting a genuinely EMPTY cell, not a legitimate zero
+    balance or terminal status."""
+    return pd.isna(value) or str(value).strip() == ""
+
+
 def consolidate_cycle_postings(servicer_inputs_df):
     """Returns one consolidated cycle record per SBA GP Number:
       posting_count, loan_status, dq_status (both from the LAST chronological
@@ -134,6 +144,34 @@ def consolidate_cycle_postings(servicer_inputs_df):
     is None and `scheduled_ambiguous` is True — callers must not silently
     sum, max, or pick one; the cycle obligation is genuinely ambiguous and
     should be surfaced, not guessed at.
+
+    CLIENT-CONFIRMED (2026-08-06): a NARROW fallback for a genuinely
+    incomplete final posting. Discovered on real Peoples Bank data (GP
+    9031018509, June 2026) — a loan's chronologically LAST posting (the
+    one flagged "Last Payment Instance? = Y") was completely blank across
+    Loan Status, Delinquency Status, and Ending Balance, while four
+    earlier, complete postings existed for the same cycle. Taking that
+    blank row at face value silently zeroed out a real $650,128.27 balance
+    and blanked its Loan Status/DQ Status, removing the loan from every
+    downstream total with no visible sign anything had gone wrong.
+
+    The fallback is deliberately narrow: it only activates when the LAST
+    posting has NO authoritative signal at all (Loan Status, Delinquency
+    Status, AND Ending Balance all blank/NaN) — never for a posting that
+    legitimately reports a real $0 balance or a real terminal status. When
+    it activates, loan_status/dq_status/ending_balance/_excel_row are all
+    taken from the last posting that actually has real data instead
+    (`effective_last`), and this is recorded, never silently: see
+    incomplete_final_posting/original_last_excel_row/
+    effective_last_excel_row below, and the separate "Final Posting
+    Incomplete" check (final_posting_incomplete_check) that surfaces this
+    for every affected loan.
+
+    Beginning Balance is deliberately UNCHANGED by this fallback — it is
+    already sourced from the FIRST posting (`first`, below), never from
+    `last`, so a blank last posting was never able to affect it in the
+    first place. Flagged explicitly here since it's easy to assume
+    otherwise.
     """
     si = servicer_inputs_df.copy()
     si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
@@ -154,6 +192,38 @@ def consolidate_cycle_postings(servicer_inputs_df):
 
         first = group.iloc[0]
         last = group.iloc[-1]
+
+        # CLIENT-CONFIRMED (2026-08-06): narrow incomplete-final-posting
+        # fallback -- see the function docstring above for the full
+        # rationale and the real loan that surfaced this.
+        final_state_blank = (
+            _is_blank_value(last.get("Loan Status"))
+            and _is_blank_value(last.get("Delinquency Status"))
+            and pd.isna(last.get("Ending Balance"))
+        )
+        if final_state_blank:
+            # CORRECTED (2026-08-06): the originally-proposed filter used
+            # raw `.notna()` on each column, which does NOT catch an empty
+            # string ('') the way _is_blank_value above does -- pandas
+            # treats '' as "not NaN." On the real loan that surfaced this
+            # whole issue, the blank final posting's Loan Status/
+            # Delinquency Status cells were empty strings, not NaN, which
+            # meant the original filter still counted that row as "valid"
+            # and effective_last ended up identical to the blank `last`.
+            # Rewritten to use the SAME _is_blank_value definition as the
+            # detection above, so "valid" and "blank" can never disagree
+            # with each other.
+            valid_mask = (
+                group["Ending Balance"].notna()
+                | ~group["Loan Status"].apply(_is_blank_value)
+                | ~group["Delinquency Status"].apply(_is_blank_value)
+            )
+            valid_rows = group[valid_mask]
+            effective_last = valid_rows.iloc[-1] if not valid_rows.empty else last
+            incomplete_final_posting = True
+        else:
+            effective_last = last
+            incomplete_final_posting = False
 
         sched_series = group["Scheduled Payment"] if "Scheduled Payment" in group.columns else pd.Series(dtype=float)
         nonzero = sched_series[(sched_series.notna()) & (sched_series != 0)]
@@ -181,8 +251,8 @@ def consolidate_cycle_postings(servicer_inputs_df):
         rows.append({
             "SBA GP Number": gp,
             "posting_count": len(group),
-            "loan_status": last.get("Loan Status", ""),
-            "dq_status": last.get("Delinquency Status", ""),
+            "loan_status": effective_last.get("Loan Status", ""),
+            "dq_status": effective_last.get("Delinquency Status", ""),
             "received": group["Payment Received"].sum(min_count=1) if "Payment Received" in group.columns else None,
             "principal": group["Principal"].sum(min_count=1) if "Principal" in group.columns else None,
             "net_interest": group["Net Interest"].sum(min_count=1) if "Net Interest" in group.columns else None,
@@ -191,7 +261,7 @@ def consolidate_cycle_postings(servicer_inputs_df):
             "scheduled_payment_updated_during_cycle": scheduled_payment_updated_during_cycle,
             "scheduled_distinct_values": distinct_nonzero,
             "beginning_balance": first.get("Beginning Balance"),
-            "ending_balance": last.get("Ending Balance"),
+            "ending_balance": effective_last.get("Ending Balance"),
             "interest_from": first.get("Interest-From", ""),
             "interest_to": last.get("Interest-To", ""),
             "lender_loan_number": first.get("Lender Loan Number", ""),
@@ -200,7 +270,7 @@ def consolidate_cycle_postings(servicer_inputs_df):
             # LAST posting whose loan_status/dq_status are used above, since
             # that's the row a correction would actually need to overwrite.
             # Not used by any existing check or the audit report.
-            "_excel_row": last.get("_excel_row"),
+            "_excel_row": effective_last.get("_excel_row"),
             "_sheet_name": last.get("_sheet_name"),
             "_header_excel_row": last.get("_header_excel_row"),
             # CLIENT-CONFIRMED (2026-08-05): every posting row's Excel row
@@ -214,6 +284,15 @@ def consolidate_cycle_postings(servicer_inputs_df):
             # sheet_name and header_excel_row are unchanged (single file,
             # single loan, single sheet/header row for all its postings).
             "_all_excel_rows": group["_excel_row"].tolist() if "_excel_row" in group.columns else [],
+            # CLIENT-CONFIRMED (2026-08-06): disclosure fields for the
+            # incomplete-final-posting fallback above. incomplete_final_posting
+            # is False for the overwhelming majority of loans (nothing
+            # changed); when True, the two _excel_row fields let a reviewer
+            # (and final_posting_incomplete_check, below) point at exactly
+            # which row was blank and which row's values were actually used.
+            "incomplete_final_posting": incomplete_final_posting,
+            "original_last_excel_row": last.get("_excel_row"),
+            "effective_last_excel_row": effective_last.get("_excel_row"),
         })
 
     return pd.DataFrame(rows).set_index("SBA GP Number") if rows else pd.DataFrame(
@@ -221,7 +300,8 @@ def consolidate_cycle_postings(servicer_inputs_df):
                  "scheduled", "scheduled_ambiguous", "scheduled_payment_updated_during_cycle",
                  "scheduled_distinct_values", "beginning_balance",
                  "ending_balance", "interest_from", "interest_to", "lender_loan_number",
-                 "_excel_row", "_sheet_name", "_header_excel_row", "_all_excel_rows"]
+                 "_excel_row", "_sheet_name", "_header_excel_row", "_all_excel_rows",
+                 "incomplete_final_posting", "original_last_excel_row", "effective_last_excel_row"]
     )
 
 
@@ -2191,6 +2271,64 @@ def _fmt_date(value):
         return str(value)
 
 
+# ---------------------------------------------------------------------------
+# DQ-01 — Final Posting Incomplete
+# CLIENT-CONFIRMED (2026-08-06): surfaces every loan where
+# consolidate_cycle_postings' incomplete-final-posting fallback actually
+# engaged -- i.e. the posting flagged as this cycle's final/authoritative
+# one (chronologically last, or explicitly marked "Last Payment Instance?
+# = Y") had no real Loan Status, Delinquency Status, or Ending Balance at
+# all, and an earlier, complete posting had to be used instead. This is
+# never silent: every downstream number derived from this loan this cycle
+# (Outstanding, its delinquency bucket, Loan Status classification, any
+# check that reads consolidate_cycle_postings) was affected by which row
+# won, so this check exists specifically so a human sees that a
+# substitution happened, not just its consequence.
+#
+# Deliberately does NOT re-derive the blank-detection logic -- it reads
+# incomplete_final_posting/original_last_excel_row/effective_last_excel_row
+# directly off the SAME consolidated record every other check uses, so
+# this can never disagree with what actually happened during consolidation.
+# ---------------------------------------------------------------------------
+
+def final_posting_incomplete_check(servicer_inputs_df, servicer_name=None):
+    records = []
+
+    if "SBA GP Number" not in servicer_inputs_df.columns:
+        return _result("DQ-01", "Final Posting Incomplete", "SBA Reconciliation", "WARN", records,
+                        lambda n: "")
+
+    si_grouped = consolidate_cycle_postings(servicer_inputs_df)
+
+    for gp, row in si_grouped.iterrows():
+        if not row.get("incomplete_final_posting"):
+            continue
+
+        records.append({
+            "SBA GP Number": gp,
+            "Servicer": servicer_name or "",
+            "Loan Status Used": row.get("loan_status", ""),
+            "Delinquency Status Used": row.get("dq_status", ""),
+            "Ending Balance Used": round(float(row["ending_balance"]), 2) if pd.notna(row.get("ending_balance")) else "",
+            "Original Last Posting Excel Row": row.get("original_last_excel_row"),
+            "Posting Used Instead (Excel Row)": row.get("effective_last_excel_row"),
+            "Detail": (
+                "The posting marked as the final payment instance contained blank Loan Status, "
+                "Delinquency Status, and Ending Balance. The last complete posting was used for "
+                "portfolio reporting. Servicer correction is recommended."
+            ),
+        })
+
+    records.sort(key=lambda r: r["SBA GP Number"])
+
+    return _result(
+        "DQ-01", "Final Posting Incomplete", "SBA Reconciliation", "WARN", records,
+        lambda n: f"{n} loan(s) had a blank final posting this cycle (no Loan Status, Delinquency "
+                  f"Status, or Ending Balance at all) — the last complete posting was used instead "
+                  f"for every downstream total. Servicer correction of the source file is recommended.",
+    )
+
+
 def duplicate_postings_check(servicer_inputs_df):
     records = []
 
@@ -2531,6 +2669,7 @@ ALL_CHECKS_META = [
     ("DUP-01", "Duplicate Postings"),
     ("NEG-01", "Negative Payment Flags"),
     ("PORT-01", "Portfolio Summary"),
+    ("DQ-01", "Final Posting Incomplete"),
 ]
 
 
@@ -2571,6 +2710,7 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
         duplicate_postings_check(servicer_inputs_df),
         negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name),
         portfolio_summary_check(servicer_inputs_df, servicer_name=servicer_name),
+        final_posting_incomplete_check(servicer_inputs_df, servicer_name=servicer_name),
     ]
     # tag every result with which servicer it belongs to, so multi-servicer
     # runs can be told apart in the combined results list -- always the
