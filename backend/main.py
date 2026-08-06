@@ -135,6 +135,42 @@ def _resolve_portfolio_summary_cycle_month(cycle_months):
     return next(iter(cycle_months), None), None
 
 
+REPORT_ALWAYS_EXCLUDED_CHECK_IDS = {"PAY-01", "PAY-02", "DUP-01", "PORT-01"}
+REPORT_CONDITIONAL_CHECK_IDS = {"POP-01", "NEG-01"}  # included only when issues_found > 0
+
+
+def _filter_report_results(all_results):
+    """CLIENT-CONFIRMED (2026-08-06): decides which checks get their own
+    tab in the detailed client-facing reconciliation workbook. Two tiers:
+
+      - REPORT_ALWAYS_EXCLUDED_CHECK_IDS: excluded unconditionally,
+        regardless of findings. PAY-01/DUP-01 are informational and can
+        create noise even when they DO find something; PAY-02 isn't yet
+        validated against the client's corrected SRF expectations;
+        PORT-01 has its own separate Original/Audited Portfolio Summary
+        workbooks entirely outside this one.
+      - REPORT_CONDITIONAL_CHECK_IDS: excluded only when the check has
+        NOTHING to report (issues_found == 0) — included with its own tab
+        the moment it actually finds something. POP-01 doesn't need a tab
+        for the common "no population differences" case, but a real
+        mismatch is worth a client seeing directly. NEG-01's negative
+        payments are important enough to see when they occur, but an
+        empty PASS worksheet (the common case) adds little value.
+
+    A missing worksheet under either tier is NEVER evidence a check
+    failed to run — every check's real, complete result is still in
+    all_results / the JSON response regardless of which tier it's in;
+    this function only decides what the WORKBOOK shows."""
+    return [
+        r for r in all_results
+        if r["id"].split("::")[0] not in REPORT_ALWAYS_EXCLUDED_CHECK_IDS
+        and (
+            r["id"].split("::")[0] not in REPORT_CONDITIONAL_CHECK_IDS
+            or r.get("issues_found", 0) > 0
+        )
+    ]
+
+
 def _flagged_loan_history_csv(soup_df, gp_numbers, columns=None, max_rows=1800):
     """Builds a CSV of SOUP's full monthly history (every Payment Month row)
     for every flagged loan — not a flat sample of the whole file, which would
@@ -298,24 +334,6 @@ async def audit(
                     "reason": correction_outcome["skip_reason"],
                 })
 
-            # CLIENT-CONFIRMED (2026-08-05): a correction that matched every
-            # business eligibility rule but had zero valid posting rows left
-            # to write to (see corrections.build_eligible_corrections'
-            # not_applied / corrections.py's corrections_not_applied) must
-            # not stay invisible inside corrections.py -- reused here via
-            # the SAME corrections_skipped structure the frontend already
-            # renders, rather than a new API field. Appended unconditionally
-            # (not only in the elif above), since a per-loan/field skip can
-            # happen even in a run where OTHER corrections for this same
-            # file succeeded and produced a corrected workbook.
-            for not_applied in correction_outcome.get("corrections_not_applied", []):
-                corrections_skipped.append({
-                    "servicer": display_label,
-                    "SBA GP Number": not_applied.get("gp"),
-                    "field": not_applied.get("field"),
-                    "reason": not_applied.get("reason"),
-                })
-
             # CLIENT-CONFIRMED (2026-08-04, revised): captured BEFORE the
             # _cycle_month pop below. Collect EVERY distinct nonblank cycle
             # month across servicers, not just the first — combining
@@ -393,28 +411,10 @@ async def audit(
         # controls (balance continuity, deferral-aware delinquency status).
         # Everything else here still runs in full above (all_results is
         # untouched) and still feeds the JSON response / chatbot / frontend
-        # dashboard — this set ONLY controls which checks get a tab in the
-        # downloadable Excel workbook.
-        #   POP-01: important control, kept running, but doesn't need its
-        #     own detail tab (174-loan Servicer + Deal population match is
-        #     unchanged — see population_check).
-        #   PAY-01, DUP-01, NEG-01: diagnostic/internal — informational,
-        #     not yet part of the client's core monthly SRF QC scope.
-        #   PAY-02: business rule (Scheduled Payment - (Payment Received +
-        #     Servicing Fee)) not yet validated against the client's
-        #     corrected SRF workbook — held out of the client-facing report
-        #     until that validation happens, NOT rewritten or disabled.
-        #   PORT-01: CLIENT-CONFIRMED (2026-08-04, revised) — deliberately
-        #     excluded from THIS workbook entirely. It gets its own two
-        #     SEPARATE downloadable Portfolio Summary workbooks instead —
-        #     Original and Audited (see portfolio_summary_original_records /
-        #     portfolio_summary_audited_records / generate_portfolio_summary_bytes
-        #     below), not a tab inside the detailed reconciliation workbook.
-        REPORT_EXCLUDED_CHECK_IDS = {"POP-01", "PAY-01", "PAY-02", "DUP-01", "NEG-01", "PORT-01"}
-        report_results = [
-            r for r in all_results
-            if r["id"].split("::")[0] not in REPORT_EXCLUDED_CHECK_IDS
-        ]
+        # dashboard — _filter_report_results only controls which checks
+        # get a tab in the downloadable Excel workbook. See that
+        # function's docstring for the full per-check rationale.
+        report_results = _filter_report_results(all_results)
 
         # The Excel workbook's own Summary tab banner ("Total issues: N")
         # must reflect only what the workbook actually contains (BAL-01 +
