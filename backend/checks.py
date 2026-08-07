@@ -28,6 +28,15 @@ from file_readers import MEMO_LENDER_ALIASES
 BALANCE_TOLERANCE = 1.00  # dollars
 
 
+def _round2(value):
+    """Coerce a value to a 2-dp float, or None if it isn't numeric. Used
+    only to expose already-computed display figures (payment, servicing
+    fee, balance) on correction_data for the review page — never in any
+    calculation."""
+    v = pd.to_numeric(value, errors="coerce")
+    return round(float(v), 2) if pd.notna(v) else None
+
+
 def _result(check_id, name, category, severity, records, details_fn, issues_found=None):
     issues = len(records) if issues_found is None else issues_found
     status = "PASS" if issues == 0 else severity
@@ -1818,6 +1827,25 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             # reversal was involved), NOT by giving STAT-01 a different
             # calculated_dq than NEG-01 would show for the same loan/cycle.
             "reversal_equivalents": reversal_info["payment_equivalents_removed"] if reversal_info else None,
+            # --- Read-only review evidence (NOT used in any calculation) ---
+            # Exposed purely so the correction review page can show, per
+            # recommendation, the prior recorded status and the BR-002
+            # payment evidence [(received + servicing_fee) / scheduled] that
+            # drove calculated_dq, without the frontend having to recompute
+            # anything. All sourced from the SAME consolidated `row` and
+            # `soup_dq_raw` the flagged `records` entry above already uses.
+            "prior_dq": str(soup_dq_raw).strip(),
+            "payment_received": _round2(row.get("received")) if has_payment_cols else None,
+            "scheduled_payment": _round2(row.get("scheduled")) if has_payment_cols else None,
+            "servicing_fee": _round2(row.get("servicing_fee")),
+            "ending_balance": _round2(row.get("ending_balance")),
+            # consolidate_cycle_postings ALWAYS produces posting_count, so
+            # None here should be unreachable. Defaulting to None (not 1) on
+            # purpose: if it ever does go missing, the review page shows the
+            # count as absent rather than silently claiming "1 posting" for a
+            # loan that actually has several — misleading evidence on the very
+            # screen a human uses to judge the correction.
+            "posting_count": int(row["posting_count"]) if row.get("posting_count") is not None else None,
         })
 
     result = _result(

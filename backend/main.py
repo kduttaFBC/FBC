@@ -2,8 +2,9 @@
 FalconBridge Audit Intelligence — FastAPI backend.
 
 Endpoints:
-  POST /api/audit            reconcile SOUP vs. each uploaded servicer SRF file
-  POST /api/chat             chat with FalconBridge AI about the audit
+  POST /api/audit               reconcile SOUP vs. each uploaded servicer SRF file
+  POST /api/corrections/review  generate corrected workbooks from a reviewer's decisions
+  POST /api/chat                chat with FalconBridge AI about the audit
 """
 
 # Makes 3.10+ union type-hint syntax (e.g. `list | None`) work on Python
@@ -18,6 +19,7 @@ import time
 import traceback
 import base64
 import gc
+import hashlib
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,9 +53,24 @@ app.add_middleware(
 REPORTS_DIR = "/tmp/reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# Holds the full SOUP dataset per audit session so the chatbot can look up
-# ANY account on demand (flagged or not), not just whatever was pre-loaded
-# into the chat context. Sessions expire after SESSION_TTL_SECONDS.
+# Per-audit-session state, held in memory between requests:
+#   - "soup_df": the full SOUP dataset, so the chatbot can look up ANY
+#     account on demand (flagged or not), not just what was pre-loaded into
+#     the chat context.
+#   - "corrections": per servicer, the ORIGINAL uploaded bytes + their
+#     SHA-256 + the eligible correction candidates, so POST
+#     /api/corrections/review can generate a corrected workbook from the
+#     exact source artifact the reviewer saw, applying only approved values.
+#
+# IMPORTANT — this is PROCESS-LOCAL state and assumes a SINGLE worker (the
+# Render start command runs uvicorn with no --workers flag; see render.yaml).
+# The chatbot's soup_df lookup depends on the same assumption. Under a
+# multi-worker deployment a review POST (or a chat request) could land on a
+# different worker than the audit that created the session, and BOTH would
+# fail together — moving this to a shared store (Redis/object storage) is the
+# prerequisite for scaling past one worker.
+#
+# Sessions expire after SESSION_TTL_SECONDS.
 SESSION_CACHE = {}
 SESSION_TTL_SECONDS = 3600
 
@@ -274,8 +291,12 @@ async def audit(
 
         all_results = []
         servicer_loan_counts = {}
-        corrected_workbooks = []
+        recommendations = []
         corrections_skipped = []
+        # Per-servicer correction state stashed for POST /api/corrections/review:
+        # original bytes + their SHA-256 + the eligible candidate set. Written
+        # into SESSION_CACHE once the session_id is minted (end of this handler).
+        correction_session_state = {}
         portfolio_summary_original_records = []
         portfolio_summary_audited_records = []
         portfolio_summary_cycle_months = set()
@@ -329,10 +350,11 @@ async def audit(
                 return JSONResponse(status_code=400, content={
                     "error": f"Could not read servicer file '{uploaded.filename}': {exc}",
                 })
-            # file_bytes is deliberately NOT deleted yet — the correction
-            # engine below needs the file's ORIGINAL bytes to build a
-            # corrected copy. Released right after that step, same as
-            # before, just a few lines later.
+            # file_bytes is deliberately NOT deleted here — the ORIGINAL bytes
+            # are stashed in the session below so POST /api/corrections/review
+            # can generate a corrected copy later, from the exact source
+            # artifact the reviewer saw. They are held only for the session
+            # TTL and are never mutated.
 
             # soup_key is what actually matches SOUP's Servicer column (e.g.
             # "Lendistry"); display_label is what shows up in results/report
@@ -346,54 +368,42 @@ async def audit(
                 memo_df=memo_df, memo_lender_key=soup_key, deal=deal,
             )
 
-            # Corrected servicer workbook generation is entirely a backend
-            # implementation detail (see backend/corrections.py) — it reads
-            # this file's STAT-01 result's correction_data/_cycle_month,
-            # decides what's eligible under the v1 allow-list, and returns
-            # either a corrected workbook or a reason it didn't. Those two
-            # keys are stripped off the result below immediately afterward,
-            # so nothing about HOW a correction was decided ever reaches the
-            # API response — the audit API stays exactly "audit results."
+            # RECOMMENDATIONS ONLY — no corrected workbook is written during
+            # the audit. corrections.build_recommendations reads this file's
+            # STAT-01 correction_data, applies the v1 eligibility allow-list,
+            # and returns (recommendations, candidates, skipped). Generation
+            # happens later, in POST /api/corrections/review, from the reviewer's
+            # decisions. The correction_data/_cycle_month/audited_status keys
+            # are stripped off the result below immediately afterward, so
+            # nothing about HOW a recommendation was derived leaks into the
+            # audit response beyond the recommendations themselves.
             stat01_result = next((r for r in results if r["id"].split("::")[0] == "STAT-01"), None)
-            correction_outcome = corrections_mod.generate_corrected_workbook(
-                file_bytes, uploaded.filename, display_label, stat01_result,
+            recs, candidates, skipped = corrections_mod.build_recommendations(
+                stat01_result, display_label,
             )
+            recommendations.extend(recs)
+            for s in skipped:
+                # Eligible-but-unreviewable (no valid posting row to write to)
+                # — surfaced through the existing corrections_skipped channel,
+                # with the servicer label added. Not reviewable, so never a
+                # recommendation.
+                corrections_skipped.append({"servicer": display_label, **s})
+
+            # Stash this servicer's ORIGINAL bytes + hash + candidate set for
+            # the review endpoint. SHA-256 captured now, alongside the bytes,
+            # so the Correction Log can later prove which source artifact was
+            # reviewed. Only stored when there is something reviewable.
+            if candidates:
+                correction_session_state[display_label] = {
+                    "original_bytes": file_bytes,
+                    "original_filename": uploaded.filename,
+                    "source_sha256": hashlib.sha256(file_bytes).hexdigest(),
+                    "institution": display_label,
+                    "cycle_month": (stat01_result or {}).get("_cycle_month"),
+                    "candidates": candidates,
+                }
             del file_bytes
             gc.collect()
-
-            if correction_outcome["file_bytes"]:
-                corrected_workbooks.append({
-                    "servicer": display_label,
-                    "filename": correction_outcome["filename"],
-                    "file_b64": base64.b64encode(correction_outcome["file_bytes"]).decode("utf-8"),
-                    "correction_count": correction_outcome["correction_count"],
-                })
-            elif correction_outcome["skip_reason"]:
-                corrections_skipped.append({
-                    "servicer": display_label,
-                    "reason": correction_outcome["skip_reason"],
-                })
-
-            # Per-loan corrections that were eligible but could not be
-            # written to a single row (corrections.py returns these as
-            # corrections_not_applied on EVERY path, including the success
-            # path). Deliberately NOT part of the if/elif above: a servicer
-            # file can produce a corrected workbook AND still have
-            # individual loans that could not be written, so these two
-            # outcomes are independent, not alternatives.
-            #
-            # Reported verbatim -- the gp/field/reason produced by
-            # corrections.py are surfaced unchanged, with only the servicer
-            # label added and the key renamed to the "SBA GP Number" the
-            # rest of the API response already uses. These never contribute
-            # to correction_count.
-            for not_applied in correction_outcome.get("corrections_not_applied") or []:
-                corrections_skipped.append({
-                    "servicer": display_label,
-                    "SBA GP Number": not_applied.get("gp"),
-                    "field": not_applied.get("field"),
-                    "reason": not_applied.get("reason"),
-                })
 
             # CLIENT-CONFIRMED (2026-08-04, revised): captured BEFORE the
             # _cycle_month pop below. Collect EVERY distinct nonblank cycle
@@ -536,8 +546,18 @@ async def audit(
 
         session_id = str(uuid.uuid4())
         _cleanup_old_sessions()
-        SESSION_CACHE[session_id] = {"soup_df": soup_df, "created": time.time()}
+        SESSION_CACHE[session_id] = {
+            "soup_df": soup_df,
+            "created": time.time(),
+            # Consumed by POST /api/corrections/review (process-local; see the
+            # SESSION_CACHE definition for the single-worker caveat).
+            "corrections": correction_session_state,
+        }
 
+        # No corrected workbook is generated here anymore — the audit returns
+        # RECOMMENDATIONS the reviewer acts on, and generation happens in POST
+        # /api/corrections/review. corrections_skipped still carries items that
+        # are not reviewable (eligible but no valid posting row to write to).
         return JSONResponse({
             "results": all_results,
             "summary": summary,
@@ -549,7 +569,7 @@ async def audit(
             "portfolio_summary_audited_filename": portfolio_summary_audited_filename_value,
             "chat_context": chat_context,
             "session_id": session_id,
-            "corrected_workbooks": corrected_workbooks,
+            "recommendations": recommendations,
             "corrections_skipped": corrections_skipped,
         })
 
@@ -563,6 +583,138 @@ async def audit(
                 "detail": str(exc),
             },
         )
+
+
+@app.post("/api/corrections/review")
+async def corrections_review(payload: dict):
+    """Second half of the review-then-generate workflow. Takes a reviewer's
+    decisions on the recommendations from a prior /api/audit run and, for
+    each servicer, generates a corrected workbook from that servicer's
+    ORIGINAL uploaded bytes (held in the session) — writing ONLY approved
+    values and recording every decision in the Correction Log.
+
+    Nothing was written during the audit; this is the only place a corrected
+    workbook is produced. All safety controls (domain-restricted approved
+    values, the terminal-Loan-Status write block, per-row GP verification)
+    live in corrections.py and cannot be bypassed by anything in the payload.
+    """
+    try:
+        session_id = payload.get("session_id")
+        reviewed_by = (payload.get("reviewed_by") or "").strip()
+        reviewed_on = payload.get("reviewed_on")
+        decisions = payload.get("decisions") or []
+
+        if not decisions:
+            return JSONResponse(status_code=400, content={
+                "error": "No decisions were submitted. Approve, reject, or return at least one "
+                         "recommendation before recording.",
+            })
+
+        # An approval that cannot be attributed is not an audit record. The
+        # name is self-declared (no auth) and recorded as unverified, but it
+        # must be present — this mirrors the review page's own submit gate.
+        if not reviewed_by:
+            return JSONResponse(status_code=400, content={
+                "error": "A reviewer name is required to record corrections.",
+            })
+
+        _cleanup_old_sessions()
+        session = SESSION_CACHE.get(session_id) if session_id else None
+        if session is None:
+            # Either never existed or aged out of the 1h TTL. The bytes and
+            # candidates are gone; decisions cannot be recovered, and the
+            # only honest path is to re-run the audit.
+            return JSONResponse(status_code=410, content={
+                "error": "This review session has expired or is no longer available. Please "
+                         "re-upload the files and re-run the audit; the decisions cannot be "
+                         "recovered.",
+            })
+
+        correction_state = session.get("corrections") or {}
+        if not correction_state:
+            return JSONResponse(status_code=400, content={
+                "error": "This audit produced no reviewable corrections.",
+            })
+
+        # Route each decision to the servicer that owns its recommendation id.
+        id_to_servicer = {
+            cand["id"]: servicer
+            for servicer, entry in correction_state.items()
+            for cand in entry["candidates"]
+        }
+        decisions_by_servicer = {}
+        unknown_ids = []
+        for d in decisions:
+            servicer = id_to_servicer.get(d.get("id"))
+            if servicer is None:
+                unknown_ids.append(d.get("id"))
+                continue
+            decisions_by_servicer.setdefault(servicer, []).append(d)
+
+        corrected_workbooks = []
+        corrections_not_applied = []
+        applied_total = rejected_total = returned_total = 0
+
+        for servicer, servicer_decisions in decisions_by_servicer.items():
+            entry = correction_state[servicer]
+            outcome = corrections_mod.generate_reviewed_workbook(
+                entry["original_bytes"],
+                entry["original_filename"],
+                entry["institution"],
+                entry["candidates"],
+                servicer_decisions,
+                reviewed_by,
+                entry["source_sha256"],
+                entry["cycle_month"],
+                reviewed_on=reviewed_on,
+            )
+
+            applied_total += outcome["applied_count"]
+            rejected_total += outcome["rejected_count"]
+            returned_total += outcome["returned_count"]
+            unknown_ids.extend(outcome.get("unknown_ids") or [])
+
+            for not_applied in outcome.get("corrections_not_applied") or []:
+                corrections_not_applied.append({
+                    "servicer": servicer,
+                    "SBA GP Number": not_applied.get("gp"),
+                    "field": not_applied.get("field"),
+                    "reason": not_applied.get("reason"),
+                })
+
+            if outcome["file_bytes"]:
+                corrected_workbooks.append({
+                    "servicer": servicer,
+                    "filename": outcome["filename"],
+                    "file_b64": base64.b64encode(outcome["file_bytes"]).decode("utf-8"),
+                    "applied_count": outcome["applied_count"],
+                    "rejected_count": outcome["rejected_count"],
+                    "returned_count": outcome["returned_count"],
+                })
+            elif outcome["skip_reason"]:
+                corrections_not_applied.append({
+                    "servicer": servicer,
+                    "reason": outcome["skip_reason"],
+                })
+
+        return JSONResponse({
+            "corrected_workbooks": corrected_workbooks,
+            "summary": {
+                "applied": applied_total,
+                "rejected": rejected_total,
+                "returned": returned_total,
+                "not_applied": len(corrections_not_applied),
+            },
+            "corrections_not_applied": corrections_not_applied,
+            "unknown_ids": [i for i in unknown_ids if i is not None],
+        })
+
+    except Exception as exc:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={
+            "error": "We couldn't generate the corrected workbook(s). Please try again.",
+            "detail": str(exc),
+        })
 
 
 def _parse_markdown_tables(text):

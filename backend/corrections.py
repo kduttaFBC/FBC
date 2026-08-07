@@ -1,9 +1,9 @@
 """
-Audit Intelligence — corrected servicer workbook generation.
+Audit Intelligence — corrected servicer workbook generation (review-gated).
 
 This module is the ONLY place that decides which audit findings are
-confident enough to auto-correct, and the only place that ever writes to a
-copy of an uploaded servicer workbook. It is deliberately isolated from the
+eligible to correct, and the only place that ever writes to a copy of an
+uploaded servicer workbook. It is deliberately isolated from the
 audit/reconciliation logic in checks.py:
 
   - checks.py (status_match_check / STAT-01) computes raw facts about each
@@ -11,25 +11,38 @@ audit/reconciliation logic in checks.py:
     warning conditions apply — and exposes them on result["correction_data"].
     It makes NO decision about what's "correctable."
   - This module reads those raw facts and applies a strict, mechanical
-    allow-list (build_eligible_corrections) to decide what may be written.
+    allow-list (build_eligible_corrections) to decide what is a CANDIDATE.
   - Nothing in this file ever changes an audit result, a report, or a
     reconciliation formula. A bug here cannot silently change what the audit
     engine concludes; a bug in the audit engine cannot silently widen what
     this module is willing to write.
 
-Version 1 scope (deliberately narrow):
-  - Delinquency Status: corrected only when STAT-01 produced a real,
+WORKFLOW (review-then-generate — see BRIEF_correction_workflow_restructure):
+  - The audit produces RECOMMENDATIONS only. build_recommendations() shapes
+    the eligible candidates for the reviewer; NO workbook is written during
+    /api/audit.
+  - A reviewer then decides each recommendation (approve / reject / return),
+    optionally substituting an approved value from that field's own domain.
+  - generate_reviewed_workbook() opens a FRESH copy of the original uploaded
+    bytes, writes ONLY the approved values, and records every decision —
+    approved, rejected and returned — in the Correction Log.
+
+Version 1 candidate scope (deliberately narrow — the eligibility allow-list):
+  - Delinquency Status: a candidate only when STAT-01 produced a real,
     unambiguous calculated value and flagged no warning of any kind for that
     loan.
-  - Loan Status: corrected only to DEFERRED, only for a CONFIRMED Full P&I
-    deferral in its "start" or "mid" phase. Partial (principal-only/
-    interest-only) deferrals and the deferral "resume" phase are explicitly
-    OUT of scope for v1 — see build_eligible_corrections for why.
+  - Loan Status: a candidate only for a CONFIRMED Full P&I deferral in its
+    "start" or "mid" phase (calculated value DEFERRED). Partial (principal-
+    only/interest-only) deferrals and the deferral "resume" phase are
+    explicitly OUT of scope for v1 — see build_eligible_corrections for why.
   - Every other field (balances, payments, population, liquidation,
     negative payments, missing periods, duplicate postings, everything
     else) is untouched in this version.
   - The original uploaded workbook is never modified — a new workbook is
     always produced from a fresh copy of the original bytes.
+  - The reviewer's approved value is domain-restricted (see
+    validate_approved_value): a substitution can never reintroduce a
+    cross-domain value, and Loan Status can never become terminal.
 """
 
 import io
@@ -119,6 +132,51 @@ def _is_terminal_loan_status(status_value):
     s = str(status_value or "").strip().upper()
     return any(k in s for k in _LOAN_STATUS_TERMINAL_KEYWORDS)
 
+
+# Loan Status values a reviewer may SUBSTITUTE as an approved value. Kept
+# deliberately narrow, mirroring the DQ domain above: v1's only calculated
+# Loan Status correction is "-> DEFERRED", so the realistic reviewer choice
+# is DEFERRED or the operational ACTIVE. A terminal status (LIQUIDATION /
+# PAID-IN-FULL) is NEVER writable through this tool regardless of this list
+# (enforced separately by _is_terminal_loan_status at write time), and a
+# value that is actually a Delinquency Status is rejected as cross-domain.
+# Widening this set is a deliberate future change, the same way widening the
+# eligibility allow-list is — it is not something that should drift silently.
+_PERMITTED_LOAN_STATUS = {"ACTIVE", "DEFERRED"}
+
+
+def validate_approved_value(field, value):
+    """The approved-value domain restriction. A reviewer's substituted value
+    must come only from the target field's own domain, so a substitution can
+    never reintroduce a cross-domain value (the exact defect that flags a
+    recommendation for review in the first place) or turn a loan terminal.
+
+    Returns (True, normalized_value) if the value is writable for this field,
+    else (False, reason)."""
+    v = str(value if value is not None else "").strip().upper()
+    if not v:
+        return False, "Approved value is blank."
+    if field == "Delinquency Status":
+        if v not in _PERMITTED_DQ_STATUS:
+            return False, (
+                f"'{value}' is not a valid Delinquency Status — an approved value must come "
+                f"from the delinquency ladder, not another field."
+            )
+        return True, v
+    if field == "Loan Status":
+        if _is_terminal_loan_status(v):
+            return False, (
+                f"Refused '{value}' — automatic corrections may never create or remove a "
+                f"LIQUIDATION or PAID-IN-FULL status."
+            )
+        if v in _PERMITTED_DQ_STATUS or v not in _PERMITTED_LOAN_STATUS:
+            return False, (
+                f"'{value}' is not a permitted Loan Status substitution."
+            )
+        return True, v
+    return False, f"Field '{field}' is not a correctable field."
+
+
 CORRECTION_LOG_SHEET_NAME = "Correction Log"
 # CLIENT-CONFIRMED (2026-08-05): one log row per LOAN-LEVEL correction, not
 # one per Excel row updated -- a 3-posting loan whose Delinquency Status was
@@ -130,11 +188,39 @@ CORRECTION_LOG_SHEET_NAME = "Correction Log"
 # invalid/duplicate references filtered out before writing, or a row whose
 # GP no longer matched at write time — so a partially-applied correction
 # never silently loses track of what it left out.
+# Existing columns are frozen — DO NOT reorder or rename them (external
+# consumers read the log by position/name). New review-workflow columns are
+# APPENDED after them:
+#   - Calculated Value      : what STAT-01 computed for this loan/field.
+#   - Reviewer Approved Value: what the reviewer authorised — equals
+#                             Calculated Value unless they substituted.
+#   - Decision              : Approved and applied / Rejected / Returned to servicer.
+#   - Reviewer Note         : the reviewer's free-text note.
+#   - Reviewed By (self-declared): the reviewer's name. Labelled "self-declared"
+#                             because the app has no authentication — a typed
+#                             name must never be mistaken for an authenticated
+#                             one. Replace this column's source (not just its
+#                             label) if/when real auth is added upstream.
+#   - Reviewed On           : when the review was submitted.
+#   - Source File SHA-256   : hash of the ORIGINAL uploaded workbook these
+#                             corrections were reviewed against, so it is
+#                             provable which source artifact was reviewed.
+#   - Notify Servicer       : "Yes" when the reviewer flagged that the
+#                             servicer should be told about this (a source-
+#                             data defect that will recur unless raised),
+#                             blank otherwise. This flag is the reason the
+#                             review exists for cross-domain defects, so it
+#                             must be recorded, not dropped.
+# `Original Value` stays the reported value read from the cells; `Corrected
+# Value` stays the value actually written (blank for a rejected/returned row).
 CORRECTION_LOG_HEADERS = [
     "Institution", "Source Worksheet", "Excel Row Numbers", "Rows Updated", "SBA GP Number",
     "Field Updated", "Original Value", "Corrected Value", "Audit Check ID",
     "Eligibility Rule", "Timestamp", "Skipped Row References",
     "Review Status", "Review Reason",
+    "Calculated Value", "Reviewer Approved Value", "Decision",
+    "Reviewer Note", "Reviewed By (self-declared)", "Reviewed On",
+    "Source File SHA-256", "Notify Servicer",
 ]
 
 
@@ -283,20 +369,30 @@ def build_eligible_corrections(correction_data):
                 "sheet_name": c.get("sheet_name"),
                 "header_excel_row": c.get("header_excel_row"),
                 "field": field,
+                # corrected_value IS STAT-01's calculated value — the default
+                # the reviewer sees, and what "Calculated Value" logs.
                 "corrected_value": corrected_value,
                 "eligibility_rule": eligibility_rule,
-                # A correction flagged for review is PROPOSED, never written.
-                # It is still recorded in the Correction Log so the defect is
-                # visible and can be raised with the servicer, rather than
-                # disappearing the way an eligibility-layer `continue` would
-                # make it disappear.
+                # A recommendation flagged for review is never AUTO-applied.
+                # It still reaches the reviewer (with the defect named) so it
+                # can be judged, rather than disappearing the way an
+                # eligibility-layer `continue` would make it disappear.
                 "review_required": bool(review_required),
                 "review_reason": review_reason,
-                # The value actually reported by the servicer, carried so a
-                # proposed-only row can show what needs reviewing without
-                # having opened the workbook to read the cells.
+                # The value actually reported by the servicer, carried so the
+                # review page can show what needs reviewing without having
+                # opened the workbook to read the cells.
                 "reported_value": c.get("srf_dq") if field == "Delinquency Status"
                                   else c.get("srf_status"),
+                # Read-only review evidence, passed straight through from
+                # STAT-01's correction_data (see checks.py). Never used in any
+                # decision here — purely for display on the review page.
+                "prior_value": c.get("prior_dq") if field == "Delinquency Status" else c.get("soup_status"),
+                "payment_received": c.get("payment_received"),
+                "scheduled_payment": c.get("scheduled_payment"),
+                "servicing_fee": c.get("servicing_fee"),
+                "balance": c.get("ending_balance"),
+                "posting_count": c.get("posting_count"),
             })
 
         # --- Delinquency Status -------------------------------------------------
@@ -341,6 +437,87 @@ def build_eligible_corrections(correction_data):
             _emit("Loan Status", "DEFERRED", f"STAT-01 confirmed Full P&I deferral ({c.get('deferral_phase')})")
 
     return eligible
+
+
+def _recommendation_id(servicer, gp, field):
+    """Stable, deterministic id for one recommendation within a session.
+    Deterministic (not a uuid) so a resubmitted review maps to the same
+    candidate. servicer/gp/field never contain '||'."""
+    return f"{servicer}||{gp}||{field}"
+
+
+def build_recommendations(stat01_result, servicer):
+    """Turns one servicer's STAT-01 result into the review-page contract,
+    WITHOUT writing anything. This is what /api/audit returns now instead of
+    a generated workbook.
+
+    Returns (recommendations, candidates, skipped):
+      - recommendations: client-facing dicts (one per eligible loan/field
+        that has at least one valid posting row to write to), carrying the
+        display evidence the reviewer needs. A recommendation is a PROPOSAL,
+        never an applied change — a `reviewFlag` names any defect (e.g. a
+        cross-domain reported value) the reviewer must weigh.
+      - candidates: the matching full server-side records (same order/ids),
+        including the sheet/row/header write metadata. main.py stashes these
+        in the session so generate_reviewed_workbook can act on a reviewer's
+        decision without trusting client-supplied write targets.
+      - skipped: eligible loans/fields with NO valid posting row to write to
+        — not reviewable (there is nowhere to apply a decision), surfaced via
+        corrections_skipped exactly as before.
+
+    Eligibility itself is unchanged — build_eligible_corrections is the sole
+    allow-list; this function only shapes and routes its output."""
+    correction_data = (stat01_result or {}).get("correction_data", [])
+    eligible = build_eligible_corrections(correction_data)
+
+    recommendations = []
+    candidates = []
+    skipped = []
+    for e in eligible:
+        rec_id = _recommendation_id(servicer, e["gp"], e["field"])
+
+        if not e["excel_rows"]:
+            # Eligible by every business rule, but no valid row to write to —
+            # a decision could never be applied, so it is not reviewable.
+            detail = (
+                "; ".join(f"{s['row_ref']} ({s['reason']})" for s in e.get("skipped_row_refs") or [])
+                if e.get("skipped_row_refs") else "no row location metadata available"
+            )
+            skipped.append({
+                "SBA GP Number": e["gp"],
+                "field": e["field"],
+                "reason": (
+                    f"Eligible for correction, but no valid posting row could be located "
+                    f"({detail}) — cannot be reviewed."
+                ),
+            })
+            continue
+
+        candidate = dict(e)
+        candidate["id"] = rec_id
+        candidate["servicer"] = servicer
+        candidates.append(candidate)
+
+        recommendations.append({
+            "id": rec_id,
+            "servicer": servicer,
+            "gp": e["gp"],
+            "field": e["field"],
+            "rows": list(e["excel_rows"]),
+            "postings": e.get("posting_count"),
+            "sheet": e.get("sheet_name"),
+            "reported": e.get("reported_value"),
+            "prior": e.get("prior_value"),
+            "calculated": e["corrected_value"],
+            "paymentReceived": e.get("payment_received"),
+            "scheduledPayment": e.get("scheduled_payment"),
+            "servicingFee": e.get("servicing_fee"),
+            "balance": e.get("balance"),
+            "reviewFlag": e.get("review_reason") if e.get("review_required") else None,
+            "rule": e.get("eligibility_rule"),
+        })
+
+    return recommendations, candidates, skipped
 
 
 def _find_header_columns(ws, header_excel_row, field, gp_field="SBA GP Number"):
@@ -485,27 +662,41 @@ def _unique_log_sheet_name(wb):
     return f"{base} {number}"
 
 
-def _add_correction_log_sheet(wb, applied_rows, institution, timestamp):
+def _add_correction_log_sheet(wb, log_rows, institution, common):
+    """Writes the Correction Log. `common` carries the values shared by
+    every row of one review submission: {timestamp, reviewed_by,
+    reviewed_on, source_sha256}. Every decided correction — applied,
+    rejected, and returned — gets exactly one row (rejected/returned rows
+    have Rows Updated = 0 and a blank Corrected Value, since no cell
+    changed)."""
     ws = wb.create_sheet(_unique_log_sheet_name(wb))
 
     rows = [
         [
             institution,
-            r["sheet_name"],
-            ", ".join(str(x) for x in r["excel_rows"]),
-            r["rows_updated"],
+            r.get("sheet_name") or "",
+            ", ".join(str(x) for x in (r.get("excel_rows") or [])),
+            r.get("rows_updated", 0),
             r["gp"],
             r["field"],
-            "; ".join("" if v is None else str(v) for v in r["original_values"]),
-            r["corrected_value"],
+            "; ".join("" if v is None else str(v) for v in (r.get("original_values") or [])),
+            "" if r.get("corrected_value") in (None, "") else r["corrected_value"],
             AUDIT_CHECK_ID,
-            r["eligibility_rule"],
-            timestamp,
+            r.get("eligibility_rule") or "",
+            common["timestamp"],
             "; ".join(f"{s['row_ref']} ({s['reason']})" for s in r.get("skipped_rows") or []),
-            r.get("review_status") or "Applied",
+            r.get("review_status") or "",
             r.get("review_reason") or "",
+            r.get("calculated_value") or "",
+            r.get("approved_value") or "",
+            r.get("decision") or "",
+            r.get("reviewer_note") or "",
+            common["reviewed_by"],
+            common["reviewed_on"],
+            common["source_sha256"],
+            r.get("notify_servicer") or "",
         ]
-        for r in applied_rows
+        for r in log_rows
     ]
     _write_header(ws, CORRECTION_LOG_HEADERS)
     _write_rows(ws, CORRECTION_LOG_HEADERS, rows)
@@ -527,127 +718,213 @@ def _build_corrected_filename(institution, cycle_month):
     return f"{safe_institution}_{month_label}_CORRECTED.xlsx"
 
 
-def generate_corrected_workbook(file_bytes, original_filename, institution, stat01_result):
-    """Given one servicer file's ORIGINAL raw bytes (never mutated) and its
-    STAT-01 result (which carries result["correction_data"] and
-    result["_cycle_month"]), returns a dict:
+def format_self_declared_reviewer(name):
+    """The Correction Log's reviewer identity. The app has no authentication,
+    so a typed name is UNVERIFIED and must be recorded as such — a reader of
+    the log must never mistake it for an authenticated identity. If real auth
+    is added upstream later, replace this with the authenticated source
+    rather than relabelling a free-text field."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    return f"{name} (unverified)"
 
-      {"file_bytes": <corrected .xlsx bytes>, "filename": <str>,
-       "correction_count": <int>, "skip_reason": None}
 
-    or, when no corrected workbook should be produced:
+# Human-readable Decision / Review Status text, kept in one place so the log
+# and the API summary can't drift apart.
+_DECISION_APPROVE = "approve"
+_DECISION_REJECT = "reject"
+_DECISION_RETURN = "return"
+_DECISION_LABELS = {
+    _DECISION_APPROVE: "Approved and applied",
+    _DECISION_REJECT: "Rejected",
+    _DECISION_RETURN: "Returned to servicer",
+}
 
-      {"file_bytes": None, "filename": None, "correction_count": 0,
-       "skip_reason": <str explaining why>}
 
-    Never raises for expected conditions (missing columns, mismatched rows,
-    unsupported format) — those are all reported via skip_reason so a
-    problem with ONE servicer's file never breaks the rest of the audit
-    response.
+def generate_reviewed_workbook(
+    file_bytes, original_filename, institution, candidates, decisions,
+    reviewer, source_sha256, cycle_month, reviewed_on=None,
+):
+    """Generates ONE servicer's corrected workbook from a FRESH copy of its
+    ORIGINAL uploaded bytes (never mutated), writing ONLY the reviewer-
+    approved values and recording every decision in the Correction Log.
 
-    CLIENT-CONFIRMED (2026-08-05): the returned dict also carries
-    "corrections_not_applied" — a list of {gp, field, reason} for every
-    eligible correction that could NOT be safely written to even one row
-    (zero valid excel_rows to begin with, or every row failing its GP
-    check). Those corrections are never counted in correction_count and
-    never appear in the Correction Log sheet — they're reported as not
-    applied, never as successful — but the reason is still surfaced here
-    rather than disappearing silently."""
+    Inputs:
+      candidates  — that servicer's candidate list from build_recommendations
+                    (each carries a stable `id` and its write metadata).
+      decisions   — a list of {id, decision, approved_value?, reviewer_note?,
+                    notify_servicer?}. Only ids present here are acted on and
+                    logged; an undecided candidate is neither written nor
+                    logged. `decision` is approve / reject / return.
+      reviewer    — the raw reviewer name (formatted self-declared here).
+      source_sha256 — SHA-256 of `file_bytes`, written to the log so it is
+                    provable which source artifact was reviewed.
+
+    Returns a dict:
+      {file_bytes, filename, applied_count, rejected_count, returned_count,
+       corrections_not_applied: [{gp, field, reason}],
+       unknown_ids: [...], skip_reason}
+
+    Never raises for expected conditions (unknown id, unsupported format,
+    template drift, an invalid substituted value) — each is reported so one
+    servicer's problem never breaks a multi-servicer review. Applying only
+    approved values, the domain restriction on substitutions, and the
+    terminal-Loan-Status write block are all enforced here, never bypassable
+    by client input."""
     empty = {
-        "file_bytes": None, "filename": None, "correction_count": 0,
-        "skip_reason": None, "corrections_not_applied": [],
+        "file_bytes": None, "filename": None,
+        "applied_count": 0, "rejected_count": 0, "returned_count": 0,
+        "corrections_not_applied": [], "unknown_ids": [], "skip_reason": None,
     }
 
-    correction_data = (stat01_result or {}).get("correction_data", [])
-    eligible = build_eligible_corrections(correction_data)
-    if not eligible:
-        return empty  # nothing eligible — no misleading file, and no error; this is the normal/common case
+    by_id = {c["id"]: c for c in (candidates or [])}
+    decisions = decisions or []
+    unknown_ids = [d.get("id") for d in decisions if d.get("id") not in by_id]
+    actionable = [d for d in decisions if d.get("id") in by_id]
+    if not actionable:
+        return {**empty, "unknown_ids": unknown_ids,
+                "skip_reason": "No reviewable decisions were submitted for this servicer."}
 
     if original_filename and original_filename.lower().strip().endswith(".xls"):
-        return {
-            **empty,
-            "skip_reason": (
-                "Eligible corrections were identified, but a corrected copy "
-                "cannot be generated safely from the legacy .xls format."
-            ),
-        }
+        return {**empty, "unknown_ids": unknown_ids,
+                "skip_reason": ("Decisions were submitted, but a corrected copy cannot be "
+                                "generated safely from the legacy .xls format.")}
 
     try:
         wb = load_workbook(io.BytesIO(file_bytes), data_only=False)
     except Exception as exc:
-        return {**empty, "skip_reason": f"Could not reopen the original workbook: {exc}"}
+        return {**empty, "unknown_ids": unknown_ids,
+                "skip_reason": f"Could not reopen the original workbook: {exc}"}
 
-    applied_rows = []
+    log_rows = []
     corrections_not_applied = []
-    for corr in eligible:
-        # CROSS-DOMAIN SOURCE DEFECT -> proposed, never written.
-        # The calculation is deterministic and correct, but applying it
-        # would normalise away an invalid value in the servicer's own file:
-        # they would never learn the field is being populated from the wrong
-        # domain, and it would recur every cycle. The proposal is recorded in
-        # the Correction Log marked "Human review required", and reported to
-        # the caller as not applied, so it is visible in both places without
-        # being silently actioned.
-        if corr.get("review_required"):
-            applied_rows.append({
-                "sheet_name": corr.get("sheet_name"),
-                "excel_rows": corr.get("excel_rows") or [],
-                "rows_updated": 0,
-                "gp": corr["gp"],
-                "field": corr["field"],
-                "original_values": ([corr.get("reported_value")]
-                                    if corr.get("reported_value") is not None else []),
-                "corrected_value": corr["corrected_value"],
-                "eligibility_rule": corr["eligibility_rule"],
-                "skipped_rows": [],
-                "review_status": "Human review required",
-                "review_reason": corr.get("review_reason"),
+    applied_count = rejected_count = returned_count = 0
+
+    for d in actionable:
+        cand = by_id[d["id"]]
+        gp, field = cand["gp"], cand["field"]
+        calculated = cand.get("corrected_value")
+        reported = cand.get("reported_value")
+        note = d.get("reviewer_note")
+        notify = "Yes" if d.get("notify_servicer") else ""
+        review_reason = cand.get("review_reason") or ""
+        decision_kind = (d.get("decision") or "").strip().lower()
+
+        base_row = {
+            "sheet_name": cand.get("sheet_name"),
+            "excel_rows": [],
+            "rows_updated": 0,
+            "gp": gp,
+            "field": field,
+            "original_values": [reported] if reported is not None else [],
+            "corrected_value": "",
+            "eligibility_rule": cand.get("eligibility_rule"),
+            "skipped_rows": [],
+            "review_reason": review_reason,
+            "calculated_value": calculated,
+            "approved_value": "",
+            "reviewer_note": note,
+            "notify_servicer": notify,
+        }
+
+        if decision_kind in (_DECISION_REJECT, _DECISION_RETURN):
+            # No write. The reported value is kept; the decision is logged
+            # with Rows Updated = 0 so the review record is complete.
+            log_rows.append({
+                **base_row,
+                "review_status": _DECISION_LABELS[decision_kind],
+                "decision": _DECISION_LABELS[decision_kind],
             })
+            if decision_kind == _DECISION_REJECT:
+                rejected_count += 1
+            else:
+                returned_count += 1
+            continue
+
+        if decision_kind != _DECISION_APPROVE:
             corrections_not_applied.append({
-                "gp": corr["gp"], "field": corr["field"],
-                "reason": (
-                    f"Human review required — {corr.get('review_reason')} "
-                    f"Reported value: {corr.get('reported_value')!r}. "
-                    f"The calculated value ({corr['corrected_value']}) is "
-                    f"recorded in the Correction Log as proposed but was not "
-                    f"written; the servicer should be informed so the error "
-                    f"does not recur."
-                ),
+                "gp": gp, "field": field,
+                "reason": f"Unrecognised decision {d.get('decision')!r} — not applied.",
             })
             continue
 
-        ok, detail = _apply_one_correction(wb, corr)
-        if ok:
-            applied_rows.append(detail)
+        # --- APPROVE ---------------------------------------------------------
+        # Default the approved value to STAT-01's calculated value; the
+        # reviewer may substitute, but only from the field's own domain.
+        substituted = d.get("approved_value") not in (None, "")
+        approved_input = d.get("approved_value") if substituted else calculated
+        ok, result = validate_approved_value(field, approved_input)
+        if not ok:
+            # A substitution outside the field's domain is refused here — it
+            # can never reintroduce a cross-domain value or a terminal status.
+            corrections_not_applied.append({
+                "gp": gp, "field": field,
+                "reason": f"Approved value not written — {result}",
+            })
+            log_rows.append({
+                **base_row,
+                "approved_value": approved_input,
+                "review_status": "Not applied",
+                "review_reason": result,
+                "decision": "Approved (value refused)",
+            })
+            continue
+        approved_value = result  # normalized
+
+        corr = dict(cand)
+        corr["corrected_value"] = approved_value  # write the APPROVED value, not necessarily the calculated one
+        written_ok, detail = _apply_one_correction(wb, corr)
+        if written_ok:
+            log_rows.append({
+                **detail,
+                "review_status": "Applied",
+                "decision": _DECISION_LABELS[_DECISION_APPROVE],
+                "calculated_value": calculated,
+                "approved_value": approved_value,
+                "reviewer_note": note,
+                "review_reason": review_reason,
+                "notify_servicer": notify,
+            })
+            applied_count += 1
         else:
-            # A correction with zero valid rows (or any other full-loan
-            # safety failure) is reported here as not applied — it never
-            # contributes to correction_count and never gets a Correction
-            # Log row, but the reason isn't lost: it's returned so the
-            # caller can surface it if useful, rather than one servicer's
-            # template mismatch silently erasing all trace of the attempt.
-            corrections_not_applied.append({"gp": corr["gp"], "field": corr["field"], "reason": detail})
+            # Approved, but could not be safely written (template drift / GP
+            # mismatch / no verifiable row). Never counted as applied; the
+            # reason is surfaced, and it is logged as a decided-but-unwritten
+            # row so the attempt isn't lost.
+            corrections_not_applied.append({"gp": gp, "field": field, "reason": detail})
+            log_rows.append({
+                **base_row,
+                "approved_value": approved_value,
+                "review_status": "Not applied",
+                "review_reason": detail,
+                "decision": "Approved (could not write)",
+            })
 
-    really_applied = [r for r in applied_rows if r.get("rows_updated")]
-    if not really_applied:
-        return {
-            **empty,
-            "skip_reason": "No corrections could be safely verified against this file's actual layout.",
-            "corrections_not_applied": corrections_not_applied,
-        }
+    if not log_rows:
+        return {**empty, "unknown_ids": unknown_ids,
+                "skip_reason": "No reviewable decisions were submitted for this servicer."}
 
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    _add_correction_log_sheet(wb, applied_rows, institution, timestamp)
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    common = {
+        "timestamp": now_iso,
+        "reviewed_by": format_self_declared_reviewer(reviewer),
+        "reviewed_on": reviewed_on or now_iso,
+        "source_sha256": source_sha256 or "",
+    }
+    _add_correction_log_sheet(wb, log_rows, institution, common)
 
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
 
-    filename = _build_corrected_filename(institution, (stat01_result or {}).get("_cycle_month"))
     return {
         "file_bytes": buf.getvalue(),
-        "filename": filename,
-        "correction_count": len(really_applied),
-        "skip_reason": None,
+        "filename": _build_corrected_filename(institution, cycle_month),
+        "applied_count": applied_count,
+        "rejected_count": rejected_count,
+        "returned_count": returned_count,
         "corrections_not_applied": corrections_not_applied,
+        "unknown_ids": unknown_ids,
+        "skip_reason": None,
     }

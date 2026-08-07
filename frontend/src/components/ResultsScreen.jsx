@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import CorrectionReview from './CorrectionReview.jsx'
 
 function DetailTable({ records }) {
   if (!records || !records.length) {
@@ -38,7 +39,7 @@ const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.s
 
 export default function ResultsScreen({ audit, onNewAudit, onExit }) {
   const { results, summary, report_id } = audit
-  const correctedWorkbooks = audit.corrected_workbooks || []
+  const recommendations = audit.recommendations || []
   const correctionsSkipped = audit.corrections_skipped || []
   const [expanded, setExpanded] = useState(null)
   const timestamp = new Date().toLocaleString()
@@ -171,35 +172,11 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
         </table>
       </div>
 
-      {/* Corrected servicer workbooks — only shown when the audit engine
-          found at least one high-confidence, auto-correctable field for a
-          servicer's file. Absent entirely when there's nothing eligible,
-          rather than showing an empty or misleading section. */}
-      {correctedWorkbooks.length > 0 && (
-        <div className="card" style={{ marginBottom: 22 }}>
-          <h3 style={{ marginTop: 0 }}>Corrected servicer workbooks</h3>
-          <p style={{ color: 'var(--text-secondary)', marginTop: 0 }}>
-            A copy of each servicer file below with only its high-confidence corrections applied,
-            plus a Correction Log tab documenting every change. The original uploaded file is never modified.
-          </p>
-          {correctedWorkbooks.map((cw) => (
-            <div className="map-row" style={{ gridTemplateColumns: '1.4fr 1fr' }} key={cw.filename}>
-              <div className="field-name">
-                {cw.servicer}
-                <div className="hint" style={{ marginTop: 2 }}>
-                  {cw.correction_count} correction{cw.correction_count === 1 ? '' : 's'} applied
-                </div>
-              </div>
-              <a
-                className="btn btn-teal"
-                onClick={() => downloadBase64File(cw.file_b64, cw.filename, XLSX_MIME)}
-              >
-                Download Corrected File
-              </a>
-            </div>
-          ))}
-        </div>
-      )}
+      {/* Correction review — the audit produces recommendations only; the
+          reviewer decides each one and the corrected workbook is generated
+          from those decisions (POST /api/corrections/review). Absent entirely
+          when there is nothing to review. */}
+      <CorrectionReview recommendations={recommendations} sessionId={audit.session_id} />
 
       {correctionsSkipped.length > 0 && (
         <div className="card" style={{ marginBottom: 22 }}>
