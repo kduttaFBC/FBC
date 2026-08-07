@@ -334,6 +334,27 @@ async def audit(
                     "reason": correction_outcome["skip_reason"],
                 })
 
+            # Per-loan corrections that were eligible but could not be
+            # written to a single row (corrections.py returns these as
+            # corrections_not_applied on EVERY path, including the success
+            # path). Deliberately NOT part of the if/elif above: a servicer
+            # file can produce a corrected workbook AND still have
+            # individual loans that could not be written, so these two
+            # outcomes are independent, not alternatives.
+            #
+            # Reported verbatim -- the gp/field/reason produced by
+            # corrections.py are surfaced unchanged, with only the servicer
+            # label added and the key renamed to the "SBA GP Number" the
+            # rest of the API response already uses. These never contribute
+            # to correction_count.
+            for not_applied in correction_outcome.get("corrections_not_applied") or []:
+                corrections_skipped.append({
+                    "servicer": display_label,
+                    "SBA GP Number": not_applied.get("gp"),
+                    "field": not_applied.get("field"),
+                    "reason": not_applied.get("reason"),
+                })
+
             # CLIENT-CONFIRMED (2026-08-04, revised): captured BEFORE the
             # _cycle_month pop below. Collect EVERY distinct nonblank cycle
             # month across servicers, not just the first — combining

@@ -126,7 +126,8 @@ def _is_blank_value(value):
 def consolidate_cycle_postings(servicer_inputs_df):
     """Returns one consolidated cycle record per SBA GP Number:
       posting_count, loan_status, dq_status (both from the LAST chronological
-      posting), received/principal/net_interest (SUMMED), scheduled (a
+      posting), received/servicing_fee/principal/net_interest (SUMMED),
+      scheduled (a
       single value — see below), scheduled_ambiguous (bool),
       scheduled_payment_updated_during_cycle (bool), scheduled_distinct_values
       (list, diagnostic), beginning_balance (FIRST posting), ending_balance
@@ -177,8 +178,9 @@ def consolidate_cycle_postings(servicer_inputs_df):
     si["SBA GP Number"] = _norm_id(si["SBA GP Number"])
     si = si.reset_index(drop=True)  # preserve original row order as the final sort fallback
 
-    numeric_cols = [c for c in ("Payment Received", "Principal", "Net Interest", "Scheduled Payment",
-                                 "Beginning Balance", "Ending Balance") if c in si.columns]
+    numeric_cols = [c for c in ("Payment Received", "Servicing Fee", "Principal", "Net Interest",
+                                 "Scheduled Payment", "Beginning Balance", "Ending Balance")
+                    if c in si.columns]
     for c in numeric_cols:
         si[c] = pd.to_numeric(si[c], errors="coerce")
 
@@ -254,6 +256,7 @@ def consolidate_cycle_postings(servicer_inputs_df):
             "loan_status": effective_last.get("Loan Status", ""),
             "dq_status": effective_last.get("Delinquency Status", ""),
             "received": group["Payment Received"].sum(min_count=1) if "Payment Received" in group.columns else None,
+            "servicing_fee": group["Servicing Fee"].sum(min_count=1) if "Servicing Fee" in group.columns else None,
             "principal": group["Principal"].sum(min_count=1) if "Principal" in group.columns else None,
             "net_interest": group["Net Interest"].sum(min_count=1) if "Net Interest" in group.columns else None,
             "scheduled": scheduled,
@@ -296,7 +299,7 @@ def consolidate_cycle_postings(servicer_inputs_df):
         })
 
     return pd.DataFrame(rows).set_index("SBA GP Number") if rows else pd.DataFrame(
-        columns=["posting_count", "loan_status", "dq_status", "received", "principal", "net_interest",
+        columns=["posting_count", "loan_status", "dq_status", "received", "servicing_fee", "principal", "net_interest",
                  "scheduled", "scheduled_ambiguous", "scheduled_payment_updated_during_cycle",
                  "scheduled_distinct_values", "beginning_balance",
                  "ending_balance", "interest_from", "interest_to", "lender_loan_number",
@@ -627,8 +630,36 @@ def _missed_count_to_status(missed_count):
 PAYMENT_SUFFICIENCY_THRESHOLD = 0.80
 
 
-def _apply_payment_transition(prior_missed_count, payment_received, scheduled_payment):
+def _apply_payment_transition(prior_missed_count, payment_received, scheduled_payment,
+                              servicing_fee=None):
     """Returns (new_missed_count, payment_equivalents_removed).
+
+    ADJUSTED PAYMENT TOTAL — the sufficiency numerator is
+    Payment Received + Servicing Fee, summed across every posting for the
+    loan this cycle, matching the SRF template's own column AD
+    (=SUMIF(Payment Received) + SUMIF(Servicing Fee)). Payment Received is
+    reported NET of the servicing fee — see the PAY-02 note on the fee
+    being "netted out before remittance" — so judging sufficiency on the
+    net figure measures what the servicer remitted rather than what the
+    borrower paid. Adding the fee back restores the gross amount, which is
+    what the 80% bar is meant to test.
+
+    servicing_fee is optional and treated as zero when absent: not every
+    servicer template carries the column (same caveat PAY-02 records).
+    A servicer reporting no fee therefore behaves exactly as before.
+
+    NOT YET CLIENT-CONFIRMED. The 0.80 threshold is confirmed
+    (see PAYMENT_SUFFICIENCY_THRESHOLD); the composition of the numerator
+    is not. Measured impact on the June and July 2026 Peoples Bank cycles:
+    zero loans change count. Confirmation should be obtained before this is
+    relied upon for a cycle where it does bite.
+
+    The fee is added ONLY to the positive-payment sufficiency judgement.
+    The negative/reversal branch below continues to key off the raw
+    Payment Received amount and its client-confirmed (2026-08-04, second
+    revision) deficiency formula, which is deliberately untouched here: a
+    small negative payment plus a fee could otherwise sum to a positive
+    figure and silently bypass the reversal path altogether.
 
     new_missed_count is None when the transition genuinely cannot be
     computed — callers MUST treat None as "this cycle's result is
@@ -690,6 +721,11 @@ def _apply_payment_transition(prior_missed_count, payment_received, scheduled_pa
         payment_received = 0
     received = float(payment_received)
 
+    # Adjusted Payment Total, used for POSITIVE-payment sufficiency only.
+    fee = 0.0
+    if servicing_fee is not None and not pd.isna(servicing_fee):
+        fee = float(servicing_fee)
+
     if received < 0:
         if (
             scheduled_payment is None
@@ -725,7 +761,10 @@ def _apply_payment_transition(prior_missed_count, payment_received, scheduled_pa
         # by — hold steady rather than risk a divide-by-zero
         return prior_missed_count, None
 
-    ratio = received / float(scheduled_payment)
+    # Adjusted Payment Total: Payment Received + Servicing Fee, both already
+    # summed across every posting for this loan by consolidate_cycle_postings.
+    adjusted_received = received + fee
+    ratio = adjusted_received / float(scheduled_payment)
 
     if ratio < PAYMENT_SUFFICIENCY_THRESHOLD:
         # received something, but less than 80% of one scheduled payment --
@@ -761,7 +800,7 @@ def _apply_payment_transition(prior_missed_count, payment_received, scheduled_pa
     # payment is already treated as "that installment fully satisfied,"
     # never partially credited.
     installments_covered = 0
-    remaining = received
+    remaining = adjusted_received
     threshold_amount = float(scheduled_payment) * PAYMENT_SUFFICIENCY_THRESHOLD
     while remaining >= threshold_amount:
         installments_covered += 1
@@ -1166,7 +1205,8 @@ _TERMINAL_COLLECTION_KEYWORDS = ("FORECLOSURE", "LIQUIDATION", "REO")
 def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, received, scheduled,
                                 has_payment_cols, memo_df, servicer_name, cycle_month,
                                 srf_dq=None,
-                                scheduled_ambiguous=False):
+                                scheduled_ambiguous=False,
+                                servicing_fee=None):
     """The single shared decision tree for 'what should this loan's Loan
     Status and Delinquency Status be this cycle' — used by BOTH STAT-01 and
     NEG-01 so the two checks can never diverge on the same loan/cycle (they
@@ -1297,7 +1337,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         if scheduled_ambiguous:
             calculated_dq = "UNVERIFIED"
         elif has_payment_cols:
-            new_missed, payment_equivalents_removed = _apply_payment_transition(0, received, scheduled)
+            new_missed, payment_equivalents_removed = _apply_payment_transition(0, received, scheduled, servicing_fee)
             calculated_dq = "UNVERIFIED" if new_missed is None else _missed_count_to_status(new_missed)
             if payment_equivalents_removed is not None:
                 reversal_info = {"payment_equivalents_removed": payment_equivalents_removed}
@@ -1379,7 +1419,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             if received_is_negative and prior_missed is None:
                 calculated_dq = "UNVERIFIED"
             else:
-                new_missed, payment_equivalents_removed = _apply_payment_transition(prior_missed, received, scheduled)
+                new_missed, payment_equivalents_removed = _apply_payment_transition(prior_missed, received, scheduled, servicing_fee)
                 calculated_dq = "UNVERIFIED" if new_missed is None else _missed_count_to_status(new_missed)
                 if payment_equivalents_removed is not None:
                     reversal_info = {"payment_equivalents_removed": payment_equivalents_removed}
@@ -1391,7 +1431,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         elif scheduled_ambiguous:
             calculated_dq = "UNVERIFIED"
         else:
-            new_missed, payment_equivalents_removed = _apply_payment_transition(prior_missed, received, scheduled)
+            new_missed, payment_equivalents_removed = _apply_payment_transition(prior_missed, received, scheduled, servicing_fee)
             calculated_dq = "UNVERIFIED" if new_missed is None else _missed_count_to_status(new_missed)
             if payment_equivalents_removed is not None:
                 reversal_info = {"payment_equivalents_removed": payment_equivalents_removed}
@@ -1536,6 +1576,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             gp, srf_status, soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
             has_payment_cols, memo_df, servicer_name, cycle_month,
             srf_dq=srf_dq, scheduled_ambiguous=scheduled_ambiguous,
+            servicing_fee=row.get("servicing_fee"),
         )
 
         # Captured HERE — unconditionally, before any skip-check below can
@@ -1932,6 +1973,7 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
             gp, srf_status, soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
             has_payment_cols, memo_df, servicer_name, cycle_month,
             srf_dq=srf_dq, scheduled_ambiguous=bool(row.get("scheduled_ambiguous")),
+            servicing_fee=row.get("servicing_fee"),
         )
         # NEG-01 only ever DISPLAYS calculated_dq for manual-review context
         # (Current Period Status (Calculated)) — it never re-derives a
