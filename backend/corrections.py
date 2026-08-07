@@ -54,6 +54,39 @@ WARNING_REASONS = {
 
 _NOT_A_REAL_STATUS = {"", "UNVERIFIED", "REVIEW", "NAN", "NONE"}
 
+# Delinquency Status values a servicer may legitimately report. A value
+# outside this set is a SOURCE DATA DOMAIN DEFECT, not merely a mismatch:
+# it is dropped from every portfolio bucket while remaining in Outstanding,
+# so the summary stops tying to itself.
+#
+# Observed live: Peoples Bank July 2026 loan 4017399101 reported
+# 'FORCLOSURE' — misspelled, AND a Loan Status value sitting in a
+# Delinquency Status field. STAT-01 calculated 30 DAYS for it, which is
+# arithmetically right, and auto-applying that would have quietly normalised
+# the defect away: the servicer never learns their template is being filled
+# in wrong, and it recurs next cycle. 584,023.61 of balance was unbucketed
+# by this one value.
+_PERMITTED_DQ_STATUS = {
+    "CURRENT", "DELINQUENT",
+    "30 DAYS", "60 DAYS", "90 DAYS", "120 DAYS",
+    "150 DAYS", "150+ DAYS", "180 DAYS", "210 DAYS",
+}
+
+REVIEW_REASON_CROSS_DOMAIN = (
+    "Reported Delinquency Status contains an invalid cross-domain value."
+)
+
+
+def _is_cross_domain_dq(value):
+    """True when a reported Delinquency Status is outside the permitted
+    domain — a misspelling, or a value belonging to another field."""
+    if value is None:
+        return False
+    v = str(value).strip().upper()
+    if not v or v in _NOT_A_REAL_STATUS:
+        return False
+    return v not in _PERMITTED_DQ_STATUS
+
 # --- Loan Status safety rules (client-specified, independent of checks.py) --
 #
 # These are checked here, in corrections.py, regardless of what checks.py's
@@ -101,6 +134,7 @@ CORRECTION_LOG_HEADERS = [
     "Institution", "Source Worksheet", "Excel Row Numbers", "Rows Updated", "SBA GP Number",
     "Field Updated", "Original Value", "Corrected Value", "Audit Check ID",
     "Eligibility Rule", "Timestamp", "Skipped Row References",
+    "Review Status", "Review Reason",
 ]
 
 
@@ -240,7 +274,8 @@ def build_eligible_corrections(correction_data):
         gp = c.get("gp")
         excel_rows, skipped_row_refs = _clean_excel_rows(c.get("excel_rows"))
 
-        def _emit(field, corrected_value, eligibility_rule):
+        def _emit(field, corrected_value, eligibility_rule,
+                  review_required=False, review_reason=None):
             eligible.append({
                 "gp": gp,
                 "excel_rows": excel_rows,
@@ -250,6 +285,18 @@ def build_eligible_corrections(correction_data):
                 "field": field,
                 "corrected_value": corrected_value,
                 "eligibility_rule": eligibility_rule,
+                # A correction flagged for review is PROPOSED, never written.
+                # It is still recorded in the Correction Log so the defect is
+                # visible and can be raised with the servicer, rather than
+                # disappearing the way an eligibility-layer `continue` would
+                # make it disappear.
+                "review_required": bool(review_required),
+                "review_reason": review_reason,
+                # The value actually reported by the servicer, carried so a
+                # proposed-only row can show what needs reviewing without
+                # having opened the workbook to read the cells.
+                "reported_value": c.get("srf_dq") if field == "Delinquency Status"
+                                  else c.get("srf_status"),
             })
 
         # --- Delinquency Status -------------------------------------------------
@@ -258,7 +305,14 @@ def build_eligible_corrections(correction_data):
             and c.get("dq_match") is False  # never True/"REVIEW" — REVIEW means UNVERIFIED, already excluded upstream
             and _is_real_dq_value(c.get("calculated_dq"))
         ):
-            _emit("Delinquency Status", str(c["calculated_dq"]).strip().upper(), "STAT-01 deterministic calculation")
+            _cross_domain = _is_cross_domain_dq(c.get("srf_dq"))
+            _emit(
+                "Delinquency Status",
+                str(c["calculated_dq"]).strip().upper(),
+                "STAT-01 deterministic calculation",
+                review_required=_cross_domain,
+                review_reason=REVIEW_REASON_CROSS_DOMAIN if _cross_domain else None,
+            )
 
         # --- Loan Status -> DEFERRED (confirmed Full P&I only, v1) --------------
         # expected_loan_status_raw == "DEFERRED" only ever gets set by a
@@ -407,6 +461,8 @@ def _apply_one_correction(wb, corr):
         )
 
     return True, {
+        "review_status": "Applied",
+        "review_reason": None,
         "sheet_name": sheet_name,
         "excel_rows": updated_rows,
         "rows_updated": len(updated_rows),
@@ -446,6 +502,8 @@ def _add_correction_log_sheet(wb, applied_rows, institution, timestamp):
             r["eligibility_rule"],
             timestamp,
             "; ".join(f"{s['row_ref']} ({s['reason']})" for s in r.get("skipped_rows") or []),
+            r.get("review_status") or "Applied",
+            r.get("review_reason") or "",
         ]
         for r in applied_rows
     ]
@@ -522,6 +580,42 @@ def generate_corrected_workbook(file_bytes, original_filename, institution, stat
     applied_rows = []
     corrections_not_applied = []
     for corr in eligible:
+        # CROSS-DOMAIN SOURCE DEFECT -> proposed, never written.
+        # The calculation is deterministic and correct, but applying it
+        # would normalise away an invalid value in the servicer's own file:
+        # they would never learn the field is being populated from the wrong
+        # domain, and it would recur every cycle. The proposal is recorded in
+        # the Correction Log marked "Human review required", and reported to
+        # the caller as not applied, so it is visible in both places without
+        # being silently actioned.
+        if corr.get("review_required"):
+            applied_rows.append({
+                "sheet_name": corr.get("sheet_name"),
+                "excel_rows": corr.get("excel_rows") or [],
+                "rows_updated": 0,
+                "gp": corr["gp"],
+                "field": corr["field"],
+                "original_values": ([corr.get("reported_value")]
+                                    if corr.get("reported_value") is not None else []),
+                "corrected_value": corr["corrected_value"],
+                "eligibility_rule": corr["eligibility_rule"],
+                "skipped_rows": [],
+                "review_status": "Human review required",
+                "review_reason": corr.get("review_reason"),
+            })
+            corrections_not_applied.append({
+                "gp": corr["gp"], "field": corr["field"],
+                "reason": (
+                    f"Human review required — {corr.get('review_reason')} "
+                    f"Reported value: {corr.get('reported_value')!r}. "
+                    f"The calculated value ({corr['corrected_value']}) is "
+                    f"recorded in the Correction Log as proposed but was not "
+                    f"written; the servicer should be informed so the error "
+                    f"does not recur."
+                ),
+            })
+            continue
+
         ok, detail = _apply_one_correction(wb, corr)
         if ok:
             applied_rows.append(detail)
@@ -534,7 +628,8 @@ def generate_corrected_workbook(file_bytes, original_filename, institution, stat
             # template mismatch silently erasing all trace of the attempt.
             corrections_not_applied.append({"gp": corr["gp"], "field": corr["field"], "reason": detail})
 
-    if not applied_rows:
+    really_applied = [r for r in applied_rows if r.get("rows_updated")]
+    if not really_applied:
         return {
             **empty,
             "skip_reason": "No corrections could be safely verified against this file's actual layout.",
@@ -552,7 +647,7 @@ def generate_corrected_workbook(file_bytes, original_filename, institution, stat
     return {
         "file_bytes": buf.getvalue(),
         "filename": filename,
-        "correction_count": len(applied_rows),
+        "correction_count": len(really_applied),
         "skip_reason": None,
         "corrections_not_applied": corrections_not_applied,
     }

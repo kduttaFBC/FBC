@@ -33,6 +33,7 @@ import report as report_mod
 import chatbot as chatbot_mod
 import file_readers
 import corrections as corrections_mod
+import preflight as preflight_mod
 
 
 load_dotenv(override=False)
@@ -281,6 +282,45 @@ async def audit(
 
         for uploaded in servicer_files:
             file_bytes = await uploaded.read()
+
+            # FORMULA / CACHE PREFLIGHT — runs on the raw bytes BEFORE
+            # Calamine, which exposes cached VALUES only and therefore cannot
+            # tell a computed cell from a pasted literal, nor a populated
+            # cache from an absent one.
+            #
+            # FORM-03 is a BLOCKING RE-INGESTION CONTROL. A workbook written
+            # by openpyxl carries its formulas but no cached values, because
+            # openpyxl does not evaluate. Calamine then reads those columns
+            # as blank. Measured on Peoples_Bank_July_2026_CORRECTED.xlsx —
+            # this application's own output — 60 of 60 rows returned blank
+            # Loan Payment Instance, Last Payment Instance? and Servicing
+            # Fee. Ingesting that file would sort postings by date instead of
+            # instance, see no final-payment flag on any posting, and
+            # evaluate payment sufficiency with a zero servicing fee.
+            #
+            # Corrected workbooks are OUTBOUND ONLY. This is the control that
+            # enforces it: one must be opened and recalculated in Excel
+            # before it can re-enter the pipeline.
+            preflight = preflight_mod.preflight_workbook(
+                file_bytes, filename=uploaded.filename,
+            )
+            if not preflight["ok"]:
+                blocking = [f for f in preflight["findings"]
+                            if f["severity"] == "FAIL"]
+                return JSONResponse(status_code=400, content={
+                    "error": (
+                        f"'{uploaded.filename}' cannot be ingested: "
+                        f"{blocking[0]['detail'] if blocking else 'preflight failed'}"
+                    ),
+                    "preflight": {
+                        "filename": uploaded.filename,
+                        "sheet": preflight["sheet"],
+                        "data_rows": preflight["data_rows"],
+                        "rows_affected": preflight["rows_affected"],
+                        "findings": blocking,
+                    },
+                })
+
             try:
                 soup_key, display_label, loan_terms_df, servicer_inputs_df, deal = file_readers.read_servicer_file(
                     file_bytes, filename=uploaded.filename
