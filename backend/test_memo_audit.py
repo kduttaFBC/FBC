@@ -447,6 +447,83 @@ class MemoCoverageResultTests(unittest.TestCase):
         self.assertEqual(classified.iloc[0]["memo_row_class"], ROW_CLASS_JOINED)
 
 
+class DeferralTypeClassificationTests(unittest.TestCase):
+    """classify_deferral_type — evaluation order and the widened partial set.
+
+    Every string here is real Servicer Action text from the delivered Servicer
+    Memo Summary, not invented. A false "full" is the dangerous direction: it
+    makes STAT-01 advance the delinquency rank +1/cycle regardless of payment
+    and it gates corrections.py's automatic Loan Status -> DEFERRED write.
+    """
+
+    def test_evaluation_order_full_beats_partial(self):
+        # The ordering guarantee: text naming BOTH principal and interest
+        # contains a principal-only phrase too, and must still read as full.
+        for text in ("3-month full principal and interest deferral",
+                     "deferment of principal and interest",
+                     "deferral of principal & interest for 90 days"):
+            with self.subTest(text=text):
+                self.assertEqual(file_readers.classify_deferral_type(text), "full")
+
+    def test_explicit_full_pni_spellings(self):
+        for text in ("full P&I deferral", "P & I deferment", "3 mos P and I deferment",
+                     "PNI deferral", "principal and interest", "principal & interest"):
+            with self.subTest(text=text):
+                self.assertEqual(file_readers.classify_deferral_type(text), "full")
+
+    def test_short_form_tokens_are_word_bounded(self):
+        # "pni" as a bare substring appears inside ordinary words. Under plain
+        # substring matching this text would force "full" and mask a genuine
+        # principal-only deferral; word-bounded, it correctly reads partial.
+        text = "Compnie Holdings LLC - 3-month principal deferment"
+        self.assertIn("pni", text.lower())  # the premise this test guards
+        self.assertEqual(file_readers.classify_deferral_type(text), "partial")
+
+    def test_principal_only_phrasings_now_classify_partial(self):
+        # The 11 rows the old two-keyword list misread as full.
+        for text in ("3- month principal deferment",
+                     "3-month deferment of principal",
+                     "3-month principal deferment",
+                     "6M principal deferral",
+                     "deferring principal for 3 months"):
+            with self.subTest(text=text):
+                self.assertEqual(file_readers.classify_deferral_type(text), "partial")
+
+    def test_interest_still_being_paid_is_partial(self):
+        # If the servicer says interest is still being paid, only principal is
+        # deferred — the brief's headline false-full cases.
+        for text in ("3-month deferment of principal paying interest",
+                     "2-month deferment with $7200 interest payments"):
+            with self.subTest(text=text):
+                self.assertEqual(file_readers.classify_deferral_type(text), "partial")
+
+    def test_original_two_keywords_still_work(self):
+        self.assertEqual(file_readers.classify_deferral_type("principal only deferral"), "partial")
+        self.assertEqual(file_readers.classify_deferral_type("interest only period"), "partial")
+
+    def test_real_memo_corpus_full_partial_split(self):
+        # Locks the measured split so a future keyword edit can't silently
+        # move rows between full and partial.
+        corpus_full = [
+            "3-month full principal and interest deferral",
+            "3 mos P and I deferment ",
+            "Second time three-month deferment of principal and interest",
+        ]
+        corpus_partial = [
+            "3-month deferment of principal paying interest",
+            "2-month deferment with $7200 interest payments",
+            "6M principal deferral",
+            "principal only",
+            "additional 6M of the interest only term",
+        ]
+        for t in corpus_full:
+            with self.subTest(full=t):
+                self.assertEqual(file_readers.classify_deferral_type(t), "full")
+        for t in corpus_partial:
+            with self.subTest(partial=t):
+                self.assertEqual(file_readers.classify_deferral_type(t), "partial")
+
+
 class ReaderPhantomRowTests(unittest.TestCase):
     """Why the real file measures 0 phantom, and what happens when a phantom
     row DOES survive the reader.

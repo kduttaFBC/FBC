@@ -125,20 +125,66 @@ def memo_lender_soup_key(lender_value):
 # freeze/auto-advance rule. Anything not matching this is treated as a full
 # P&I deferral. Order matters: "principal and interest" / "P&I" / "PNI" must
 # NOT be misclassified as partial just because they also contain "principal".
-_PARTIAL_DEFERRAL_KEYWORDS = ("principal only", "interest only")
-_FULL_PNI_OVERRIDE_KEYWORDS = ("principal and interest", "p&i", "pni", "p & i")
+# Checked FIRST, and it has to be: text naming BOTH principal and interest is
+# a full P&I deferral even though it also contains the word "principal", which
+# several of the partial patterns below would otherwise match.
+#
+# Long phrases match as plain substrings. The short forms are word-bounded
+# instead, because "pni" / "p and i" as bare substrings can appear inside
+# unrelated words.
+_FULL_PNI_OVERRIDE_KEYWORDS = ("principal and interest", "principal & interest")
+_FULL_PNI_TOKEN_RE = re.compile(r"\b(?:p\s*&\s*i|p\s+and\s+i|pni)\b")
+
+# Servicer Action free text identifying a PRINCIPAL-ONLY (or interest-only)
+# deferral. Widened 2026-08-07 after measuring the delivered Servicer Memo
+# Summary: the previous list held only the literal strings "principal only"
+# and "interest only", so every OTHER way of writing a principal-only
+# deferral fell through to the "full" default below. That misclassified 11 of
+# 68 Deferred rows -- among them
+#
+#   "3-month deferment of principal paying interest"   (interest IS paid)
+#   "2-month deferment with $7200 interest payments"   (interest IS paid)
+#   "3-month principal deferment" / "6M principal deferral"
+#
+# all of which are partial deferrals being read as a full P&I freeze. That is
+# the dangerous direction: "full" is what makes STAT-01 advance the
+# delinquency rank +1/cycle regardless of payment, and what gates
+# corrections.py's automatic Loan Status -> DEFERRED write.
+#
+# "paying interest" / "interest payment" are included on the same logic: if
+# the servicer says interest is still being paid, principal alone is deferred.
+# They cannot swallow a genuine full deferral, because any text naming both
+# principal and interest is caught by the override above first.
+_PARTIAL_DEFERRAL_KEYWORDS = (
+    "principal only", "interest only",
+    "principal deferment", "principal deferral", "principal payment deferral",
+    "deferment of principal", "deferral of principal", "deferring principal",
+    "paying interest", "interest payment",
+)
 
 
 def classify_deferral_type(servicer_action):
-    """Returns 'partial' for a principal-only/interest-only deferral, 'full'
-    for a full principal-and-interest deferral, based on the memo's free-text
-    Servicer Action description. Defaults to 'full' when ambiguous, since
-    that's the more conservative assumption (payment is checked, not ignored,
-    only under 'partial' — misclassifying 'full' as 'partial' merely falls
-    back to normal calc, while misclassifying 'partial' as 'full' would
-    wrongly ignore real payments)."""
+    """Classifies the memo's free-text Servicer Action as a full P&I or a
+    principal-only/interest-only deferral.
+
+    Evaluation order is load-bearing and must stay exactly:
+
+        1. explicit full P&I  -> "full"
+        2. partial keywords   -> "partial"
+        3. neither            -> the default below
+
+    Step 1 has to come first: text like "deferment of principal and interest"
+    contains a principal-only phrase from step 2, and reading it as partial
+    would be wrong. Anything naming both principal and interest is full.
+
+    The step-3 default is "full", which is the direction that makes STAT-01
+    advance the delinquency rank +1/cycle regardless of payment and that gates
+    corrections.py's automatic Loan Status -> DEFERRED write. Measured against
+    the delivered memo, 9 of 68 Deferred rows reach step 3 on text carrying no
+    payment-type signal at all ("90-Day Deferment", "3 month payment
+    deferral") — see docs/deferralevidencebrief.md."""
     s = str(servicer_action).strip().lower()
-    if any(k in s for k in _FULL_PNI_OVERRIDE_KEYWORDS):
+    if any(k in s for k in _FULL_PNI_OVERRIDE_KEYWORDS) or _FULL_PNI_TOKEN_RE.search(s):
         return "full"
     if any(k in s for k in _PARTIAL_DEFERRAL_KEYWORDS):
         return "partial"
