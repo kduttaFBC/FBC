@@ -497,6 +497,19 @@ class DeferralTypeClassificationTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(file_readers.classify_deferral_type(text), "partial")
 
+    def test_signal_free_text_is_unclassified_not_full(self):
+        # The 9 rows carrying no payment-type signal at all. Returning "full"
+        # for these asserted the one thing the servicer never wrote down.
+        for text in ("three months deferment", "one-time 90-day deferment",
+                     "30-day deferment", "90-Day Deferment",
+                     "3 month payment deferral", "One-Time 90-Day Defermen"):
+            with self.subTest(text=text):
+                self.assertEqual(file_readers.classify_deferral_type(text), "unclassified")
+
+    def test_unclassified_is_never_returned_for_typed_text(self):
+        self.assertEqual(file_readers.classify_deferral_type("full P&I deferral"), "full")
+        self.assertEqual(file_readers.classify_deferral_type("6M principal deferral"), "partial")
+
     def test_original_two_keywords_still_work(self):
         self.assertEqual(file_readers.classify_deferral_type("principal only deferral"), "partial")
         self.assertEqual(file_readers.classify_deferral_type("interest only period"), "partial")

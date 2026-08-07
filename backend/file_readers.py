@@ -171,24 +171,40 @@ def classify_deferral_type(servicer_action):
 
         1. explicit full P&I  -> "full"
         2. partial keywords   -> "partial"
-        3. neither            -> the default below
+        3. neither            -> "unclassified"
 
     Step 1 has to come first: text like "deferment of principal and interest"
     contains a principal-only phrase from step 2, and reading it as partial
     would be wrong. Anything naming both principal and interest is full.
 
-    The step-3 default is "full", which is the direction that makes STAT-01
-    advance the delinquency rank +1/cycle regardless of payment and that gates
-    corrections.py's automatic Loan Status -> DEFERRED write. Measured against
-    the delivered memo, 9 of 68 Deferred rows reach step 3 on text carrying no
-    payment-type signal at all ("90-Day Deferment", "3 month payment
-    deferral") — see docs/deferralevidencebrief.md."""
+    Step 3 used to return "full". It no longer does. Measured against the
+    delivered memo, 9 of 68 Deferred rows reach step 3 on text carrying no
+    payment-type signal whatsoever — "three months deferment", "90-Day
+    Deferment", "3 month payment deferral", "30-day deferment". Returning
+    "full" for those asserted the one thing the servicer never wrote down,
+    in the direction that gates corrections.py's automatic Loan Status ->
+    DEFERRED write.
+
+    "unclassified" is not a third kind of deferral. It means the text does
+    not say. STAT-01 raises DEFERRAL DATA QUALITY WARNING for it, which
+    surfaces the loan for review and excludes it from auto-correction via
+    corrections.WARNING_REASONS.
+
+    IMPORTANT — this changes DISCLOSURE, not ARITHMETIC. An unclassified
+    deferral still rides the full-P&I calculation path it rode before (see
+    checks._FULL_PNI_CALC_TYPES), so no delinquency value and no Portfolio
+    Summary bucket moves as a result of this classification. That is
+    deliberate: switching an unclassified loan onto the no-deferral path
+    would silently assert delinquency on evidence we have just declared
+    unknown — measured at $280,162.64 moving from Current to 60 Days on one
+    Millennium loan. Which way that calculation should go is a client
+    decision, not a side effect of a classifier default."""
     s = str(servicer_action).strip().lower()
     if any(k in s for k in _FULL_PNI_OVERRIDE_KEYWORDS) or _FULL_PNI_TOKEN_RE.search(s):
         return "full"
     if any(k in s for k in _PARTIAL_DEFERRAL_KEYWORDS):
         return "partial"
-    return "full"
+    return "unclassified"
 
 # Fixed set of servicers this client works with. Used to identify the
 # servicer from the uploaded filename, which is far more reliable than

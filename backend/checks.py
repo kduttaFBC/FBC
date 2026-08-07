@@ -964,6 +964,40 @@ def _check_change_in_terms_resume(candidates, soup_status, cycle_month):
     return None
 
 
+# Deferral types that take the FULL P&I calculation path below.
+#
+# "unclassified" is here on purpose, and it is a disclosure/arithmetic split
+# rather than a claim that unclassified means full. file_readers.
+# classify_deferral_type returns "unclassified" for Servicer Action text with
+# no payment-type signal at all ("three months deferment"); those rows used to
+# return "full" outright, so keeping them on this path leaves every calculated
+# delinquency value and every Portfolio Summary bucket exactly where it was,
+# while STAT-01 raises DEFERRAL DATA QUALITY WARNING so a human sees the
+# uncertainty and corrections.py refuses to auto-write anything.
+#
+# Moving them off this path is NOT a safe default: it would apply the
+# no-deferral math instead, skipping the client-confirmed resume reset and
+# asserting delinquency on evidence just declared unknown. Measured on the
+# June-2026 run, that single switch moved $280,162.64 from Current into
+# 60 Days on one Millennium loan. Which way it should go is a client
+# decision, not a side effect of a classifier default.
+#
+# corrections.py deliberately does NOT use this set — its Loan Status ->
+# DEFERRED gate stays a strict `== "full"`, so an unclassified deferral can
+# never trigger an automatic status write even if its warning were ever
+# dropped from WARNING_REASONS.
+_FULL_PNI_CALC_TYPES = ("full", "unclassified")
+
+_UNCLASSIFIED_TYPE_WARNING = (
+    "The Servicer Memo's Servicer Action text does not state whether this is a "
+    "full principal-and-interest deferral or a principal-only/interest-only "
+    "one, so the deferral type could not be established from the memo. The "
+    "delinquency calculation for this cycle is unchanged from prior behavior "
+    "(it still uses the full P&I path), but this loan is excluded from "
+    "automatic correction and needs a human to confirm the deferral type."
+)
+
+
 def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     """Finds the memo row (if any) whose deferral window covers cycle_month
     for this loan, and returns (deferral_info, warning, warning_type):
@@ -1110,7 +1144,7 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     warning = None
     warning_type = None
     months_since_start = (cycle_period.year - chosen_start_month.year) * 12 + (cycle_period.month - chosen_start_month.month)
-    if deferral_type == "full":
+    if deferral_type in _FULL_PNI_CALC_TYPES:
         # Checked in this order:
         #   1. start — the cycle containing Deferral Start Date
         #   2. resume — the cycle containing an ACTUAL Regular Payment
@@ -1147,6 +1181,15 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
             )
     else:
         phase = None
+
+    # The memo names a deferral but not its type. Surface it: the loan reaches
+    # the reviewer and corrections.py's WARNING_REASONS excludes it from every
+    # auto-correction. Only set when the phase logic above hasn't already
+    # raised a more specific deferral_dates warning — that one says something
+    # narrower about the same record, and replacing it would lose detail.
+    if deferral_type == "unclassified" and warning is None:
+        warning = _UNCLASSIFIED_TYPE_WARNING
+        warning_type = "deferral_dates"
 
     return {"deferral_type": deferral_type, "phase": phase, "months_since_start": months_since_start}, warning, warning_type
 
@@ -1338,7 +1381,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             calculated_dq = _missed_count_to_status(max(candidates)) if candidates else "UNVERIFIED"
         else:
             calculated_dq = "CURRENT"
-    elif deferral and deferral["deferral_type"] == "full" and deferral["phase"] == "resume":
+    elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES and deferral["phase"] == "resume":
         # Client-confirmed: the cycle containing Regular Payment Resume
         # Date resets the delinquency baseline to CURRENT, then applies
         # normal payment evaluation THIS cycle — the rank accumulated
@@ -1380,7 +1423,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             )
         else:
             expected_loan_status = srf_status
-    elif deferral and deferral["deferral_type"] == "full" and deferral["phase"] == "resume_unverified":
+    elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES and deferral["phase"] == "resume_unverified":
         # Client-confirmed: past Deferral End Date with no known Regular
         # Payment Resume Date. Do NOT advance the deferral rank (that would
         # assume still-deferred), do NOT reset to CURRENT (that would
@@ -1391,7 +1434,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         # regardless of whether this coincidentally "matches."
         expected_loan_status = None
         calculated_dq = str(soup_dq_raw).strip().upper()
-    elif deferral and deferral["deferral_type"] == "full":
+    elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES:
         expected_loan_status = "DEFERRED"
         # CLIENT-CONFIRMED (2026-08-03): an external deferral (one initiated
         # by a servicer memo, not necessarily by a missed payment) does NOT

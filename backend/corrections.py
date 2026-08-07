@@ -429,6 +429,12 @@ def build_eligible_corrections(correction_data):
         if (
             "LOAN STATUS MISMATCH" in reasons
             and c.get("expected_loan_status_raw") == "DEFERRED"
+            # Strict equality, deliberately NOT checks._FULL_PNI_CALC_TYPES.
+            # An "unclassified" deferral rides the full P&I path for the
+            # delinquency ARITHMETIC (so no number moves on unknown evidence),
+            # but it must never justify writing a Loan Status. Its DEFERRAL
+            # DATA QUALITY WARNING already excludes the loan above; this keeps
+            # it excluded even if that warning were ever dropped.
             and c.get("deferral_type") == "full"
             and c.get("deferral_phase") in ("start", "mid")
             and not _is_terminal_loan_status(c.get("srf_status"))
