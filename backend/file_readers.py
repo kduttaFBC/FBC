@@ -27,6 +27,15 @@ SERVICE_MEMO_FIELDS = [
     "Regular Payment Resume Date",
 ]
 
+# Deferral date column -> the column read_service_memo stores that cell's
+# ORIGINAL text in, before pd.to_datetime(errors="coerce") flattens
+# unparseable values to NaT. Diagnostics only (memo_audit.py).
+MEMO_RAW_DATE_COLUMNS = {
+    "Deferral Start Date": "_raw_deferral_start",
+    "Deferral End Date": "_raw_deferral_end",
+    "Regular Payment Resume Date": "_raw_deferral_resume",
+}
+
 # Centralized, explicit map from a servicer's canonical identity (the same
 # soup_key value SERVICER_SOUP_KEYS/filter_soup_by_servicer already use — a
 # note-series year like "2025"/"2024" is stripped out BEFORE this lookup, it
@@ -51,6 +60,10 @@ SERVICE_MEMO_FIELDS = [
 # isn't silently broken until someone adds it -- see
 # checks._lookup_deferral's docstring for that fallback behavior.
 MEMO_LENDER_ALIASES = {
+    # NB: the "&" spelling is the canonical soup_key -- the frontend's
+    # SERVICER_SOUP_KEYS maps its "Community Bank and Trust" display label TO
+    # this exact string, so this key must stay spelled with "&" to be found
+    # by MEMO_LENDER_ALIASES.get(servicer_key) in checks._lookup_deferral.
     "Community Bank & Trust": ["Community Bank & Trust"],
     "Millennium Bank": ["Millennium Bank", "Millennium Bank, IL"],
     "Lendistry": ["Lendistry", "Lendistry SBLC, LLC, CA"],
@@ -70,6 +83,41 @@ MEMO_LENDER_ALIASES = {
     "FinWise": ["FinWise"],
     "X-Caliber": ["X-Caliber"],
 }
+
+
+def _build_alias_index(alias_table):
+    """Reverse index of MEMO_LENDER_ALIASES: {normalized memo Lender spelling
+    -> canonical soup_key}. Lets a caller answer "is this Lender string known
+    to ANY servicer?" in one lookup, which is what makes an unrecognized memo
+    Lender a reportable finding instead of a silent zero-match.
+
+    A spelling claimed by two different soup_keys is a table defect (it would
+    make memo attribution ambiguous). This does NOT raise on one -- an import-
+    time exception would take the whole app down over a table typo -- it keeps
+    the first binding and leaves detection to the alias-table drift test in
+    test_memo_audit.py, which fails loudly at test time instead."""
+    index = {}
+    for soup_key, spellings in alias_table.items():
+        for spelling in spellings:
+            index.setdefault(str(spelling).strip().lower(), soup_key)
+    return index
+
+
+_ALIAS_TO_SOUP_KEY = _build_alias_index(MEMO_LENDER_ALIASES)
+
+
+def memo_lender_soup_key(lender_value):
+    """Returns the canonical soup_key for a memo "Lender" cell, or None if
+    that exact spelling isn't catalogued in MEMO_LENDER_ALIASES. None means
+    "no servicer in the alias table claims this spelling" -- the condition
+    that silently yields zero SOUP matches today."""
+    if lender_value is None:
+        return None
+    s = str(lender_value).strip().lower()
+    if not s:
+        return None
+    return _ALIAS_TO_SOUP_KEY.get(s)
+
 
 # Servicer Action free text that identifies a PRINCIPAL-ONLY (or interest-only)
 # deferral, which follows normal payment-vs-scheduled delinquency math (just
@@ -451,13 +499,24 @@ def read_service_memo(file_bytes):
       - "gp_sba":    normalized digit-only SBA Loan ID
       - "gp_lender": normalized digit-only Lender Loan ID
       - "deferral_type": "full" or "partial", from classify_deferral_type()
+
+    Also carries the source row's own position ("_sheet_name",
+    "_header_excel_row", "_excel_row", exactly as read_servicer_file already
+    does) and, for each of the three deferral date columns, the cell's
+    ORIGINAL text under the matching MEMO_RAW_DATE_COLUMNS name. Both are for
+    diagnostics: pd.to_datetime(errors="coerce") turns a literal "n/a" and a
+    genuinely empty cell into the same NaT, so without the raw text there is
+    no way to tell "the servicer asserted a deferral but wrote no usable
+    date" from "no date was claimed" -- and no way to point a reviewer at the
+    row to fix. Nothing in the reconciliation path reads either; see
+    memo_audit.py.
     """
     wb = _load_workbook(file_bytes)
     rows_cache = {}
     best = _find_best_header(wb, SERVICE_MEMO_FIELDS, _rows_cache=rows_cache)
     if best["matches"] < len(SERVICE_MEMO_FIELDS) // 2:
         raise ValueError("Could not find the expected Servicer Memo Summary columns in this file.")
-    df = _rows_to_df(rows_cache[best["sheet_name"]], best["row_idx"])
+    df = _rows_to_df(rows_cache[best["sheet_name"]], best["row_idx"], sheet_name=best["sheet_name"])
     rows_cache.clear()
     del wb
 
@@ -467,6 +526,11 @@ def read_service_memo(file_bytes):
         df["gp_lender"] = df["Lender Loan ID"].apply(normalize_memo_loan_id)
     if "Servicer Action" in df.columns:
         df["deferral_type"] = df["Servicer Action"].apply(classify_deferral_type)
+
+    # Snapshot the raw text BEFORE the coercion below overwrites it.
+    for col, raw_col in MEMO_RAW_DATE_COLUMNS.items():
+        if col in df.columns:
+            df[raw_col] = df[col].map(lambda v: "" if v is None else str(v).strip())
 
     for col in ("Deferral Start Date", "Deferral End Date", "Regular Payment Resume Date", "Report Date"):
         if col in df.columns:

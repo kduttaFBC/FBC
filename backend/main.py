@@ -36,6 +36,7 @@ import chatbot as chatbot_mod
 import file_readers
 import corrections as corrections_mod
 import preflight as preflight_mod
+import memo_audit as memo_audit_mod
 
 
 load_dotenv(override=False)
@@ -154,7 +155,12 @@ def _resolve_portfolio_summary_cycle_month(cycle_months):
 
 
 REPORT_ALWAYS_EXCLUDED_CHECK_IDS = {"PAY-01", "PAY-02", "DUP-01", "PORT-01"}
-REPORT_CONDITIONAL_CHECK_IDS = {"POP-01", "NEG-01"}  # included only when issues_found > 0
+# included only when issues_found > 0. MEMO-01 belongs here rather than in the
+# always-excluded tier: a clean memo file needs no tab, but an unrecognized
+# Lender spelling or an orphaned memo row means real deferral evidence never
+# reached the audit at all, which a reviewer has to see in the workbook itself
+# -- the whole point of the check is that this failure is otherwise silent.
+REPORT_CONDITIONAL_CHECK_IDS = {"POP-01", "NEG-01", "MEMO-01"}
 
 
 def _filter_report_results(all_results):
@@ -475,6 +481,32 @@ async def audit(
         )
         if mixed_period_error:
             return JSONResponse(status_code=400, content={"error": mixed_period_error})
+
+        # MEMO-01 — Servicer Memo Coverage. Runs ONCE per audit, after the
+        # per-servicer loop, because the memo workbook is a single global file
+        # rather than per-servicer input: inside the loop it would re-sweep the
+        # same memo_df once per uploaded servicer and report every finding N
+        # times.
+        #
+        # This is a STANDALONE DIAGNOSTIC over the memo file. It does not feed
+        # STAT-01, corrections.py, or any calculation — it only reports. It
+        # exists because checks._lookup_deferral runs per loan and therefore
+        # cannot see a memo row whose loan ID is in no population: no loan
+        # iteration ever reaches that row, so no per-loan warning can fire for
+        # it. Today such a row is indistinguishable from "this loan has no
+        # deferral". Sweeping the memo file is the only direction that sees it.
+        #
+        # Population = every SBA GP Number in the SOUP file (all servicers),
+        # not just this run's uploads: a memo row belonging to a servicer that
+        # wasn't uploaded today is a legitimately-absent reconciliation, not a
+        # defective memo row, and must not be reported as one.
+        if memo_df is not None:
+            memo_result, _memo_counts = memo_audit_mod.build_memo_coverage_result(
+                memo_df,
+                soup_df["SBA GP Number"].dropna().tolist() if "SBA GP Number" in soup_df.columns else [],
+            )
+            if memo_result is not None:
+                all_results.append(memo_result)
 
         summary = checks_mod.summarize(all_results, len(soup_df), servicer_loan_counts)
 
