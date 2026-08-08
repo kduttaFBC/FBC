@@ -27,6 +27,7 @@ import pandas as pd
 
 import corrections
 import checks
+import file_readers
 
 
 HEADERS = [
@@ -715,3 +716,126 @@ class BuildEligibleCorrectionsSignatureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnclassifiedDeferralTypeTests(unittest.TestCase):
+    """A deferral whose memo text never states full-P&I vs principal-only.
+
+    classify_deferral_type returns "unclassified" for it rather than assuming
+    "full". Two separate protections must both hold, so that dropping either
+    one still leaves the loan safe:
+
+      1. STAT-01 raises DEFERRAL DATA QUALITY WARNING, which is in
+         WARNING_REASONS and excludes the loan from BOTH correction types.
+      2. The Loan Status -> DEFERRED gate is a strict `== "full"`, so an
+         unclassified deferral cannot qualify even with no warning present.
+    """
+
+    def _entry(self, **overrides):
+        base = dict(
+            reasons=["LOAN STATUS MISMATCH"], dq_match=True, calculated_dq="CURRENT",
+            status_match=False, expected_loan_status_raw="DEFERRED",
+            srf_status="ACTIVE", soup_status="ACTIVE", deferral_phase="start",
+        )
+        base.update(overrides)
+        return _correction_data_entry("1111111111", [4], **base)
+
+    def test_full_deferral_still_produces_the_loan_status_candidate(self):
+        # Control: the same shape with a confirmed full P&I deferral IS
+        # eligible — otherwise the assertions below would pass vacuously.
+        recs, _, _ = _recommend([self._entry(deferral_type="full")])
+        self.assertEqual([r["field"] for r in recs], ["Loan Status"])
+        self.assertEqual(recs[0]["calculated"], "DEFERRED")
+
+    def test_unclassified_is_not_eligible_even_without_a_warning(self):
+        # Protection 2 in isolation: no warning reason present at all.
+        recs, _, _ = _recommend([self._entry(deferral_type="unclassified")])
+        self.assertEqual(recs, [])
+
+    def test_warning_alone_also_excludes_it(self):
+        # Protection 1 in isolation: the warning excludes the loan from every
+        # correction type, not just the deferral one.
+        recs, _, _ = _recommend([self._entry(
+            deferral_type="unclassified",
+            reasons=["LOAN STATUS MISMATCH", "DEFERRAL DATA QUALITY WARNING"],
+        )])
+        self.assertEqual(recs, [])
+
+    def test_warning_also_blocks_an_unrelated_delinquency_correction(self):
+        # The exclusion is loan-level by design (corrections.py:346): a loan
+        # with flagged uncertainty about itself isn't trusted for a different
+        # field either.
+        recs, _, _ = _recommend([_correction_data_entry(
+            "2222222222", [5],
+            reasons=["DELINQUENCY STATUS MISMATCH", "DEFERRAL DATA QUALITY WARNING"],
+        )])
+        self.assertEqual(recs, [])
+
+
+class UnclassifiedDeferralArithmeticTests(unittest.TestCase):
+    """Option B's core guarantee: "unclassified" changes what a reviewer SEES,
+    never what the pipeline COMPUTES.
+
+    An unclassified deferral rides the same full-P&I calculation path it rode
+    when it was silently classified "full", so no delinquency value and no
+    Portfolio Summary bucket moves. Switching it to the no-deferral path would
+    skip the client-confirmed resume reset and assert delinquency on evidence
+    just declared unknown — measured at $280,162.64 moving Current -> 60 Days
+    on one real loan.
+    """
+
+    def _memo(self, servicer_action):
+        df = pd.DataFrame([{
+            "Lender": "Millennium Bank", "SBA Loan ID": "5658839107",
+            "Lender Loan ID": "5658839107", "Borrower Name": "Test",
+            "Securitization Action": "Deferred", "Servicer Action": servicer_action,
+            "Deferral Start Date": pd.Timestamp("2026-03-01"),
+            "Deferral End Date": pd.Timestamp("2026-05-01"),
+            "Regular Payment Resume Date": pd.Timestamp("2026-06-01"),
+            "Report Date": pd.Timestamp("2026-05-26"),
+        }])
+        df["gp_sba"] = df["SBA Loan ID"]
+        df["gp_lender"] = df["Lender Loan ID"]
+        df["deferral_type"] = df["Servicer Action"].apply(file_readers.classify_deferral_type)
+        return df
+
+    def test_unclassified_and_full_agree_on_every_phase(self):
+        # The real loan's text ("three months deferment") against an explicit
+        # full-P&I equivalent, across the whole deferral window.
+        for cycle in ("2026-03-01", "2026-04-01", "2026-05-01", "2026-06-01"):
+            with self.subTest(cycle=cycle):
+                unclassified = checks._lookup_deferral(
+                    self._memo("three months deferment"), "5658839107",
+                    "Millennium Bank", pd.Timestamp(cycle), "DEFERRED")
+                full = checks._lookup_deferral(
+                    self._memo("three months principal and interest deferment"), "5658839107",
+                    "Millennium Bank", pd.Timestamp(cycle), "DEFERRED")
+                self.assertEqual(unclassified[0]["phase"], full[0]["phase"])
+                self.assertEqual(unclassified[0]["months_since_start"],
+                                 full[0]["months_since_start"])
+
+    def test_resume_reset_still_fires_for_an_unclassified_deferral(self):
+        # The client-confirmed reset is keyed on the resume cycle; losing it
+        # here is exactly what moved $280k in the rejected variant.
+        info, _, _, _ = checks._lookup_deferral(
+            self._memo("three months deferment"), "5658839107",
+            "Millennium Bank", pd.Timestamp("2026-06-01"), "DEFERRED")
+        self.assertEqual(info["phase"], "resume")
+
+    def test_unclassified_raises_the_data_quality_warning(self):
+        info, warning, warning_type, evidence = checks._lookup_deferral(
+            self._memo("three months deferment"), "5658839107",
+            "Millennium Bank", pd.Timestamp("2026-04-01"), "DEFERRED")
+        self.assertEqual(info["deferral_type"], "unclassified")
+        self.assertEqual(warning_type, "deferral_dates")
+        self.assertIn("does not state whether", warning)
+
+    def test_a_typed_deferral_raises_no_such_warning(self):
+        for text in ("three months principal and interest deferment",
+                     "three months principal only deferment"):
+            with self.subTest(text=text):
+                _, warning, warning_type, _ = checks._lookup_deferral(
+                    self._memo(text), "5658839107", "Millennium Bank",
+                    pd.Timestamp("2026-04-01"), "DEFERRED")
+                self.assertIsNone(warning)
+                self.assertIsNone(warning_type)

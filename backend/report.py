@@ -165,6 +165,14 @@ CHECK_LEGEND = [
      "(typically a reversal of a prior payment). This does NOT change the delinquency status "
      "calculation shown elsewhere in this report — it's a visibility flag only, so these loans "
      "can be manually reviewed and their status adjusted by hand if needed."),
+    ("Servicer Memo Coverage", "WARN",
+     "Reviews the Servicer Memo Summary itself and flags any memo row the audit cannot rely "
+     "on: a loan ID that appears in no SOUP population, a Lender spelling the audit doesn't "
+     "recognize, a deferral asserted with no usable start date, impossible deferral date "
+     "ordering, or a non-Deferred action carrying real deferral dates. Every row listed is a "
+     "memo record whose deferral evidence may never have reached the reconciliation — none of "
+     "them is evidence that the loan has no deferral. This tab appears only when there is "
+     "something to report."),
 ]
 
 

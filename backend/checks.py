@@ -901,24 +901,28 @@ def _check_change_in_terms_resume(candidates, soup_status, cycle_month):
     logic), otherwise a deferral_info dict with phase="resume" and a
     diagnostic marker (resume_via_change_in_terms_exception=True) so the
     result stays visible for review rather than looking identical to a
-    normal, standard-path resume."""
+    normal, standard-path resume.
+
+    Returns (deferral_info, matched_row), both None when the exception does
+    not apply. The row is returned so the caller can build the loan's deferral
+    evidence from the same record this decision was made on."""
     if candidates is None or candidates.empty or cycle_month is None:
-        return None
+        return None, None
     if "Securitization Action" not in candidates.columns:
-        return None
+        return None, None
 
     # Condition 1: Securitization Action is exactly "CHANGE IN TERMS AGREEMENT".
     cit_rows = candidates[
         candidates["Securitization Action"].astype("string").str.strip().str.lower() == "change in terms agreement"
     ]
     if cit_rows.empty:
-        return None
+        return None, None
 
     # Condition 2: Prior SOUP Loan Status for this loan must be DEFERRED —
     # this is what makes the memo evidence of a RESUME, not a new deferral.
     # Checked against SOUP's own independent history, not the memo itself.
     if "DEFERRED" not in str(soup_status or "").upper():
-        return None
+        return None, None
 
     cycle_period = cycle_month.to_period("M").to_timestamp()
 
@@ -954,19 +958,166 @@ def _check_change_in_terms_resume(candidates, soup_status, cycle_month):
             continue
 
         # All six conditions satisfied — confirmed resume, never a new deferral.
+        # The matched row rides along so the caller can shape its evidence
+        # record from the SAME row this decision was made on, rather than
+        # re-finding it and risking a different one.
         return {
             "deferral_type": "full",
             "phase": "resume",
             "months_since_start": None,
             "resume_via_change_in_terms_exception": True,
-        }
+        }, row
 
-    return None
+    return None, None
+
+
+# Deferral types that take the FULL P&I calculation path below.
+#
+# "unclassified" is here on purpose, and what it means must be stated
+# precisely: this is a PROVISIONAL LENIENT ASSUMPTION, not neutral arithmetic.
+# See docs/deferralevidencebrief.md, "Interim treatment for unclassified
+# deferrals (governing decision, 2026-08-07)", which governs this comment.
+#
+# file_readers.classify_deferral_type returns "unclassified" for Servicer
+# Action text with no payment-type signal at all ("three months deferment").
+# Full P&I freezes the delinquency rank, because no payment was due; partial
+# runs normal missed-payment math, because interest was still due. With the
+# type unknown, keeping the freeze LEANS LENIENT — exactly as recomputing on
+# the no-deferral path would lean strict. Neither is objectively correct until
+# the type is known, so the rule preserves the established number, declares it
+# provisional, and routes the resolution to a human. Describing this as "no
+# number moves" is true of the diff and misleading about the claim: the
+# retained figure is an assumption, and every unclassified delinquency value
+# is provisional pending confirmation of the deferral type.
+#
+# Why preserve rather than recompute: (1) it does not introduce a new
+# financial result merely because the parser got more honest; (2)
+# "unclassified" plus DEFERRAL DATA QUALITY WARNING stop the system
+# presenting the assumption as fact; (3) exclusion from auto-correction stops
+# the lenient assumption quietly becoming a written status change. Measured on
+# the June-2026 run, recomputing instead moved $280,162.64 from Current into
+# 60 Days on one Millennium loan.
+#
+# corrections.py deliberately does NOT use this set — its Loan Status ->
+# DEFERRED gate stays a strict `== "full"`, so an unclassified deferral can
+# never trigger an automatic status write even if its warning were ever
+# dropped from WARNING_REASONS.
+_FULL_PNI_CALC_TYPES = ("full", "unclassified")
+
+# ---------------------------------------------------------------------------
+# THE DEFERRAL EVIDENCE CONTRACT
+#
+# One vocabulary describing what the audit actually knows about a loan's
+# deferral evidence this cycle. Computed ONCE, here in STAT-01, and consumed
+# verbatim by corrections.py, report.py and the correction review page. None of
+# those three may recompute or reinterpret it — that is the whole point of
+# naming it once, since three renderers inventing three readings of the same
+# facts is how they drift.
+#
+#   documented                      a deferral applies this cycle, its dates
+#                                   are internally consistent and its type is
+#                                   known
+#   no-deferral                     no memo deferral applies to this cycle.
+#                                   A FACT, not a defect
+#   deferral-claimed-dates-missing  the memo asserts a deferral but wrote no
+#                                   usable Deferral Start Date, so the window
+#                                   cannot be placed on any cycle
+#   lookup-failed                   memo rows exist for this loan but none
+#                                   matched a known Lender identity for this
+#                                   servicer — a DEFECT that must never render
+#                                   as "no deferral"
+#   date-anomaly                    the matched row's dates are impossible
+#                                   (end or resume before start)
+#   type-unclassified               a deferral applies, but the Servicer
+#                                   Action text never says full P&I vs partial
+#
+# NB "no-deferral" and "lookup-failed" are the two that look identical in the
+# output today and are not the same thing at all — separating them is the
+# reason this field exists.
+EVIDENCE_DOCUMENTED = "documented"
+EVIDENCE_NO_DEFERRAL = "no-deferral"
+EVIDENCE_DATES_MISSING = "deferral-claimed-dates-missing"
+EVIDENCE_LOOKUP_FAILED = "lookup-failed"
+EVIDENCE_DATE_ANOMALY = "date-anomaly"
+EVIDENCE_TYPE_UNCLASSIFIED = "type-unclassified"
+
+DEFERRAL_EVIDENCE_STATUSES = (
+    EVIDENCE_DOCUMENTED, EVIDENCE_NO_DEFERRAL, EVIDENCE_DATES_MISSING,
+    EVIDENCE_LOOKUP_FAILED, EVIDENCE_DATE_ANOMALY, EVIDENCE_TYPE_UNCLASSIFIED,
+)
+
+
+def _memo_date_order_is_impossible(row):
+    """End or resume before start. Deliberately the SAME two rules
+    memo_audit's date-anomaly flag uses, so the per-loan label in STAT-01 and
+    the file-level count in MEMO-01 can never disagree about the same row.
+    ("resume before end" is invalid too, but it is advisory in memo_audit and
+    is not part of that flag — keep the two definitions in step.)
+
+    LABEL ONLY. Nothing branches on this: it does not gate the row, change a
+    phase, or alter a delinquency value. Applying a date-anomaly gate to the
+    calculation is a separate, client-confirmed decision."""
+    if row is None:
+        return False
+    start = row.get("Deferral Start Date")
+    end = row.get("Deferral End Date")
+    resume = row.get("Regular Payment Resume Date")
+    if pd.isna(start):
+        return False
+    start = pd.Timestamp(start)
+    if pd.notna(end) and pd.Timestamp(end) < start:
+        return True
+    if pd.notna(resume) and pd.Timestamp(resume) < start:
+        return True
+    return False
+
+
+def _deferral_evidence(status, row=None):
+    """Shapes the evidence record every renderer reads. Always returns the
+    same keys so a consumer never has to test for their presence, and always
+    returns plain display-ready strings (never NaT/Timestamp), because these
+    cross into JSON, Excel and the review page unchanged.
+
+    READ-ONLY REVIEW EVIDENCE, per the rule in CLAUDE.md: nothing in this
+    module's calculation logic may read these back."""
+    def _date(col):
+        v = row.get(col) if row is not None else None
+        if v is None or (not isinstance(v, str) and pd.isna(v)):
+            return ""
+        try:
+            return pd.Timestamp(v).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return str(v).strip()
+
+    action = row.get("Securitization Action") if row is not None else None
+    return {
+        "evidence_status": status,
+        "deferral_start": _date("Deferral Start Date"),
+        "deferral_end": _date("Deferral End Date"),
+        "deferral_resume": _date("Regular Payment Resume Date"),
+        "securitization_action": "" if action is None or (not isinstance(action, str) and pd.isna(action)) else str(action).strip(),
+    }
+
+
+_UNCLASSIFIED_TYPE_WARNING = (
+    "The Servicer Memo's Servicer Action text does not state whether this is a "
+    "full principal-and-interest deferral or a principal-only/interest-only "
+    "one, so the deferral type could not be established from the memo. This "
+    "cycle's Delinquency Status is therefore PROVISIONAL: it retains the "
+    "established full P&I treatment (the rank is held, as it would be if no "
+    "payment were due), which is a deliberate interim assumption rather than a "
+    "confirmed result — a principal-only deferral would instead be evaluated "
+    "against normal missed-payment math, because interest would still be due. "
+    "The loan is excluded from automatic correction until a human confirms the "
+    "deferral type, at which point the definitive status follows the correct "
+    "rule."
+)
 
 
 def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     """Finds the memo row (if any) whose deferral window covers cycle_month
-    for this loan, and returns (deferral_info, warning, warning_type):
+    for this loan, and returns
+    (deferral_info, warning, warning_type, evidence):
 
       deferral_info: None, or {"deferral_type": "full" | "partial",
                                 "phase": "start" | "mid" | "resume" |
@@ -980,6 +1131,12 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
                this cycle in the deferral timeline" (deferral_dates). These
                get different Reason tags in status_match_check: "MEMO DATA
                QUALITY WARNING" vs "DEFERRAL DATA QUALITY WARNING".
+      evidence: ALWAYS a dict (never None), from _deferral_evidence — the
+               loan's evidence_status plus the matched memo row's raw
+               Deferral Start/End/Resume dates and Securitization Action.
+               Read-only review evidence: it is display material for
+               corrections.py, report.py and the review page, and no
+               calculation in this module may read it back.
 
     soup_status is SOUP's last recorded Loan Status for this loan — needed
     ONLY for the narrow CHANGE IN TERMS AGREEMENT resume exception below
@@ -992,9 +1149,9 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     never match it.
     """
     if memo_df is None or memo_df.empty or gp is None or cycle_month is None:
-        return None, None, None
+        return None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)
     if "gp_sba" not in memo_df.columns and "gp_lender" not in memo_df.columns:
-        return None, None, None
+        return None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)
 
     id_match = pd.Series(False, index=memo_df.index)
     if "gp_sba" in memo_df.columns:
@@ -1003,7 +1160,9 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
         id_match = id_match | (memo_df["gp_lender"] == gp)
 
     if not id_match.any():
-        return None, None, None  # no memo entry exists for this loan at all
+        # No memo entry exists for this loan at all. A FACT, not a defect --
+        # deliberately distinct from lookup-failed below, which IS one.
+        return None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)
 
     lender_match = pd.Series(True, index=memo_df.index)
     using_alias_table = False
@@ -1041,7 +1200,7 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
             f"normal calculation, which may be WRONG if a deferral is actually recorded under one of "
             f"these unrecognized spellings."
         )
-        return None, warning, "lender_identity"
+        return None, warning, "lender_identity", _deferral_evidence(EVIDENCE_LOOKUP_FAILED)
 
     all_candidates = memo_df[id_match & lender_match].copy()
 
@@ -1051,9 +1210,9 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     # treated as evidence of a NEW deferral — see _check_change_in_terms_resume
     # for the full set of required conditions. Does not generalize to
     # MODIFICATION, CHANGE MEMO, or any other Securitization Action value.
-    cit_result = _check_change_in_terms_resume(all_candidates, soup_status, cycle_month)
+    cit_result, cit_row = _check_change_in_terms_resume(all_candidates, soup_status, cycle_month)
     if cit_result is not None:
-        return cit_result, None, None
+        return cit_result, None, None, _deferral_evidence(EVIDENCE_DOCUMENTED, cit_row)
 
     candidates = all_candidates.copy()
 
@@ -1068,10 +1227,15 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
         candidates = candidates[candidates["Securitization Action"].astype("string").str.strip().str.lower() == "deferred"]
 
     if candidates.empty or "Deferral Start Date" not in candidates.columns:
-        return None, None, None
+        return None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)
+    # Rows the memo marks Deferred but left with no usable start date. They are
+    # dropped from matching exactly as before -- the only change is that a loan
+    # no longer renders as "no deferral" when THIS is the reason.
+    claimed_without_dates = bool(candidates["Deferral Start Date"].isna().any())
     candidates = candidates.dropna(subset=["Deferral Start Date"])
     if candidates.empty:
-        return None, None, None
+        return None, None, None, _deferral_evidence(
+            EVIDENCE_DATES_MISSING if claimed_without_dates else EVIDENCE_NO_DEFERRAL)
 
     start_month = candidates["Deferral Start Date"].dt.to_period("M").dt.to_timestamp()
     resume_month = candidates["Regular Payment Resume Date"].dt.to_period("M").dt.to_timestamp() \
@@ -1093,7 +1257,7 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     still_relevant = started & (resume_month.isna() | (cycle_period <= resume_month))
     active = candidates[still_relevant]
     if active.empty:
-        return None, None, None
+        return None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)
 
     # multiple matching rows -> take the most recently reported memo entry
     if "Report Date" in active.columns and active["Report Date"].notna().any():
@@ -1110,7 +1274,7 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     warning = None
     warning_type = None
     months_since_start = (cycle_period.year - chosen_start_month.year) * 12 + (cycle_period.month - chosen_start_month.month)
-    if deferral_type == "full":
+    if deferral_type in _FULL_PNI_CALC_TYPES:
         # Checked in this order:
         #   1. start — the cycle containing Deferral Start Date
         #   2. resume — the cycle containing an ACTUAL Regular Payment
@@ -1148,7 +1312,30 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
     else:
         phase = None
 
-    return {"deferral_type": deferral_type, "phase": phase, "months_since_start": months_since_start}, warning, warning_type
+    # The memo names a deferral but not its type. Surface it: the loan reaches
+    # the reviewer and corrections.py's WARNING_REASONS excludes it from every
+    # auto-correction. Only set when the phase logic above hasn't already
+    # raised a more specific deferral_dates warning — that one says something
+    # narrower about the same record, and replacing it would lose detail.
+    if deferral_type == "unclassified" and warning is None:
+        warning = _UNCLASSIFIED_TYPE_WARNING
+        warning_type = "deferral_dates"
+
+    # Evidence status for a deferral that DID match this cycle. Precedence is
+    # deliberate: impossible dates outrank an unknown type, because a bad date
+    # undermines the window itself (which cycle the deferral even covers),
+    # whereas an unknown type leaves a valid window with one unknown attribute.
+    if _memo_date_order_is_impossible(chosen):
+        evidence_status = EVIDENCE_DATE_ANOMALY
+    elif deferral_type == "unclassified":
+        evidence_status = EVIDENCE_TYPE_UNCLASSIFIED
+    else:
+        evidence_status = EVIDENCE_DOCUMENTED
+
+    return (
+        {"deferral_type": deferral_type, "phase": phase, "months_since_start": months_since_start},
+        warning, warning_type, _deferral_evidence(evidence_status, chosen),
+    )
 
 
 # A Loan Status comparison of "prior != current" is not the same question as
@@ -1261,7 +1448,13 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     # to detect this in the Servicer Loan Status field.
     srf_status_is_terminal_collection = any(k in srf_status_u for k in _TERMINAL_COLLECTION_KEYWORDS)
 
-    deferral, memo_warning, warning_type = (None, None, None) if is_terminal_this_cycle else _lookup_deferral(memo_df, gp, servicer_name, cycle_month, soup_status=soup_status)
+    # NB the terminal short-circuit literal widens with the call: a terminal
+    # loan never consults the memo, so its evidence is "no-deferral" — stated,
+    # not left as a bare None for a renderer to interpret.
+    deferral, memo_warning, warning_type, deferral_evidence = (
+        (None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)) if is_terminal_this_cycle
+        else _lookup_deferral(memo_df, gp, servicer_name, cycle_month, soup_status=soup_status)
+    )
 
     prior_missed = _status_to_missed_count(soup_dq_raw) if has_payment_cols else None
     expected_loan_status = None
@@ -1338,7 +1531,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             calculated_dq = _missed_count_to_status(max(candidates)) if candidates else "UNVERIFIED"
         else:
             calculated_dq = "CURRENT"
-    elif deferral and deferral["deferral_type"] == "full" and deferral["phase"] == "resume":
+    elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES and deferral["phase"] == "resume":
         # Client-confirmed: the cycle containing Regular Payment Resume
         # Date resets the delinquency baseline to CURRENT, then applies
         # normal payment evaluation THIS cycle — the rank accumulated
@@ -1380,7 +1573,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
             )
         else:
             expected_loan_status = srf_status
-    elif deferral and deferral["deferral_type"] == "full" and deferral["phase"] == "resume_unverified":
+    elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES and deferral["phase"] == "resume_unverified":
         # Client-confirmed: past Deferral End Date with no known Regular
         # Payment Resume Date. Do NOT advance the deferral rank (that would
         # assume still-deferred), do NOT reset to CURRENT (that would
@@ -1391,7 +1584,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         # regardless of whether this coincidentally "matches."
         expected_loan_status = None
         calculated_dq = str(soup_dq_raw).strip().upper()
-    elif deferral and deferral["deferral_type"] == "full":
+    elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES:
         expected_loan_status = "DEFERRED"
         # CLIENT-CONFIRMED (2026-08-03): an external deferral (one initiated
         # by a servicer memo, not necessarily by a missed payment) does NOT
@@ -1521,7 +1714,7 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     if srf_status_is_terminal_collection:
         expected_loan_status = srf_status
 
-    return calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, is_terminal_this_cycle, reversal_info
+    return calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, is_terminal_this_cycle, reversal_info, deferral_evidence
 
 
 def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None):
@@ -1581,7 +1774,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         scheduled_ambiguous = bool(row.get("scheduled_ambiguous"))
         scheduled_payment_updated_during_cycle = bool(row.get("scheduled_payment_updated_during_cycle"))
 
-        calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, _, reversal_info = _calculate_expected_status(
+        calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, _, reversal_info, deferral_evidence = _calculate_expected_status(
             gp, srf_status, soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
             has_payment_cols, memo_df, servicer_name, cycle_month,
             srf_dq=srf_dq, scheduled_ambiguous=scheduled_ambiguous,
@@ -1770,6 +1963,20 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "Calculated DQ Status": calculated_dq,
             "DQ Status Match": dq_match if dq_match == "REVIEW" else ("YES" if dq_match else "NO"),
             "Deferral Type": deferral["deferral_type"] if deferral else "",
+            # --- Reviewer context: the six facts that explain WHY a deferral
+            # row was flagged, as discrete columns rather than prose. STAT-01
+            # is the only place all six coexist for one loan — the memo has no
+            # SOUP or servicer status, and SOUP has no memo label — which is
+            # why they are assembled here and merely rendered downstream.
+            # A label conflict (a "Modification" Securitization Action against
+            # a full-P&I window) is unreadable without the memo label sitting
+            # beside the prior and current statuses.
+            "Deferral Evidence Status": deferral_evidence["evidence_status"],
+            "Memo Securitization Action": deferral_evidence["securitization_action"],
+            "Deferral Start Date": deferral_evidence["deferral_start"],
+            "Deferral End Date": deferral_evidence["deferral_end"],
+            "Regular Payment Resume Date": deferral_evidence["deferral_resume"],
+            "Prior (SOUP) Loan Status": str(soup_status).strip() if soup_status is not None else "",
             "Memo Lookup Warning": memo_warning if warning_type == "lender_identity" else "",
             "Deferral Data Quality Warning": memo_warning if warning_type == "deferral_dates" else "",
             "Deferral Resume Source": "CHANGE IN TERMS AGREEMENT exception (not a standard Deferred record)" if resume_via_change_in_terms_exception else "",
@@ -1819,6 +2026,16 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "soup_status": soup_status,
             "deferral_type": deferral["deferral_type"] if deferral else None,
             "deferral_phase": deferral["phase"] if deferral else None,
+            # The shared deferral-evidence contract, computed once above and
+            # passed through verbatim. corrections.py, report.py and the review
+            # page all read these; none of them recomputes or reinterprets.
+            # Read-only review evidence, same rule as the block below: nothing
+            # in this module's calculation logic may read them back.
+            "evidence_status": deferral_evidence["evidence_status"],
+            "deferral_start": deferral_evidence["deferral_start"],
+            "deferral_end": deferral_evidence["deferral_end"],
+            "deferral_resume": deferral_evidence["deferral_resume"],
+            "securitization_action": deferral_evidence["securitization_action"],
             # CLIENT-CONFIRMED (2026-08-03): whenever a negative Payment
             # Received amount actually drove calculated_dq this cycle, that
             # result must require manual review before correction rather
@@ -1997,7 +2214,7 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
 
         srf_status = str(row.get("loan_status", "")).strip()
         srf_dq = str(row.get("dq_status", "")).strip()
-        calculated_dq, _, _, _, _, _, reversal_info = _calculate_expected_status(
+        calculated_dq, _, _, _, _, _, reversal_info, _ = _calculate_expected_status(
             gp, srf_status, soup_status, soup_dq_raw, row.get("received"), row.get("scheduled"),
             has_payment_cols, memo_df, servicer_name, cycle_month,
             srf_dq=srf_dq, scheduled_ambiguous=bool(row.get("scheduled_ambiguous")),

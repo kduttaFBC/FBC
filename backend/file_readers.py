@@ -27,6 +27,15 @@ SERVICE_MEMO_FIELDS = [
     "Regular Payment Resume Date",
 ]
 
+# Deferral date column -> the column read_service_memo stores that cell's
+# ORIGINAL text in, before pd.to_datetime(errors="coerce") flattens
+# unparseable values to NaT. Diagnostics only (memo_audit.py).
+MEMO_RAW_DATE_COLUMNS = {
+    "Deferral Start Date": "_raw_deferral_start",
+    "Deferral End Date": "_raw_deferral_end",
+    "Regular Payment Resume Date": "_raw_deferral_resume",
+}
+
 # Centralized, explicit map from a servicer's canonical identity (the same
 # soup_key value SERVICER_SOUP_KEYS/filter_soup_by_servicer already use — a
 # note-series year like "2025"/"2024" is stripped out BEFORE this lookup, it
@@ -51,6 +60,10 @@ SERVICE_MEMO_FIELDS = [
 # isn't silently broken until someone adds it -- see
 # checks._lookup_deferral's docstring for that fallback behavior.
 MEMO_LENDER_ALIASES = {
+    # NB: the "&" spelling is the canonical soup_key -- the frontend's
+    # SERVICER_SOUP_KEYS maps its "Community Bank and Trust" display label TO
+    # this exact string, so this key must stay spelled with "&" to be found
+    # by MEMO_LENDER_ALIASES.get(servicer_key) in checks._lookup_deferral.
     "Community Bank & Trust": ["Community Bank & Trust"],
     "Millennium Bank": ["Millennium Bank", "Millennium Bank, IL"],
     "Lendistry": ["Lendistry", "Lendistry SBLC, LLC, CA"],
@@ -71,30 +84,130 @@ MEMO_LENDER_ALIASES = {
     "X-Caliber": ["X-Caliber"],
 }
 
+
+def _build_alias_index(alias_table):
+    """Reverse index of MEMO_LENDER_ALIASES: {normalized memo Lender spelling
+    -> canonical soup_key}. Lets a caller answer "is this Lender string known
+    to ANY servicer?" in one lookup, which is what makes an unrecognized memo
+    Lender a reportable finding instead of a silent zero-match.
+
+    A spelling claimed by two different soup_keys is a table defect (it would
+    make memo attribution ambiguous). This does NOT raise on one -- an import-
+    time exception would take the whole app down over a table typo -- it keeps
+    the first binding and leaves detection to the alias-table drift test in
+    test_memo_audit.py, which fails loudly at test time instead."""
+    index = {}
+    for soup_key, spellings in alias_table.items():
+        for spelling in spellings:
+            index.setdefault(str(spelling).strip().lower(), soup_key)
+    return index
+
+
+_ALIAS_TO_SOUP_KEY = _build_alias_index(MEMO_LENDER_ALIASES)
+
+
+def memo_lender_soup_key(lender_value):
+    """Returns the canonical soup_key for a memo "Lender" cell, or None if
+    that exact spelling isn't catalogued in MEMO_LENDER_ALIASES. None means
+    "no servicer in the alias table claims this spelling" -- the condition
+    that silently yields zero SOUP matches today."""
+    if lender_value is None:
+        return None
+    s = str(lender_value).strip().lower()
+    if not s:
+        return None
+    return _ALIAS_TO_SOUP_KEY.get(s)
+
+
 # Servicer Action free text that identifies a PRINCIPAL-ONLY (or interest-only)
 # deferral, which follows normal payment-vs-scheduled delinquency math (just
 # against a reduced, deferral-adjusted amount) rather than the full P&I
 # freeze/auto-advance rule. Anything not matching this is treated as a full
 # P&I deferral. Order matters: "principal and interest" / "P&I" / "PNI" must
 # NOT be misclassified as partial just because they also contain "principal".
-_PARTIAL_DEFERRAL_KEYWORDS = ("principal only", "interest only")
-_FULL_PNI_OVERRIDE_KEYWORDS = ("principal and interest", "p&i", "pni", "p & i")
+# Checked FIRST, and it has to be: text naming BOTH principal and interest is
+# a full P&I deferral even though it also contains the word "principal", which
+# several of the partial patterns below would otherwise match.
+#
+# Long phrases match as plain substrings. The short forms are word-bounded
+# instead, because "pni" / "p and i" as bare substrings can appear inside
+# unrelated words.
+_FULL_PNI_OVERRIDE_KEYWORDS = ("principal and interest", "principal & interest")
+_FULL_PNI_TOKEN_RE = re.compile(r"\b(?:p\s*&\s*i|p\s+and\s+i|pni)\b")
+
+# Servicer Action free text identifying a PRINCIPAL-ONLY (or interest-only)
+# deferral. Widened 2026-08-07 after measuring the delivered Servicer Memo
+# Summary: the previous list held only the literal strings "principal only"
+# and "interest only", so every OTHER way of writing a principal-only
+# deferral fell through to the "full" default below. That misclassified 11 of
+# 68 Deferred rows -- among them
+#
+#   "3-month deferment of principal paying interest"   (interest IS paid)
+#   "2-month deferment with $7200 interest payments"   (interest IS paid)
+#   "3-month principal deferment" / "6M principal deferral"
+#
+# all of which are partial deferrals being read as a full P&I freeze. That is
+# the dangerous direction: "full" is what makes STAT-01 advance the
+# delinquency rank +1/cycle regardless of payment, and what gates
+# corrections.py's automatic Loan Status -> DEFERRED write.
+#
+# "paying interest" / "interest payment" are included on the same logic: if
+# the servicer says interest is still being paid, principal alone is deferred.
+# They cannot swallow a genuine full deferral, because any text naming both
+# principal and interest is caught by the override above first.
+_PARTIAL_DEFERRAL_KEYWORDS = (
+    "principal only", "interest only",
+    "principal deferment", "principal deferral", "principal payment deferral",
+    "deferment of principal", "deferral of principal", "deferring principal",
+    "paying interest", "interest payment",
+)
 
 
 def classify_deferral_type(servicer_action):
-    """Returns 'partial' for a principal-only/interest-only deferral, 'full'
-    for a full principal-and-interest deferral, based on the memo's free-text
-    Servicer Action description. Defaults to 'full' when ambiguous, since
-    that's the more conservative assumption (payment is checked, not ignored,
-    only under 'partial' — misclassifying 'full' as 'partial' merely falls
-    back to normal calc, while misclassifying 'partial' as 'full' would
-    wrongly ignore real payments)."""
+    """Classifies the memo's free-text Servicer Action as a full P&I or a
+    principal-only/interest-only deferral.
+
+    Evaluation order is load-bearing and must stay exactly:
+
+        1. explicit full P&I  -> "full"
+        2. partial keywords   -> "partial"
+        3. neither            -> "unclassified"
+
+    Step 1 has to come first: text like "deferment of principal and interest"
+    contains a principal-only phrase from step 2, and reading it as partial
+    would be wrong. Anything naming both principal and interest is full.
+
+    Step 3 used to return "full". It no longer does. Measured against the
+    delivered memo, 9 of 68 Deferred rows reach step 3 on text carrying no
+    payment-type signal whatsoever — "three months deferment", "90-Day
+    Deferment", "3 month payment deferral", "30-day deferment". Returning
+    "full" for those asserted the one thing the servicer never wrote down,
+    in the direction that gates corrections.py's automatic Loan Status ->
+    DEFERRED write.
+
+    "unclassified" is not a third kind of deferral. It means the text does
+    not say. STAT-01 raises DEFERRAL DATA QUALITY WARNING for it, which
+    surfaces the loan for review and excludes it from auto-correction via
+    corrections.WARNING_REASONS.
+
+    IMPORTANT — an unclassified deferral still rides the full-P&I calculation
+    path it rode before (see checks._FULL_PNI_CALC_TYPES). That is a
+    PROVISIONAL LENIENT ASSUMPTION, not neutral arithmetic, and it is governed
+    by docs/deferralevidencebrief.md, "Interim treatment for unclassified
+    deferrals (2026-08-07)". Full P&I holds the delinquency rank because no
+    payment was due; partial runs normal missed-payment math because interest
+    was still due. With the type unknown, retaining the freeze leans lenient
+    exactly as recomputing would lean strict, so the rule keeps the
+    established number, marks it provisional, and sends the decision to a
+    human. The resulting delinquency status is provisional pending
+    confirmation of the deferral type — do not describe it as "unchanged"
+    without saying that."""
     s = str(servicer_action).strip().lower()
-    if any(k in s for k in _FULL_PNI_OVERRIDE_KEYWORDS):
+    if any(k in s for k in _FULL_PNI_OVERRIDE_KEYWORDS) or _FULL_PNI_TOKEN_RE.search(s):
         return "full"
     if any(k in s for k in _PARTIAL_DEFERRAL_KEYWORDS):
         return "partial"
-    return "full"
+    return "unclassified"
 
 # Fixed set of servicers this client works with. Used to identify the
 # servicer from the uploaded filename, which is far more reliable than
@@ -451,13 +564,24 @@ def read_service_memo(file_bytes):
       - "gp_sba":    normalized digit-only SBA Loan ID
       - "gp_lender": normalized digit-only Lender Loan ID
       - "deferral_type": "full" or "partial", from classify_deferral_type()
+
+    Also carries the source row's own position ("_sheet_name",
+    "_header_excel_row", "_excel_row", exactly as read_servicer_file already
+    does) and, for each of the three deferral date columns, the cell's
+    ORIGINAL text under the matching MEMO_RAW_DATE_COLUMNS name. Both are for
+    diagnostics: pd.to_datetime(errors="coerce") turns a literal "n/a" and a
+    genuinely empty cell into the same NaT, so without the raw text there is
+    no way to tell "the servicer asserted a deferral but wrote no usable
+    date" from "no date was claimed" -- and no way to point a reviewer at the
+    row to fix. Nothing in the reconciliation path reads either; see
+    memo_audit.py.
     """
     wb = _load_workbook(file_bytes)
     rows_cache = {}
     best = _find_best_header(wb, SERVICE_MEMO_FIELDS, _rows_cache=rows_cache)
     if best["matches"] < len(SERVICE_MEMO_FIELDS) // 2:
         raise ValueError("Could not find the expected Servicer Memo Summary columns in this file.")
-    df = _rows_to_df(rows_cache[best["sheet_name"]], best["row_idx"])
+    df = _rows_to_df(rows_cache[best["sheet_name"]], best["row_idx"], sheet_name=best["sheet_name"])
     rows_cache.clear()
     del wb
 
@@ -467,6 +591,11 @@ def read_service_memo(file_bytes):
         df["gp_lender"] = df["Lender Loan ID"].apply(normalize_memo_loan_id)
     if "Servicer Action" in df.columns:
         df["deferral_type"] = df["Servicer Action"].apply(classify_deferral_type)
+
+    # Snapshot the raw text BEFORE the coercion below overwrites it.
+    for col, raw_col in MEMO_RAW_DATE_COLUMNS.items():
+        if col in df.columns:
+            df[raw_col] = df[col].map(lambda v: "" if v is None else str(v).strip())
 
     for col in ("Deferral Start Date", "Deferral End Date", "Regular Payment Resume Date", "Report Date"):
         if col in df.columns:
