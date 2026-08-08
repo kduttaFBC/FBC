@@ -973,21 +973,30 @@ def _check_change_in_terms_resume(candidates, soup_status, cycle_month):
 
 # Deferral types that take the FULL P&I calculation path below.
 #
-# "unclassified" is here on purpose, and it is a disclosure/arithmetic split
-# rather than a claim that unclassified means full. file_readers.
-# classify_deferral_type returns "unclassified" for Servicer Action text with
-# no payment-type signal at all ("three months deferment"); those rows used to
-# return "full" outright, so keeping them on this path leaves every calculated
-# delinquency value and every Portfolio Summary bucket exactly where it was,
-# while STAT-01 raises DEFERRAL DATA QUALITY WARNING so a human sees the
-# uncertainty and corrections.py refuses to auto-write anything.
+# "unclassified" is here on purpose, and what it means must be stated
+# precisely: this is a PROVISIONAL LENIENT ASSUMPTION, not neutral arithmetic.
+# See docs/deferralevidencebrief.md, "Interim treatment for unclassified
+# deferrals (governing decision, 2026-08-07)", which governs this comment.
 #
-# Moving them off this path is NOT a safe default: it would apply the
-# no-deferral math instead, skipping the client-confirmed resume reset and
-# asserting delinquency on evidence just declared unknown. Measured on the
-# June-2026 run, that single switch moved $280,162.64 from Current into
-# 60 Days on one Millennium loan. Which way it should go is a client
-# decision, not a side effect of a classifier default.
+# file_readers.classify_deferral_type returns "unclassified" for Servicer
+# Action text with no payment-type signal at all ("three months deferment").
+# Full P&I freezes the delinquency rank, because no payment was due; partial
+# runs normal missed-payment math, because interest was still due. With the
+# type unknown, keeping the freeze LEANS LENIENT — exactly as recomputing on
+# the no-deferral path would lean strict. Neither is objectively correct until
+# the type is known, so the rule preserves the established number, declares it
+# provisional, and routes the resolution to a human. Describing this as "no
+# number moves" is true of the diff and misleading about the claim: the
+# retained figure is an assumption, and every unclassified delinquency value
+# is provisional pending confirmation of the deferral type.
+#
+# Why preserve rather than recompute: (1) it does not introduce a new
+# financial result merely because the parser got more honest; (2)
+# "unclassified" plus DEFERRAL DATA QUALITY WARNING stop the system
+# presenting the assumption as fact; (3) exclusion from auto-correction stops
+# the lenient assumption quietly becoming a written status change. Measured on
+# the June-2026 run, recomputing instead moved $280,162.64 from Current into
+# 60 Days on one Millennium loan.
 #
 # corrections.py deliberately does NOT use this set — its Loan Status ->
 # DEFERRED gate stays a strict `== "full"`, so an unclassified deferral can
@@ -1093,10 +1102,15 @@ def _deferral_evidence(status, row=None):
 _UNCLASSIFIED_TYPE_WARNING = (
     "The Servicer Memo's Servicer Action text does not state whether this is a "
     "full principal-and-interest deferral or a principal-only/interest-only "
-    "one, so the deferral type could not be established from the memo. The "
-    "delinquency calculation for this cycle is unchanged from prior behavior "
-    "(it still uses the full P&I path), but this loan is excluded from "
-    "automatic correction and needs a human to confirm the deferral type."
+    "one, so the deferral type could not be established from the memo. This "
+    "cycle's Delinquency Status is therefore PROVISIONAL: it retains the "
+    "established full P&I treatment (the rank is held, as it would be if no "
+    "payment were due), which is a deliberate interim assumption rather than a "
+    "confirmed result — a principal-only deferral would instead be evaluated "
+    "against normal missed-payment math, because interest would still be due. "
+    "The loan is excluded from automatic correction until a human confirms the "
+    "deferral type, at which point the definitive status follows the correct "
+    "rule."
 )
 
 

@@ -190,15 +190,18 @@ def classify_deferral_type(servicer_action):
     surfaces the loan for review and excludes it from auto-correction via
     corrections.WARNING_REASONS.
 
-    IMPORTANT — this changes DISCLOSURE, not ARITHMETIC. An unclassified
-    deferral still rides the full-P&I calculation path it rode before (see
-    checks._FULL_PNI_CALC_TYPES), so no delinquency value and no Portfolio
-    Summary bucket moves as a result of this classification. That is
-    deliberate: switching an unclassified loan onto the no-deferral path
-    would silently assert delinquency on evidence we have just declared
-    unknown — measured at $280,162.64 moving from Current to 60 Days on one
-    Millennium loan. Which way that calculation should go is a client
-    decision, not a side effect of a classifier default."""
+    IMPORTANT — an unclassified deferral still rides the full-P&I calculation
+    path it rode before (see checks._FULL_PNI_CALC_TYPES). That is a
+    PROVISIONAL LENIENT ASSUMPTION, not neutral arithmetic, and it is governed
+    by docs/deferralevidencebrief.md, "Interim treatment for unclassified
+    deferrals (2026-08-07)". Full P&I holds the delinquency rank because no
+    payment was due; partial runs normal missed-payment math because interest
+    was still due. With the type unknown, retaining the freeze leans lenient
+    exactly as recomputing would lean strict, so the rule keeps the
+    established number, marks it provisional, and sends the decision to a
+    human. The resulting delinquency status is provisional pending
+    confirmation of the deferral type — do not describe it as "unchanged"
+    without saying that."""
     s = str(servicer_action).strip().lower()
     if any(k in s for k in _FULL_PNI_OVERRIDE_KEYWORDS) or _FULL_PNI_TOKEN_RE.search(s):
         return "full"
