@@ -422,17 +422,25 @@ class MemoCoverageResultTests(unittest.TestCase):
         df = _build_memo_df([_memo_row(**{"Lender": "Unknown Bank, ZZ"})])
         result, _ = memo_audit.build_memo_coverage_result(df, ["6673679110"])
         for key in ("id", "servicer", "name", "category", "severity", "status",
-                    "issues_found", "details", "records"):
+                    "issues_found", "details", "records", "unattributable_count",
+                    "memo_file_counts"):
             self.assertIn(key, result)
         self.assertEqual(result["id"].split("::")[0], "MEMO-01")
         self.assertEqual(result["status"], "WARN")
-        self.assertEqual(result["issues_found"], 1)
+        # An unrecognized Lender belongs to NO servicer, so it is reported but
+        # is not an issue for anyone in the audit.
+        self.assertEqual(result["issues_found"], 0)
+        self.assertEqual(result["unattributable_count"], 1)
+        self.assertEqual(len(result["records"]), 1)
 
-    def test_details_states_the_denominator_and_disclaims_no_deferral(self):
-        rows = [_memo_row(), _memo_row(**{"Lender": "Unknown Bank, ZZ"})]
+    def test_details_names_both_counts_without_combining_them(self):
+        rows = [_memo_row(**{"Securitization Action": "Modification"}),
+                _memo_row(**{"Lender": "Unknown Bank, ZZ"})]
         result, _ = memo_audit.build_memo_coverage_result(_build_memo_df(rows), ["6673679110"])
-        self.assertIn("of 2 real memo row(s)", result["details"])
-        self.assertIn("Unknown Bank, ZZ", result["details"])
+        self.assertEqual(result["issues_found"], 1)        # the label-conflict row
+        self.assertEqual(result["unattributable_count"], 1)  # the unknown-Lender row
+        self.assertIn("1 memo row(s) for the servicer(s) in this audit", result["details"])
+        self.assertIn("NOT counted as issues", result["details"])
         self.assertIn("none of them is evidence that the loan has no deferral",
                       result["details"])
 

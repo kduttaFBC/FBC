@@ -191,6 +191,11 @@ def _filter_report_results(all_results):
         and (
             r["id"].split("::")[0] not in REPORT_CONDITIONAL_CHECK_IDS
             or r.get("issues_found", 0) > 0
+            # A result may carry findings it deliberately does NOT count as
+            # issues (MEMO-01's unattributable file-level memo rows). Those
+            # still have to reach the workbook, or a servicer with no memo
+            # issues of its own would hide them entirely.
+            or r.get("unattributable_count", 0) > 0
         )
     ]
 
@@ -306,6 +311,10 @@ async def audit(
         portfolio_summary_original_records = []
         portfolio_summary_audited_records = []
         portfolio_summary_cycle_months = set()
+        # Canonical soup_keys of the servicer files in THIS audit, used to
+        # scope MEMO-01 below. The memo workbook covers every servicer; an
+        # audit does not.
+        uploaded_soup_keys = set()
 
         for uploaded in servicer_files:
             file_bytes = await uploaded.read()
@@ -367,6 +376,7 @@ async def audit(
             # tabs/summary (e.g. "Lendistry 2024") — these differ for files
             # like Lendistry's two yearly uploads, which both reconcile
             # against the same SOUP servicer but need distinct labels.
+            uploaded_soup_keys.add(soup_key)
             soup_servicer_df = file_readers.filter_soup_by_servicer(soup_df, soup_key)
 
             results = checks_mod.run_servicer_reconciliation(
@@ -496,14 +506,25 @@ async def audit(
         # it. Today such a row is indistinguishable from "this loan has no
         # deferral". Sweeping the memo file is the only direction that sees it.
         #
-        # Population = every SBA GP Number in the SOUP file (all servicers),
-        # not just this run's uploads: a memo row belonging to a servicer that
-        # wasn't uploaded today is a legitimately-absent reconciliation, not a
-        # defective memo row, and must not be reported as one.
+        # Two different scopes, deliberately:
+        #
+        #   population = every SBA GP Number in the SOUP file (all servicers).
+        #     "lookup-failed" means "this loan ID exists in no population", so
+        #     narrowing it to this run's servicers would reclassify every other
+        #     servicer's memo rows as defects -- measured at 195 false findings
+        #     instead of 22 on the delivered file.
+        #   uploaded_soup_keys = only the servicers in THIS audit. Scopes which
+        #     rows are reported as this audit's issues, by Lender attribution.
+        #
+        # Attribution and population answer different questions and must not be
+        # conflated. Rows attributable to NO servicer are still reported, but
+        # counted separately (unattributable_count) so they are never presented
+        # as an uploaded servicer's issues.
         if memo_df is not None:
             memo_result, _memo_counts = memo_audit_mod.build_memo_coverage_result(
                 memo_df,
                 soup_df["SBA GP Number"].dropna().tolist() if "SBA GP Number" in soup_df.columns else [],
+                uploaded_soup_keys=uploaded_soup_keys,
             )
             if memo_result is not None:
                 all_results.append(memo_result)
