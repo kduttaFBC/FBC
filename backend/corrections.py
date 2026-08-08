@@ -391,6 +391,24 @@ def build_eligible_corrections(correction_data):
                 "payment_received": c.get("payment_received"),
                 "scheduled_payment": c.get("scheduled_payment"),
                 "servicing_fee": c.get("servicing_fee"),
+                # The shared deferral-evidence contract (checks.
+                # DEFERRAL_EVIDENCE_STATUSES). Passed through verbatim and
+                # NEVER recomputed here: STAT-01 is the only place that
+                # decides what the evidence says, so the review page, the
+                # workbook and this module cannot drift into three readings
+                # of the same facts. Together with prior_value and
+                # reported_value above, these are the six columns that let a
+                # reviewer see WHY a deferral row was flagged — most of all a
+                # label conflict, where a "Modification" Securitization
+                # Action sits against a full-P&I window and is unreadable
+                # without the prior and current statuses beside it.
+                "evidence_status": c.get("evidence_status"),
+                "deferral_start": c.get("deferral_start"),
+                "deferral_end": c.get("deferral_end"),
+                "deferral_resume": c.get("deferral_resume"),
+                "securitization_action": c.get("securitization_action"),
+                "servicer_loan_status": c.get("srf_status"),
+                "prior_loan_status": c.get("soup_status"),
                 "balance": c.get("ending_balance"),
                 "posting_count": c.get("posting_count"),
             })
@@ -521,6 +539,16 @@ def build_recommendations(stat01_result, servicer):
             "balance": e.get("balance"),
             "reviewFlag": e.get("review_reason") if e.get("review_required") else None,
             "rule": e.get("eligibility_rule"),
+            # Deferral evidence, carried to the review page so a reviewer can
+            # judge a deferral correction without opening the memo workbook
+            # alongside the audit. Display only, computed once in STAT-01.
+            "evidenceStatus": e.get("evidence_status"),
+            "deferralStart": e.get("deferral_start"),
+            "deferralEnd": e.get("deferral_end"),
+            "deferralResume": e.get("deferral_resume"),
+            "memoSecuritizationAction": e.get("securitization_action"),
+            "servicerLoanStatus": e.get("servicer_loan_status"),
+            "priorLoanStatus": e.get("prior_loan_status"),
         })
 
     return recommendations, candidates, skipped

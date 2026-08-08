@@ -817,13 +817,13 @@ class UnclassifiedDeferralArithmeticTests(unittest.TestCase):
     def test_resume_reset_still_fires_for_an_unclassified_deferral(self):
         # The client-confirmed reset is keyed on the resume cycle; losing it
         # here is exactly what moved $280k in the rejected variant.
-        info, _, _ = checks._lookup_deferral(
+        info, _, _, _ = checks._lookup_deferral(
             self._memo("three months deferment"), "5658839107",
             "Millennium Bank", pd.Timestamp("2026-06-01"), "DEFERRED")
         self.assertEqual(info["phase"], "resume")
 
     def test_unclassified_raises_the_data_quality_warning(self):
-        info, warning, warning_type = checks._lookup_deferral(
+        info, warning, warning_type, evidence = checks._lookup_deferral(
             self._memo("three months deferment"), "5658839107",
             "Millennium Bank", pd.Timestamp("2026-04-01"), "DEFERRED")
         self.assertEqual(info["deferral_type"], "unclassified")
@@ -834,7 +834,7 @@ class UnclassifiedDeferralArithmeticTests(unittest.TestCase):
         for text in ("three months principal and interest deferment",
                      "three months principal only deferment"):
             with self.subTest(text=text):
-                _, warning, warning_type = checks._lookup_deferral(
+                _, warning, warning_type, _ = checks._lookup_deferral(
                     self._memo(text), "5658839107", "Millennium Bank",
                     pd.Timestamp("2026-04-01"), "DEFERRED")
                 self.assertIsNone(warning)

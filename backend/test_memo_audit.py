@@ -40,6 +40,8 @@ import unittest
 import pandas as pd
 from openpyxl import Workbook
 
+import checks  # for the shared evidence contract only — memo_audit itself
+               # must never import checks; DiagnosticIsolationTests enforces that
 import file_readers
 import memo_audit
 from memo_audit import (
@@ -881,3 +883,126 @@ class AliasTableDriftTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeferralEvidenceContractTests(unittest.TestCase):
+    """The shared evidence_status contract (checks.DEFERRAL_EVIDENCE_STATUSES).
+
+    Computed once in STAT-01 and consumed verbatim by corrections.py,
+    report.py and the review page. These tests pin the vocabulary and the two
+    distinctions the field exists to make:
+
+      no-deferral  vs  lookup-failed   fact vs defect — identical output today
+      documented   vs  type-unclassified   type known vs "the memo doesn't say"
+    """
+
+    def _memo(self, **over):
+        row = {
+            "Lender": KNOWN_LENDER, "SBA Loan ID": "6673679110",
+            "Lender Loan ID": "6673679110", "Borrower Name": "Test",
+            "Securitization Action": "Deferred",
+            "Servicer Action": "3-month full principal and interest deferral",
+            "Deferral Start Date": pd.Timestamp("2026-04-01"),
+            "Deferral End Date": pd.Timestamp("2026-06-01"),
+            "Regular Payment Resume Date": pd.Timestamp("2026-07-01"),
+            "Report Date": pd.Timestamp("2026-05-26"),
+        }
+        row.update(over)
+        df = pd.DataFrame([row])
+        df["gp_sba"] = df["SBA Loan ID"].astype(str)
+        df["gp_lender"] = df["Lender Loan ID"].astype(str)
+        df["deferral_type"] = df["Servicer Action"].apply(file_readers.classify_deferral_type)
+        return df
+
+    def _evidence(self, df, servicer=KNOWN_LENDER, cycle="2026-05-01", soup_status="ACTIVE"):
+        return checks._lookup_deferral(df, "6673679110", servicer, pd.Timestamp(cycle), soup_status)[3]
+
+    def test_every_status_is_in_the_published_vocabulary(self):
+        for df, cycle in ((self._memo(), "2026-05-01"),
+                          (self._memo(), "2027-01-01"),
+                          (self._memo(**{"Deferral Start Date": pd.NaT}), "2026-05-01"),
+                          (self._memo(**{"Servicer Action": "90-day deferment"}), "2026-05-01"),
+                          (self._memo(**{"Regular Payment Resume Date": pd.Timestamp("2025-01-01")}), "2026-05-01")):
+            with self.subTest(cycle=cycle):
+                self.assertIn(self._evidence(df, cycle=cycle)["evidence_status"],
+                              checks.DEFERRAL_EVIDENCE_STATUSES)
+
+    def test_documented_carries_the_matched_rows_raw_facts(self):
+        ev = self._evidence(self._memo())
+        self.assertEqual(ev["evidence_status"], checks.EVIDENCE_DOCUMENTED)
+        self.assertEqual(ev["deferral_start"], "2026-04-01")
+        self.assertEqual(ev["deferral_end"], "2026-06-01")
+        self.assertEqual(ev["deferral_resume"], "2026-07-01")
+        self.assertEqual(ev["securitization_action"], "Deferred")
+
+    def test_no_deferral_when_the_window_does_not_cover_the_cycle(self):
+        self.assertEqual(self._evidence(self._memo(), cycle="2027-01-01")["evidence_status"],
+                         checks.EVIDENCE_NO_DEFERRAL)
+
+    def test_lookup_failed_is_distinct_from_no_deferral(self):
+        # The whole point of the contract: memo rows exist for this loan but
+        # the Lender resolves to no known servicer identity. That is a DEFECT,
+        # and it must not render the same as "this loan has no deferral".
+        ev = self._evidence(self._memo(**{"Lender": "Unknown Bank, ZZ"}))
+        self.assertEqual(ev["evidence_status"], checks.EVIDENCE_LOOKUP_FAILED)
+        self.assertNotEqual(ev["evidence_status"], checks.EVIDENCE_NO_DEFERRAL)
+
+    def test_dates_missing_is_distinct_from_no_deferral(self):
+        ev = self._evidence(self._memo(**{"Deferral Start Date": pd.NaT}))
+        self.assertEqual(ev["evidence_status"], checks.EVIDENCE_DATES_MISSING)
+
+    def test_type_unclassified(self):
+        ev = self._evidence(self._memo(**{"Servicer Action": "90-day deferment"}))
+        self.assertEqual(ev["evidence_status"], checks.EVIDENCE_TYPE_UNCLASSIFIED)
+
+    def test_date_anomaly_outranks_type_unclassified(self):
+        # A row can be both. Impossible dates undermine the window itself, so
+        # they win — pinned because the precedence is a judgement call.
+        ev = self._evidence(self._memo(**{
+            "Servicer Action": "90-day deferment",
+            "Deferral End Date": pd.Timestamp("2020-01-01"),
+        }))
+        self.assertEqual(ev["evidence_status"], checks.EVIDENCE_DATE_ANOMALY)
+
+    def test_resume_before_start_falls_out_of_the_window_before_it_can_be_labelled(self):
+        # A LIMITATION worth stating rather than hiding. evidence_status
+        # describes the row that MATCHED this cycle, and a resume date before
+        # the start date makes `still_relevant` false, so the row is gone
+        # before the anomaly check is reached and the loan reads no-deferral.
+        # The bad date may be exactly WHY no deferral matched.
+        #
+        # This is not a gap in coverage: MEMO-01 sweeps the memo file itself
+        # and counts every date-order violation regardless of which cycle it
+        # touches, which is the direction that can see this one. Closing it
+        # per-loan means gating the calculation on date sanity — the separate,
+        # client-confirmed decision in the brief's step 4.
+        ev = self._evidence(self._memo(**{
+            "Regular Payment Resume Date": pd.Timestamp("2025-01-01"),
+        }))
+        self.assertEqual(ev["evidence_status"], checks.EVIDENCE_NO_DEFERRAL)
+
+    def test_date_anomaly_is_label_only_and_changes_no_phase(self):
+        # The anomaly must not gate the row or alter the calculation; applying
+        # a date-anomaly gate is a separate client-confirmed decision.
+        clean = checks._lookup_deferral(self._memo(), "6673679110", KNOWN_LENDER,
+                                        pd.Timestamp("2026-05-01"), "ACTIVE")
+        anomalous = checks._lookup_deferral(
+            self._memo(**{"Deferral End Date": pd.Timestamp("2020-01-01")}),
+            "6673679110", KNOWN_LENDER, pd.Timestamp("2026-05-01"), "ACTIVE")
+        self.assertEqual(anomalous[3]["evidence_status"], checks.EVIDENCE_DATE_ANOMALY)
+        self.assertEqual(anomalous[0]["deferral_type"], clean[0]["deferral_type"])
+        self.assertEqual(anomalous[0]["months_since_start"], clean[0]["months_since_start"])
+
+    def test_evidence_is_always_a_dict_with_a_stable_shape(self):
+        # Consumers never test for key presence, so every exit must return the
+        # same keys — including the ones returning no deferral at all.
+        keys = {"evidence_status", "deferral_start", "deferral_end",
+                "deferral_resume", "securitization_action"}
+        for df, cycle in ((self._memo(), "2026-05-01"), (self._memo(), "2027-06-01")):
+            self.assertEqual(set(self._evidence(df, cycle=cycle)), keys)
+        self.assertEqual(set(checks._lookup_deferral(None, "1", "X", pd.Timestamp("2026-05-01"))[3]), keys)
+
+    def test_dates_are_display_strings_never_timestamps(self):
+        # These cross into JSON, Excel and the review page unchanged.
+        for value in self._evidence(self._memo()).values():
+            self.assertIsInstance(value, str)

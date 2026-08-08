@@ -50,6 +50,39 @@ function paymentUnits(rec) {
   return adjusted / sched
 }
 
+// The deferral-evidence contract, computed ONCE in checks.py (STAT-01) and
+// only rendered here. This screen must never re-derive what the evidence says
+// from the dates or the memo action — that is precisely the drift the shared
+// contract exists to prevent. These maps translate the value for a reader;
+// they do not decide it.
+const EVIDENCE_MEANING = {
+  'documented': 'deferral confirmed, dates consistent, type known',
+  'no-deferral': 'no deferral applies to this cycle',
+  'deferral-claimed-dates-missing': 'a deferral is asserted but no usable start date was written',
+  'lookup-failed': 'memo rows exist for this loan but none matched a known Lender for this servicer — NOT evidence that there is no deferral',
+  'date-anomaly': 'the matched memo row has impossible dates (end or resume before start)',
+  'type-unclassified': 'the memo does not say whether this is full P&I or partial — the delinquency figure is provisional pending confirmation',
+}
+
+const EVIDENCE_COLORS = {
+  'lookup-failed': 'var(--amber, #BA7517)',
+  'date-anomaly': 'var(--amber, #BA7517)',
+  'deferral-claimed-dates-missing': 'var(--amber, #BA7517)',
+  'type-unclassified': 'var(--amber, #BA7517)',
+}
+
+// Shown whenever there is deferral evidence worth reading. "no-deferral" is a
+// fact rather than a finding, so it stays out of the way; every other status
+// is surfaced, including "documented", since the window and the memo label are
+// exactly what a reviewer needs to judge a deferral-driven correction.
+function hasDeferralEvidence(rec) {
+  return Boolean(rec.evidenceStatus) && rec.evidenceStatus !== 'no-deferral'
+}
+
+function dash(value) {
+  return value === null || value === undefined || value === '' ? '—' : String(value)
+}
+
 export default function CorrectionReview({ recommendations, sessionId }) {
   const recs = recommendations || []
   const [decisions, setDecisions] = useState({}) // id -> {decision, approved_value, note, notify}
@@ -209,6 +242,26 @@ export default function CorrectionReview({ recommendations, sessionId }) {
                     />
                   </td>
                 </tr>
+                {hasDeferralEvidence(r) && (
+                  <tr>
+                    <td colSpan={10} className="hint">
+                      <strong>Deferral evidence:</strong>{' '}
+                      <span style={{ color: EVIDENCE_COLORS[r.evidenceStatus] || 'inherit' }}>
+                        {r.evidenceStatus}
+                      </span>
+                      {EVIDENCE_MEANING[r.evidenceStatus] && (
+                        <> — {EVIDENCE_MEANING[r.evidenceStatus]}</>
+                      )}
+                      <div>
+                        Memo action {dash(r.memoSecuritizationAction)} · Window{' '}
+                        {dash(r.deferralStart)} → {dash(r.deferralEnd)} · Resume{' '}
+                        {dash(r.deferralResume)} · Prior (SOUP) Loan Status{' '}
+                        {dash(r.priorLoanStatus)} · Servicer Loan Status{' '}
+                        {dash(r.servicerLoanStatus)}
+                      </div>
+                    </td>
+                  </tr>
+                )}
                 {r.reviewFlag && (
                   <tr>
                     <td colSpan={10} style={{ color: 'var(--amber, #BA7517)' }}>
