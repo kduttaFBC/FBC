@@ -97,6 +97,16 @@ The review payload (`corrections.build_recommendations`) and the reconciliation 
 
 There is a dollar consequence that raises the stakes: `report.py`'s Portfolio Summary has a `Deferred` bucket (line 297), and the Original-vs-Audited pair differs only in "which Delinquency Status source feeds the aging buckets." A silently-unrecognized deferral misbuckets its balance into a delinquency band — the same failure mode `corrections.py` already documents costing 584,023.61 unbucketed on one mistyped status (lines 78–81). Silent memo misses aren't just a blank cell; they move money into the wrong bucket.
 
+## Interim treatment for unclassified deferrals (governing decision, 2026-08-07)
+
+Where the Servicer Memo confirms a deferral but does not specify whether it is full P&I or partial, the application preserves the existing full-P&I / freeze calculation **solely to avoid changing portfolio results on unresolved evidence**. The loan is classified `unclassified`, receives a `DEFERRAL DATA QUALITY WARNING`, and is excluded from automatic correction. **The resulting delinquency status is provisional, pending human confirmation of the deferral type.**
+
+This is *not* neutral arithmetic — it is a deliberate provisional lenient assumption, and it must be described that way, never as "no number moves." Full P&I freezes the delinquency rank (no payment was due); partial runs normal missed-payment math (interest was still due). With the type unknown, preserving the freeze leans lenient — exactly as recomputing on the no-deferral path (Option A) would lean strict and move real dollars ($280,162.64 from Current to 60 Days on one Millennium loan, measured on the June-2026 run). Neither assumption is objectively correct until the type is known, so the rule preserves the established number, declares it provisional, and routes the resolution to a human.
+
+Why this interim rule (B) over recomputing (A): (1) it preserves the established calculation rather than introducing a new financial result because the parser got more honest; (2) `unclassified` plus the warning stop the system from presenting the assumption as fact; (3) exclusion from auto-correction stops the lenient assumption from quietly becoming a written status change.
+
+**Resolution path (follow-on, not part of this change):** the interactive review screen must show the reviewer the `UNCLASSIFIED` type, the Servicer Action text, the interim treatment (Full P&I / freeze), the reason (the memo does not state whether interest payments remain due), and a *Review required* prompt to confirm Full P&I or Partial. Once the reviewer confirms the type, the definitive delinquency status is calculated from the correct rule. Until then, every unclassified figure is labeled provisional.
+
 ## Sequence
 
 The trace of GP 6673679110 reorders this away from the original "parse dates, then fix the resume logic." The resume logic is already correct; the problem is upstream — valid deferral evidence is excluded before STAT-01 ever gets to apply the lifecycle. So the sequence now verifies and *protects* existing logic before changing any rule.
