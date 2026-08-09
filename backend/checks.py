@@ -1448,11 +1448,26 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     # to detect this in the Servicer Loan Status field.
     srf_status_is_terminal_collection = any(k in srf_status_u for k in _TERMINAL_COLLECTION_KEYWORDS)
 
-    # NB the terminal short-circuit literal widens with the call: a terminal
-    # loan never consults the memo, so its evidence is "no-deferral" — stated,
-    # not left as a bare None for a renderer to interpret.
+    # NARROWED 2026-08-08. A terminal status used to skip the memo lookup
+    # entirely, which meant a servicer-reported LIQUIDATION/FORECLOSURE/REO
+    # silently suppressed every piece of INDEPENDENT memo evidence for that
+    # loan -- including evidence that would have established a different
+    # Expected Loan Status (e.g. a documented deferral whose Regular Payment
+    # Resume Date has passed, which sets expected to the resumed status rather
+    # than SOUP's stale DEFERRED). The servicer's own claim must not be able
+    # to switch off independent evidence about itself.
+    #
+    # Terminal COLLECTION loans now consult the memo exactly like any other
+    # loan. Branch B statuses (PAID/PIF/CHARGE/CANCEL/WITHDRAWN) keep the
+    # short-circuit unchanged -- they are being reviewed separately, and a
+    # finished loan has no deferral timeline to place.
+    #
+    # The short-circuit literal widens with the call: a skipped loan's
+    # evidence is stated as "no-deferral" rather than left a bare None for a
+    # renderer to interpret.
+    skip_memo_lookup = is_terminal_this_cycle and not srf_status_is_terminal_collection
     deferral, memo_warning, warning_type, deferral_evidence = (
-        (None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)) if is_terminal_this_cycle
+        (None, None, None, _deferral_evidence(EVIDENCE_NO_DEFERRAL)) if skip_memo_lookup
         else _lookup_deferral(memo_df, gp, servicer_name, cycle_month, soup_status=soup_status)
     )
 
@@ -1468,69 +1483,43 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     # would have handled it.
     received_is_negative = received is not None and pd.notna(received) and float(received) < 0
 
-    if is_terminal_this_cycle:
-        if srf_status_is_terminal_collection:
-            # CLIENT-CONFIRMED (2026-08-04): FORECLOSURE/
-            # LIQUIDATION/REO are ACTIVE collection statuses, not finished
-            # loans -- do NOT blank the ranking to CURRENT like the generic
-            # terminal-status case below, and do NOT apply catch-up credit
-            # that could IMPROVE the ranking (client Rule 1). The servicer's
-            # own reported Delinquency Status is trusted ONLY when it's a
-            # clean, precise ladder value -- an open-ended bucket label like
-            # "150+ Days" is NOT trusted numerically (the trailing "+" means
-            # "at least this much, exact figure unknown", and taking it at
-            # face value can silently UNDERSTATE the true ranking -- caught
-            # on loan 5387239101: Servicer DQ "150+ Days" parsed as
-            # missed=6, LOWER than the loan's own prior recorded 240 DAYS
-            # (missed=9), with zero payment evidence to justify that
-            # improvement — Payment Received was $0 this cycle).
-            #
-            # The final value is the greater of:
-            #   (a) a "degradation-only" floor -- the prior missed count
-            #       advanced by the SAME insufficient/no-payment rule used
-            #       everywhere else in this file, but NEVER reduced by a
-            #       catch-up credit (the explicit prohibition in Rule 1);
-            #   (b) the servicer's own reported value, but ONLY when it
-            #       parses cleanly with no trailing "+" -- a "+"-suffixed
-            #       bucket is never used numerically, since it's known to
-            #       potentially understate the truth.
-            # This lets a servicer's WORSE, precise report still be trusted
-            # (Rule 2), while never letting an imprecise bucket, or the
-            # absence of a payment, silently improve the ranking.
-            #
-            # *** PENDING BUSINESS RULE DECISION (as of 2026-08-04) ***
-            # A NEGATIVE Payment Received (a reversal) for a
-            # FORECLOSURE/LIQUIDATION/REO loan is CURRENTLY treated the
-            # same as "no payment" here (a flat +1), NOT run through the
-            # full reversal-equivalents formula (total_payment_deficiency /
-            # (scheduled_payment * PAYMENT_SUFFICIENCY_THRESHOLD)) used for
-            # non-terminal loans elsewhere in this function. That formula
-            # could advance the ranking by MORE than one level for a large
-            # reversal, which is plausible and arguably more accurate for
-            # these loans too — but this has NOT been explicitly confirmed,
-            # and must not be assumed or silently changed here. See
-            # test_delinquency_ladder.py's
-            # TerminalCollectionNegativePaymentPendingDecisionTests for a
-            # regression test documenting the CURRENT flat-+1 behavior —
-            # when this decision is made, that test's expectations must be
-            # updated deliberately, alongside this comment, not silently.
-            degradation_floor = None
-            if prior_missed is not None:
-                if received is None or pd.isna(received) or float(received) <= 0:
-                    degradation_floor = prior_missed + 1
-                elif scheduled is None or pd.isna(scheduled) or float(scheduled) <= 0:
-                    degradation_floor = prior_missed  # can't judge sufficiency without a valid scheduled amount -- hold, don't guess
-                else:
-                    ratio = float(received) / float(scheduled)
-                    degradation_floor = prior_missed + 1 if ratio < PAYMENT_SUFFICIENCY_THRESHOLD else prior_missed
-
-            srf_dq_is_open_ended = "+" in str(srf_dq)
-            srf_dq_missed = _status_to_missed_count(srf_dq) if srf_dq and not srf_dq_is_open_ended else None
-
-            candidates = [v for v in (degradation_floor, srf_dq_missed) if v is not None]
-            calculated_dq = _missed_count_to_status(max(candidates)) if candidates else "UNVERIFIED"
-        else:
-            calculated_dq = "CURRENT"
+    # SUPERSEDED 2026-08-08 — the CLIENT-CONFIRMED (2026-08-04) rule that gave
+    # FORECLOSURE/LIQUIDATION/REO their own delinquency calculation is no
+    # longer in force. History, kept deliberately rather than deleted:
+    #
+    #   The 2026-08-04 rule computed these loans' Delinquency Status from a
+    #   "degradation-only floor" (the prior missed count advanced, never
+    #   reduced by catch-up credit) and then took max(floor, servicer's own
+    #   reported DQ), trusting the servicer's value whenever it was worse and
+    #   precise. It was introduced to fix loan 5387239101, where an open-ended
+    #   "150+ Days" bucket parsed LOWER than the loan's own prior 240 DAYS and
+    #   silently improved the ranking with no payment to justify it.
+    #
+    #   Superseded because terminal collection status and delinquency
+    #   calculation are SEPARATE CONCEPTS. A servicer reporting LIQUIDATION is
+    #   evidence to review, not a reason to compute this loan's delinquency
+    #   differently from every other loan, and not a licence for the
+    #   servicer's own reported DQ to determine the audited figure — that let
+    #   the servicer's number validate itself.
+    #
+    # These loans now follow the SAME normal ladder as everything else:
+    # calculated from prior SOUP delinquency status and this cycle's payment
+    # activity, including catch-up credit. The servicer's reported DQ is
+    # displayed for comparison and still raises DELINQUENCY STATUS MISMATCH
+    # when it differs, but never enters the calculation. Note this also
+    # retires the "150+ Days" hazard by construction rather than by special
+    # case: a value that never enters the calculation cannot corrupt it.
+    #
+    # Everything INFORMATIONAL about these loans is unchanged: the TERMINAL
+    # STATUS REVIEW reason, STAT-02, exclusion from auto-correction, and the
+    # always-visible row.
+    #
+    # Branch B below (PAID/PIF/CHARGE/CANCEL/WITHDRAWN blanked to CURRENT) is
+    # deliberately NOT changed here. Those statuses raise a different question
+    # -- some may legitimately end the scheduled-payment relationship -- and
+    # are being reviewed separately.
+    if is_terminal_this_cycle and not srf_status_is_terminal_collection:
+        calculated_dq = "CURRENT"
     elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES and deferral["phase"] == "resume":
         # Client-confirmed: the cycle containing Regular Payment Resume
         # Date resets the delinquency baseline to CURRENT, then applies
@@ -1702,17 +1691,35 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     if "BANKRUPT" in srf_status_u:
         expected_loan_status = srf_status
 
-    # CLIENT-CONFIRMED (2026-08-04): same "arriving is not a mismatch"
-    # principle as BANKRUPTCY above — FORECLOSURE/LIQUIDATION/REO reported
-    # by the servicer this cycle is accepted as authoritative for Loan
-    # Status, regardless of what SOUP's prior status was. One-directional,
-    # same as BANKRUPTCY/PAID-IN-FULL: only overrides when the CURRENT
-    # servicer report says one of these; leaving one of these statuses for
-    # something else stays subject to the normal comparison. Does not touch
-    # calculated_dq here — that's handled separately above, using a
-    # degradation-only floor rather than blanking to CURRENT.
-    if srf_status_is_terminal_collection:
-        expected_loan_status = srf_status
+    # SUPERSEDED 2026-08-08 — the CLIENT-CONFIRMED (2026-08-04) rule here
+    # accepted a servicer-reported FORECLOSURE/LIQUIDATION/REO as
+    # authoritative for Expected Loan Status, on the same "arriving is not a
+    # mismatch" principle as BANKRUPTCY/PAID-IN-FULL above.
+    #
+    # Superseded because it let the servicer's assertion validate itself: the
+    # audit adopted the servicer's status as the expected one, so the two
+    # could never disagree and no LOAN STATUS MISMATCH was possible. A
+    # servicer-reported terminal status is EVIDENCE TO REVIEW, not the source
+    # of truth.
+    #
+    # Expected Loan Status is now determined from independent evidence, which
+    # is what the existing fallback already does: SOUP's last recorded status
+    # (`expected_loan_status or soup_status` in status_match_check). Where the
+    # servicer's claim and that evidence disagree, LOAN STATUS MISMATCH is
+    # raised — which is the point.
+    #
+    # The Servicer Memo is deliberately NOT used to infer or confirm
+    # LIQUIDATION/FORECLOSURE/REO. Doing so requires an explicitly defined
+    # business requirement establishing how such confirmation works; none
+    # exists, so none is implemented. (The delivered memo carries zero rows
+    # mentioning any of the three in Securitization Action or Servicer Action,
+    # so there is nothing to read even if one wanted to.) Do not add memo-based
+    # inference here without that requirement.
+    if srf_status_is_terminal_collection and not expected_loan_status and not str(soup_status or "").strip():
+        # The servicer claims a terminal status and there is NO independent
+        # evidence to weigh it against. Do not guess, and do not adopt the
+        # claim -- say plainly that it could not be established.
+        expected_loan_status = "UNVERIFIED"
 
     return calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, is_terminal_this_cycle, reversal_info, deferral_evidence
 
@@ -1795,11 +1802,10 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # reported Delinquency Status OR the SERVICER'S reported Loan
         # Status. Either one is flagged as its own distinct review item
         # below, separately from a normal calculation disagreement. When
-        # found in Loan Status, calculated_dq above has already been set
-        # using a degradation-only floor (or UNVERIFIED if no floor was
-        # available) rather than blanking to CURRENT — this flag here is
-        # purely for the Reason tag and STAT-02 visibility, it doesn't
-        # change the calculation again.
+        # SUPERSEDED 2026-08-08: when found in Loan Status this no longer
+        # affects calculated_dq at all -- those loans now use the same normal
+        # ladder as every other loan. This flag is purely for the Reason tag,
+        # STAT-02 visibility and exclusion from auto-correction.
         srf_dq_is_terminal_collection = any(k in srf_dq.upper() for k in _TERMINAL_COLLECTION_KEYWORDS)
         srf_status_is_terminal_collection = any(k in srf_status.upper() for k in _TERMINAL_COLLECTION_KEYWORDS)
 
@@ -1826,7 +1832,17 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # normal comparison below, since that's a materially different and
         # unvalidated scenario.
         is_valid_exit_transition = any(k in srf_status.upper() for k in _VALID_EXIT_TRANSITION_KEYWORDS)
-        status_match = is_valid_exit_transition or (srf_status.upper() == (expected_loan_status or soup_status).upper())
+
+        # THE audit's effective Expected Loan Status: the independently
+        # derived override when one applies (confirmed deferral, resume,
+        # bankruptcy, UNVERIFIED), otherwise SOUP's last recorded status.
+        # Computed ONCE and used by every consumer -- the match test below,
+        # the display column, and corrections.py via correction_data -- so no
+        # consumer re-derives it and they cannot drift apart. Previously this
+        # expression appeared twice here and nowhere else, which is why
+        # corrections.py had no way to see it.
+        effective_expected_loan_status = expected_loan_status or soup_status
+        status_match = is_valid_exit_transition or (srf_status.upper() == effective_expected_loan_status.upper())
 
         # CLIENT-CONFIRMED (2026-08-04): whenever the CHANGE IN TERMS
         # AGREEMENT resume exception (see _check_change_in_terms_resume)
@@ -1925,22 +1941,24 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         if srf_dq_is_terminal_collection and srf_status_is_terminal_collection:
             terminal_status_review_detail = (
                 f"Both the Servicer Loan Status ({srf_status!r}) and Servicer Delinquency Status "
-                f"({srf_dq!r}) contain a terminal collection status. Normal catch-up logic was not "
-                f"applied. The Calculated DQ Status uses a degradation-only floor based on prior "
-                f"SOUP status and current payment activity. A precise servicer DQ value is retained "
-                f"only when it is equal to or worse than that floor. Open-ended values such as "
-                f"\"150+ Days\" remain visible for transparency but are not treated as exact ladder "
-                f"positions. This loan needs manual review, not an automatic ranking comparison."
+                f"({srf_dq!r}) contain a terminal collection status. This is a REVIEW SIGNAL "
+                f"about the loan's collection state, not an input to the delinquency calculation: "
+                f"the Calculated DQ Status above was computed by the same normal ladder used for "
+                f"every other loan, from the prior SOUP delinquency status and this cycle's payment "
+                f"activity. The servicer's reported Delinquency Status is shown for comparison only "
+                f"and does not determine the calculated value. This loan needs manual review of the "
+                f"reported terminal status itself."
             )
         elif srf_status_is_terminal_collection:
             terminal_status_review_detail = (
                 f"Servicer Loan Status ({srf_status!r}) contains a terminal collection status. "
-                f"Normal catch-up logic was not applied. The Calculated DQ Status uses a "
-                f"degradation-only floor based on prior SOUP status and current payment activity. "
-                f"A precise servicer DQ value is retained only when it is equal to or worse than "
-                f"that floor. Open-ended values such as \"150+ Days\" remain visible for "
-                f"transparency but are not treated as exact ladder positions. This loan needs "
-                f"manual review rather than an automatic ranking comparison."
+                f"This is a REVIEW SIGNAL that the servicer is reporting this status; it is not "
+                f"treated as authoritative and does not change the delinquency calculation. The "
+                f"Calculated DQ Status above was computed by the same normal ladder used for every "
+                f"other loan, from the prior SOUP delinquency status and this cycle's payment "
+                f"activity, and the Expected Loan Status was determined from independent evidence "
+                f"rather than adopted from this report. Review whether the reported status is "
+                f"supported."
             )
         elif srf_dq_is_terminal_collection:
             terminal_status_review_detail = (
@@ -1956,7 +1974,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "SBA GP Number": gp,
             "Reason": " + ".join(reasons),
             "Servicer Loan Status": srf_status,
-            "Expected Loan Status": expected_loan_status or soup_status,
+            "Expected Loan Status": effective_expected_loan_status,
             "Loan Status Match": "YES" if status_match else "NO",
             "Servicer DQ Status": srf_dq,
             "Prior (SOUP) DQ Status": str(soup_dq_raw).strip(),
@@ -2022,6 +2040,14 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "srf_dq": srf_dq,
             "status_match": status_match,
             "expected_loan_status_raw": expected_loan_status,
+            # The EFFECTIVE expected status (override, else SOUP), computed
+            # once above. corrections.py's terminal-review branch proposes
+            # THIS -- never soup_status directly, which would ignore every
+            # deferral/resume/bankruptcy branch that legitimately changes the
+            # answer. expected_loan_status_raw above stays as it is: the
+            # deferral branch needs to tell a confirmed override apart from a
+            # SOUP value that merely happens to read the same.
+            "expected_loan_status_effective": effective_expected_loan_status,
             "srf_status": srf_status,
             "soup_status": soup_status,
             "deferral_type": deferral["deferral_type"] if deferral else None,
@@ -2152,10 +2178,12 @@ def terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_
     return _result(
         "STAT-02", "Terminal Status Review", "SBA Reconciliation", "WARN", records,
         lambda n: f"{n} loan(s) reported by the servicer as FORECLOSURE, LIQUIDATION, or REO this "
-                  f"cycle — surfaced for manual review. These loans are excluded from automatic "
-                  f"corrections; their Calculated DQ Status uses a degradation-only floor based on "
-                  f"prior SOUP status and current payment activity, retaining a precise servicer DQ "
-                  f"value only when it is equal to or worse than that floor.",
+                  f"cycle — surfaced for manual review. A servicer-reported terminal status is "
+                  f"evidence to review, not the source of truth: these loans are excluded from "
+                  f"automatic corrections, and their Calculated DQ Status is computed by the same "
+                  f"normal delinquency ladder as every other loan (prior SOUP status plus this "
+                  f"cycle's payment activity). The servicer's reported Delinquency Status is shown "
+                  f"for comparison only and never determines the calculated value.",
     )
 
 

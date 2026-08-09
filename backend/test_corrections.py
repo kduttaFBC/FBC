@@ -839,3 +839,173 @@ class UnclassifiedDeferralArithmeticTests(unittest.TestCase):
                     pd.Timestamp("2026-04-01"), "DEFERRED")
                 self.assertIsNone(warning)
                 self.assertIsNone(warning_type)
+
+
+class TerminalStatusRoutesToReviewTests(unittest.TestCase):
+    """A servicer-reported terminal status routes corrections TO interactive
+    review; it never excludes them FROM it (2026-08-08).
+
+    The distinction the rules now draw: GENERATING a recommendation is
+    permitted when independent evidence contradicts the servicer's claim;
+    AUTOMATICALLY APPLYING one remains impossible. Every correction here is
+    review_required and writes only on explicit approval.
+    """
+
+    def _entry(self, **over):
+        base = dict(
+            reasons=["LOAN STATUS MISMATCH", "DELINQUENCY STATUS MISMATCH", "TERMINAL STATUS REVIEW"],
+            dq_match=False, calculated_dq="90 DAYS", srf_dq="120 DAYS",
+            status_match=False, srf_status="LIQUIDATION", soup_status="PAID-IN-FULL",
+            expected_loan_status_raw=None, expected_loan_status_effective="PAID-IN-FULL",
+        )
+        base.update(over)
+        return _correction_data_entry("4338609104", [4], **base)
+
+    def test_terminal_status_does_not_suppress_the_dq_candidate(self):
+        recs, _, _ = _recommend([self._entry()])
+        dq = [r for r in recs if r["field"] == "Delinquency Status"]
+        self.assertEqual(len(dq), 1)
+        self.assertEqual(dq[0]["calculated"], "90 DAYS")
+
+    def test_dq_candidate_is_flagged_for_review_not_auto_applied(self):
+        recs, _, _ = _recommend([self._entry()])
+        dq = next(r for r in recs if r["field"] == "Delinquency Status")
+        self.assertIsNotNone(dq["reviewFlag"])
+        self.assertIn("terminal collection status", dq["reviewFlag"])
+
+    def test_loan_status_candidate_uses_the_audits_effective_expected_value(self):
+        recs, _, _ = _recommend([self._entry()])
+        ls = next(r for r in recs if r["field"] == "Loan Status")
+        self.assertEqual(ls["calculated"], "PAID-IN-FULL")
+        self.assertIsNotNone(ls["reviewFlag"])
+
+    def test_both_correction_types_appear_for_the_same_loan(self):
+        recs, _, _ = _recommend([self._entry()])
+        self.assertEqual({r["field"] for r in recs}, {"Loan Status", "Delinquency Status"})
+        self.assertEqual(len({r["id"] for r in recs}), 2)
+
+    def test_proposed_value_is_never_the_servicers_own_terminal_status(self):
+        # The whole point: a terminal status must not validate itself.
+        recs, _, _ = _recommend([self._entry()])
+        for r in recs:
+            self.assertNotIn("LIQUIDATION", str(r["calculated"]).upper())
+
+    def test_stale_soup_is_not_proposed_when_the_audit_derived_something_else(self):
+        # SOUP still says DEFERRED, but the memo/resume logic established
+        # ACTIVE. The candidate must follow the audit's effective value, not
+        # copy prior SOUP -- this is why the branch reads
+        # expected_loan_status_effective rather than soup_status.
+        recs, _, _ = _recommend([self._entry(
+            soup_status="DEFERRED", expected_loan_status_effective="ACTIVE")])
+        ls = next(r for r in recs if r["field"] == "Loan Status")
+        self.assertEqual(ls["calculated"], "ACTIVE")
+
+    def test_unverified_expected_value_produces_no_loan_status_candidate(self):
+        # Insufficient or contradictory independent evidence -> no proposal.
+        recs, _, _ = _recommend([self._entry(expected_loan_status_effective="UNVERIFIED")])
+        self.assertEqual([r["field"] for r in recs], ["Delinquency Status"])
+
+    def test_collection_status_is_never_proposed_even_if_it_is_the_expected_value(self):
+        recs, _, _ = _recommend([self._entry(
+            srf_status="ACTIVE", expected_loan_status_effective="LIQUIDATION",
+            reasons=["LOAN STATUS MISMATCH", "TERMINAL STATUS REVIEW"], dq_match=True)])
+        self.assertEqual([r["field"] for r in recs], [])
+
+    def test_no_candidate_when_expected_matches_what_the_servicer_reported(self):
+        recs, _, _ = _recommend([self._entry(expected_loan_status_effective="LIQUIDATION")])
+        self.assertNotIn("Loan Status", [r["field"] for r in recs])
+
+
+class TerminalWriteRequiresExplicitApprovalTests(unittest.TestCase):
+    """The write guard must FAIL CLOSED: a terminal Loan Status is writable
+    only when the correction carries explicit reviewer approval, and that flag
+    is set in exactly one place — after the decision is confirmed to be an
+    approval and the value has passed validation."""
+
+    def _corr(self, value="PAID-IN-FULL", **over):
+        c = {"gp": "1", "field": "Loan Status", "corrected_value": value,
+             "excel_rows": [4], "sheet_name": "Servicer Inputs",
+             "header_excel_row": HEADER_ROW, "skipped_row_refs": [],
+             "eligibility_rule": "test fixture", "reported_value": "LIQUIDATION"}
+        c.update(over)
+        return c
+
+    def _wb(self):
+        file_bytes, rows = _build_workbook_bytes([
+            {"SBA GP Number": "1", "Loan Status": "LIQUIDATION", "Delinquency Status": "CURRENT",
+             "Beginning Balance": 100000, "Ending Balance": 100000, "Payment Received": 0,
+             "Scheduled Payment": 500},
+        ])
+        return load_workbook(io.BytesIO(file_bytes), data_only=False), rows
+
+    def test_paid_in_full_refused_without_the_approval_flag(self):
+        wb, _ = self._wb()
+        ok, detail = corrections._apply_one_correction(wb, self._corr())
+        self.assertFalse(ok)
+        self.assertIn("explicit reviewer approval", detail)
+
+    def test_paid_in_full_written_with_the_approval_flag(self):
+        wb, rows = self._wb()
+        ok, _ = corrections._apply_one_correction(wb, self._corr(reviewer_approved=True))
+        self.assertTrue(ok)
+        self.assertEqual(wb["Servicer Inputs"].cell(row=rows[0], column=2).value, "PAID-IN-FULL")
+
+    def test_collection_status_refused_even_with_the_approval_flag(self):
+        for value in ("LIQUIDATION", "FORECLOSURE", "REO"):
+            with self.subTest(value=value):
+                wb, _ = self._wb()
+                ok, detail = corrections._apply_one_correction(
+                    wb, self._corr(value=value, reviewer_approved=True))
+                self.assertFalse(ok)
+                self.assertIn("may never create", detail)
+
+    def test_non_terminal_values_need_no_approval_flag(self):
+        # ACTIVE/DEFERRED are unaffected by the terminal rule.
+        for value in ("ACTIVE", "DEFERRED"):
+            with self.subTest(value=value):
+                wb, _ = self._wb()
+                ok, _ = corrections._apply_one_correction(wb, self._corr(value=value))
+                self.assertTrue(ok)
+
+
+class TerminalApprovedValueDomainTests(unittest.TestCase):
+    """PAID-IN-FULL may be APPROVED from a generated recommendation, but never
+    typed in as a freeform substitution."""
+
+    def test_paid_in_full_accepted_when_not_substituted(self):
+        ok, value = corrections.validate_approved_value("Loan Status", "PAID-IN-FULL", substituted=False)
+        self.assertTrue(ok)
+        self.assertEqual(value, "PAID-IN-FULL")
+
+    def test_paid_in_full_refused_as_a_substitution(self):
+        ok, reason = corrections.validate_approved_value("Loan Status", "PAID-IN-FULL", substituted=True)
+        self.assertFalse(ok)
+        self.assertIn("may never create or remove", reason)
+
+    def test_soup_spelling_is_canonicalised_to_the_workbook_representation(self):
+        # SOUP carries "Paid-in-Full" alongside "PAID-IN-FULL"; the servicer
+        # workbooks are uniformly "PAID-IN-FULL".
+        for spelling in ("Paid-in-Full", "paid in full", "PAID-IN-FULL"):
+            with self.subTest(spelling=spelling):
+                ok, value = corrections.validate_approved_value("Loan Status", spelling, substituted=False)
+                self.assertTrue(ok)
+                self.assertEqual(value, "PAID-IN-FULL")
+
+    def test_collection_status_refused_on_both_routes(self):
+        for sub in (True, False):
+            for value in ("LIQUIDATION", "FORECLOSURE", "REO"):
+                with self.subTest(substituted=sub, value=value):
+                    ok, _ = corrections.validate_approved_value("Loan Status", value, substituted=sub)
+                    self.assertFalse(ok)
+
+    def test_active_and_deferred_still_work_on_both_routes(self):
+        for sub in (True, False):
+            for value in ("ACTIVE", "DEFERRED"):
+                with self.subTest(substituted=sub, value=value):
+                    ok, out = corrections.validate_approved_value("Loan Status", value, substituted=sub)
+                    self.assertTrue(ok)
+                    self.assertEqual(out, value)
+
+    def test_cross_domain_value_still_refused_when_not_substituted(self):
+        ok, _ = corrections.validate_approved_value("Loan Status", "60 DAYS", substituted=False)
+        self.assertFalse(ok)

@@ -89,6 +89,51 @@ REVIEW_REASON_CROSS_DOMAIN = (
     "Reported Delinquency Status contains an invalid cross-domain value."
 )
 
+REVIEW_REASON_TERMINAL_STATUS = (
+    "The servicer reports a terminal collection status (FORECLOSURE / "
+    "LIQUIDATION / REO) for this loan. That report is evidence to review, not "
+    "a confirmed fact: it does not validate itself and it does not change the "
+    "delinquency calculation. Requires explicit reviewer approval before "
+    "anything is written."
+)
+
+# Loan Status values this tool must NEVER write, whoever approves. Distinct
+# from _LOAN_STATUS_TERMINAL_KEYWORDS below, which also covers PAID-IN-FULL:
+# PAID-IN-FULL MAY be written once a reviewer explicitly approves it
+# (2026-08-08), whereas a collection status must never be CREATED -- that is
+# the self-validation this rule exists to prevent.
+_NEVER_WRITABLE_LOAN_STATUS = ("LIQUIDATION", "FORECLOSURE", "REO")
+
+
+def _is_never_writable_loan_status(status_value):
+    s = str(status_value or "").strip().upper()
+    return any(k in s for k in _NEVER_WRITABLE_LOAN_STATUS)
+
+
+# Loan Status values the terminal-review branch may PROPOSE from independent
+# evidence. Deliberately SEPARATE from _PERMITTED_LOAN_STATUS, which governs
+# reviewer SUBSTITUTIONS and stays {ACTIVE, DEFERRED}: PAID-IN-FULL may be
+# proposed when SOUP independently supports it, but may never be typed in by
+# hand. An allow-list, not a deny-list, so blank, UNVERIFIED, malformed and
+# cross-domain values ("CURRENT", "60 DAYS") are rejected by construction.
+# NOT every valid SOUP Loan Status belongs here: BANKRUPTCY, SUBSTITUTION-IN
+# and SUBSTITUTION-OUT are real SOUP values deliberately left out.
+_PROPOSABLE_LOAN_STATUS = ("ACTIVE", "DEFERRED", "PAID-IN-FULL")
+
+
+def _canonical_loan_status(value):
+    """Validity check and canonicaliser in one. Returns the CANONICAL spelling
+    of a proposable Loan Status, or None if the value may not be proposed.
+
+    Canonicalising matters: SOUP is mixed-case and mixed-format ("Paid-in-Full"
+    alongside "PAID-IN-FULL", "Active"/"ACTiVE"), while the servicer workbooks
+    this tool writes into are uniformly "PAID-IN-FULL"/"ACTIVE". Uppercasing
+    whatever SOUP happened to contain works only by luck -- a SOUP value of
+    "Paid in Full" would write "PAID IN FULL" into a workbook whose canon is
+    hyphenated. Resolving through this table guarantees the workbook's own
+    representation regardless of how SOUP spelled it."""
+    return {_norm(v): v for v in _PROPOSABLE_LOAN_STATUS}.get(_norm(value))
+
 
 def _is_cross_domain_dq(value):
     """True when a reported Delinquency Status is outside the permitted
@@ -123,8 +168,26 @@ def _is_cross_domain_dq(value):
 #      Also satisfied by construction (corrected_value is always "DEFERRED").
 #   5. Loan Status corrections are limited to "anything -> DEFERRED", only
 #      for a CONFIRMED Full P&I deferral, phase "start" or "mid".
-#   6. Every other Loan Status mismatch is left for manual review — no other
-#      Loan Status correction branch exists in this module.
+#   6. Every other Loan Status mismatch is left for manual review.
+#
+# NARROWED 2026-08-08 — rules 2, 3 and 4 were written when this module
+# AUTO-APPLIED corrections. Since the review-then-generate restructure there
+# is no automatic-apply path: /api/audit only recommends, and
+# generate_reviewed_workbook writes solely what a reviewer explicitly
+# approved. Left unchanged, those rules vetoed a HUMAN's decision rather than
+# an automatic write, which was never their purpose.
+#
+# They now separate the two things they had conflated:
+#   GENERATING a recommendation is permitted when INDEPENDENT evidence (SOUP's
+#     last recorded status) contradicts the servicer's current terminal claim.
+#   AUTOMATICALLY APPLYING one remains impossible -- every such correction is
+#     review_required and writes only on explicit approval.
+#
+# UNCHANGED: a collection status (LIQUIDATION/FORECLOSURE/REO) is never
+# writable by any route; the substitution domain stays {ACTIVE, DEFERRED};
+# cross-domain protection is untouched; the deferral branch is untouched.
+# PAID-IN-FULL may now be PROPOSED when independently supported, and written
+# only on explicit approval -- never by substitution.
 _LOAN_STATUS_TERMINAL_KEYWORDS = ("LIQUIDATION", "PAID-IN-FULL", "PIF")
 
 
@@ -145,7 +208,7 @@ def _is_terminal_loan_status(status_value):
 _PERMITTED_LOAN_STATUS = {"ACTIVE", "DEFERRED"}
 
 
-def validate_approved_value(field, value):
+def validate_approved_value(field, value, substituted=True):
     """The approved-value domain restriction. A reviewer's substituted value
     must come only from the target field's own domain, so a substitution can
     never reintroduce a cross-domain value (the exact defect that flags a
@@ -164,9 +227,29 @@ def validate_approved_value(field, value):
             )
         return True, v
     if field == "Loan Status":
+        # Unconditional, both routes: a collection status is never writable by
+        # anyone. This is what stops the tool creating LIQUIDATION/FORECLOSURE/
+        # REO out of the servicer's own assertion.
+        if _is_never_writable_loan_status(v):
+            return False, (
+                f"Refused '{value}' — corrections may never create a LIQUIDATION, "
+                f"FORECLOSURE or REO status."
+            )
+        if not substituted:
+            # NARROWED 2026-08-08: the reviewer is approving the value the
+            # AUDIT derived, not one they typed. PAID-IN-FULL is permitted
+            # here and only here -- it is independently supported by STAT-01's
+            # Expected Loan Status, and reaches this point only via an
+            # explicit approval of a review_required recommendation.
+            canonical = _canonical_loan_status(v)
+            if canonical is None:
+                return False, f"'{value}' is not a proposable Loan Status."
+            return True, canonical
+        # A reviewer TYPING a value stays on the original narrow domain, so a
+        # substitution can never turn a loan terminal or cross-domain.
         if _is_terminal_loan_status(v):
             return False, (
-                f"Refused '{value}' — automatic corrections may never create or remove a "
+                f"Refused '{value}' — a substituted value may never create or remove a "
                 f"LIQUIDATION or PAID-IN-FULL status."
             )
         if v in _PERMITTED_DQ_STATUS or v not in _PERMITTED_LOAN_STATUS:
@@ -420,12 +503,20 @@ def build_eligible_corrections(correction_data):
             and _is_real_dq_value(c.get("calculated_dq"))
         ):
             _cross_domain = _is_cross_domain_dq(c.get("srf_dq"))
+            # A servicer-reported terminal status forces HUMAN REVIEW of this
+            # loan's corrections; it never suppresses them. The delinquency
+            # figure was calculated by the same normal ladder as every other
+            # loan, and the servicer's reported DQ played no part in it.
+            _terminal = _is_terminal_loan_status(c.get("srf_status"))
             _emit(
                 "Delinquency Status",
                 str(c["calculated_dq"]).strip().upper(),
                 "STAT-01 deterministic calculation",
-                review_required=_cross_domain,
-                review_reason=REVIEW_REASON_CROSS_DOMAIN if _cross_domain else None,
+                review_required=_cross_domain or _terminal,
+                review_reason=(
+                    REVIEW_REASON_CROSS_DOMAIN if _cross_domain
+                    else REVIEW_REASON_TERMINAL_STATUS if _terminal else None
+                ),
             )
 
         # --- Loan Status -> DEFERRED (confirmed Full P&I only, v1) --------------
@@ -459,6 +550,49 @@ def build_eligible_corrections(correction_data):
             and not _is_terminal_loan_status(c.get("soup_status"))
         ):
             _emit("Loan Status", "DEFERRED", f"STAT-01 confirmed Full P&I deferral ({c.get('deferral_phase')})")
+
+        # --- Loan Status: servicer-asserted terminal status contradicted by
+        # --- independent evidence (2026-08-08) --------------------------------
+        # SEPARATE from the deferral branch above, which is untouched. Scoped
+        # to one situation: the servicer reports a terminal collection status
+        # this cycle and the audit's own independently derived Expected Loan
+        # Status says something else.
+        #
+        # The proposed value is expected_loan_status_effective -- STAT-01's
+        # single source of truth, computed once in checks.py. Deliberately NOT
+        # soup_status: prior SOUP is independent evidence but not always the
+        # answer, and copying it would ignore every deferral / resume /
+        # bankruptcy branch that legitimately changes it (e.g. SOUP still says
+        # DEFERRED while the memo confirms payments resumed -- expected is the
+        # resumed status, and proposing DEFERRED would be stale). This module
+        # never re-derives that value.
+        #
+        # _canonical_loan_status is both the validity gate and the
+        # canonicaliser: it rejects blank / UNVERIFIED / malformed /
+        # cross-domain values by construction, and returns the workbook's own
+        # spelling rather than whatever case SOUP used.
+        #
+        # ALWAYS review_required -- recommendation only, never written without
+        # explicit approval. A collection status can never be the PROPOSED
+        # value (allow-list, plus the guard here and again at write time), so
+        # this can only move a loan OUT of a servicer-asserted terminal
+        # status, never into one.
+        _proposed_status = _canonical_loan_status(c.get("expected_loan_status_effective"))
+        if (
+            "LOAN STATUS MISMATCH" in reasons
+            and _is_terminal_loan_status(c.get("srf_status"))
+            and _proposed_status is not None
+            and _norm(_proposed_status) != _norm(c.get("srf_status"))
+            and not _is_never_writable_loan_status(_proposed_status)
+        ):
+            _emit(
+                "Loan Status",
+                _proposed_status,
+                "Servicer-reported terminal status contradicted by the audit's independently "
+                "derived Expected Loan Status",
+                review_required=True,
+                review_reason=REVIEW_REASON_TERMINAL_STATUS,
+            )
 
     return eligible
 
@@ -639,11 +773,23 @@ def _apply_one_correction(wb, corr):
     # build_eligible_corrections only ever producing "DEFERRED" today. Checked
     # once for the whole correction, since corrected_value is the same value
     # for every row.
-    if corr["field"] == "Loan Status" and _is_terminal_loan_status(corr["corrected_value"]):
-        return False, (
-            f"Refused to write Loan Status '{corr['corrected_value']}' for loan {corr['gp']} — "
-            f"automatic corrections may never create or remove a LIQUIDATION or PAID-IN-FULL status."
-        )
+    # NARROWED 2026-08-08. A collection status is refused unconditionally --
+    # nothing may ever write LIQUIDATION/FORECLOSURE/REO. PAID-IN-FULL is
+    # refused unless the correction carries explicit reviewer approval: the
+    # rule is "never AUTOMATICALLY", and an approved decision is not
+    # automatic. Fails closed -- a caller that does not set the flag is
+    # refused.
+    if corr["field"] == "Loan Status":
+        if _is_never_writable_loan_status(corr["corrected_value"]):
+            return False, (
+                f"Refused to write Loan Status '{corr['corrected_value']}' for loan {corr['gp']} — "
+                f"corrections may never create a LIQUIDATION, FORECLOSURE or REO status."
+            )
+        if _is_terminal_loan_status(corr["corrected_value"]) and not corr.get("reviewer_approved"):
+            return False, (
+                f"Refused to write Loan Status '{corr['corrected_value']}' for loan {corr['gp']} — "
+                f"a terminal status may only be written on an explicit reviewer approval."
+            )
 
     updated_rows = []
     original_values = []
@@ -888,7 +1034,7 @@ def generate_reviewed_workbook(
         # reviewer may substitute, but only from the field's own domain.
         substituted = d.get("approved_value") not in (None, "")
         approved_input = d.get("approved_value") if substituted else calculated
-        ok, result = validate_approved_value(field, approved_input)
+        ok, result = validate_approved_value(field, approved_input, substituted=substituted)
         if not ok:
             # A substitution outside the field's domain is refused here — it
             # can never reintroduce a cross-domain value or a terminal status.
@@ -908,6 +1054,14 @@ def generate_reviewed_workbook(
 
         corr = dict(cand)
         corr["corrected_value"] = approved_value  # write the APPROVED value, not necessarily the calculated one
+        # Explicit, in-band evidence that a reviewer approved THIS correction.
+        # Set here and nowhere else -- after the decision was confirmed to be
+        # an approval AND the value passed validation. _apply_one_correction
+        # refuses a terminal Loan Status without it, so "never AUTOMATICALLY"
+        # is enforced on data the write guard can see rather than on an
+        # assumption about which branch called it. Any other caller omits the
+        # flag and is refused, which is the correct default.
+        corr["reviewer_approved"] = True
         written_ok, detail = _apply_one_correction(wb, corr)
         if written_ok:
             log_rows.append({
