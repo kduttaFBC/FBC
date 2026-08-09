@@ -10,7 +10,15 @@ const DQ_LADDER = [
   'CURRENT', 'DELINQUENT', '30 DAYS', '60 DAYS', '90 DAYS',
   '120 DAYS', '150 DAYS', '150+ DAYS', '180 DAYS', '210 DAYS',
 ]
-const LOAN_STATUS_DOMAIN = ['ACTIVE', 'DEFERRED']
+// The client's authoritative Loan Status domain, from the SRF template's own
+// "Reference Tables" sheet — identical across every servicer workbook. A
+// reviewer picks from the real field domain, exactly as they do for
+// Delinquency Status above; the application itself never GENERATES a terminal
+// collection status, and nothing is written without explicit approval.
+const LOAN_STATUS_DOMAIN = [
+  'ACTIVE', 'DEFERRED', 'PAID-IN-FULL', 'REO', 'FORECLOSURE',
+  'BANKRUPTCY', 'SUBSTITUTION-IN', 'SUBSTITUTION-OUT', 'LIQUIDATION',
+]
 
 const DECISIONS = [
   { v: 'approve', label: 'Approve — write to workbook' },

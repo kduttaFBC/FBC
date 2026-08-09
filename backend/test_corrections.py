@@ -20,6 +20,7 @@ Run with:
 """
 
 import io
+import os
 import unittest
 
 from openpyxl import Workbook, load_workbook
@@ -635,7 +636,7 @@ class ApprovedValueDomainRestrictionTests(unittest.TestCase):
         _, ws = _reload(outcome["file_bytes"])
         self.assertEqual(_read_cell(ws, excel_rows[0], "Delinquency Status"), "CURRENT")  # untouched
 
-    def test_terminal_loan_status_substitution_is_refused(self):
+    def test_reviewer_may_now_substitute_a_terminal_loan_status(self):
         file_bytes, excel_rows = _build_workbook_bytes([
             {"SBA GP Number": "1", "Loan Status": "ACTIVE", "Delinquency Status": "CURRENT",
              "Beginning Balance": 100000, "Ending Balance": 100000, "Payment Received": 0,
@@ -646,19 +647,25 @@ class ApprovedValueDomainRestrictionTests(unittest.TestCase):
             expected_loan_status_raw="DEFERRED", deferral_type="full", deferral_phase="start",
             srf_status="ACTIVE", soup_status="ACTIVE",
         )
+        # SUPERSEDED 2026-08-08: LIQUIDATION used to be refused outright. A
+        # reviewer who examines the evidence and concludes the servicer's
+        # terminal report is correct must be able to say so, so an explicitly
+        # SELECTED terminal status is now written. What the APPLICATION may
+        # generate is unchanged and still excludes it.
         recs, candidates, _ = _recommend([entry])
         outcome = _generate(file_bytes, candidates, [_approve(recs[0], approved_value="LIQUIDATION")])
-        self.assertEqual(outcome["applied_count"], 0)
-        self.assertIn("LIQUIDATION", outcome["corrections_not_applied"][0]["reason"])
+        self.assertEqual(outcome["applied_count"], 1)
         _, ws = _reload(outcome["file_bytes"])
-        self.assertEqual(_read_cell(ws, excel_rows[0], "Loan Status"), "ACTIVE")  # untouched
+        self.assertEqual(_read_cell(ws, excel_rows[0], "Loan Status"), "LIQUIDATION")
 
     def test_validate_approved_value_directly(self):
         ok, norm = corrections.validate_approved_value("Delinquency Status", "90 days")
         self.assertTrue(ok)
         self.assertEqual(norm, "90 DAYS")
         self.assertFalse(corrections.validate_approved_value("Delinquency Status", "FORCLOSURE")[0])
-        self.assertFalse(corrections.validate_approved_value("Loan Status", "PAID-IN-FULL")[0])
+        # SUPERSEDED 2026-08-08: PAID-IN-FULL is now a legitimate reviewer
+        # selection. Cross-domain protection is unchanged.
+        self.assertTrue(corrections.validate_approved_value("Loan Status", "PAID-IN-FULL")[0])
         self.assertFalse(corrections.validate_approved_value("Loan Status", "CURRENT")[0])  # cross-domain
         self.assertTrue(corrections.validate_approved_value("Loan Status", "DEFERRED")[0])
 
@@ -950,22 +957,27 @@ class TerminalWriteRequiresExplicitApprovalTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(wb["Servicer Inputs"].cell(row=rows[0], column=2).value, "PAID-IN-FULL")
 
-    def test_collection_status_refused_even_with_the_approval_flag(self):
+    def test_collection_status_written_when_explicitly_approved(self):
+        # SUPERSEDED 2026-08-08: these were refused unconditionally. The
+        # application still never GENERATES them; a reviewer may select them.
         for value in ("LIQUIDATION", "FORECLOSURE", "REO"):
             with self.subTest(value=value):
-                wb, _ = self._wb()
-                ok, detail = corrections._apply_one_correction(
+                wb, rows = self._wb()
+                ok, _ = corrections._apply_one_correction(
                     wb, self._corr(value=value, reviewer_approved=True))
-                self.assertFalse(ok)
-                self.assertIn("may never create", detail)
+                self.assertTrue(ok)
+                self.assertEqual(wb["Servicer Inputs"].cell(row=rows[0], column=2).value, value)
 
-    def test_non_terminal_values_need_no_approval_flag(self):
-        # ACTIVE/DEFERRED are unaffected by the terminal rule.
-        for value in ("ACTIVE", "DEFERRED"):
+    def test_every_loan_status_write_needs_the_approval_flag(self):
+        # WIDENED 2026-08-08: the gate covers ALL Loan Status writes now, not
+        # only terminal ones -- it is the whole of the "never automatically
+        # applied" guarantee, so it can no longer be value-dependent.
+        for value in ("ACTIVE", "DEFERRED", "LIQUIDATION", "PAID-IN-FULL"):
             with self.subTest(value=value):
                 wb, _ = self._wb()
-                ok, _ = corrections._apply_one_correction(wb, self._corr(value=value))
-                self.assertTrue(ok)
+                ok, detail = corrections._apply_one_correction(wb, self._corr(value=value))
+                self.assertFalse(ok)
+                self.assertIn("explicit reviewer approval", detail)
 
 
 class TerminalApprovedValueDomainTests(unittest.TestCase):
@@ -977,10 +989,11 @@ class TerminalApprovedValueDomainTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(value, "PAID-IN-FULL")
 
-    def test_paid_in_full_refused_as_a_substitution(self):
-        ok, reason = corrections.validate_approved_value("Loan Status", "PAID-IN-FULL", substituted=True)
-        self.assertFalse(ok)
-        self.assertIn("may never create or remove", reason)
+    def test_paid_in_full_permitted_as_a_reviewer_selection(self):
+        # SUPERSEDED 2026-08-08.
+        ok, value = corrections.validate_approved_value("Loan Status", "PAID-IN-FULL", substituted=True)
+        self.assertTrue(ok)
+        self.assertEqual(value, "PAID-IN-FULL")
 
     def test_soup_spelling_is_canonicalised_to_the_workbook_representation(self):
         # SOUP carries "Paid-in-Full" alongside "PAID-IN-FULL"; the servicer
@@ -991,12 +1004,17 @@ class TerminalApprovedValueDomainTests(unittest.TestCase):
                 self.assertTrue(ok)
                 self.assertEqual(value, "PAID-IN-FULL")
 
-    def test_collection_status_refused_on_both_routes(self):
-        for sub in (True, False):
-            for value in ("LIQUIDATION", "FORECLOSURE", "REO"):
-                with self.subTest(substituted=sub, value=value):
-                    ok, _ = corrections.validate_approved_value("Loan Status", value, substituted=sub)
-                    self.assertFalse(ok)
+    def test_collection_status_selectable_by_reviewer_but_not_generatable(self):
+        # The rule the 2026-08-08 clarification draws: the APPLICATION may not
+        # generate these (substituted=False is the app-derived route), but a
+        # REVIEWER may explicitly select them.
+        for value in ("LIQUIDATION", "FORECLOSURE", "REO"):
+            with self.subTest(value=value):
+                ok_gen, _ = corrections.validate_approved_value("Loan Status", value, substituted=False)
+                self.assertFalse(ok_gen)
+                ok_sel, out = corrections.validate_approved_value("Loan Status", value, substituted=True)
+                self.assertTrue(ok_sel)
+                self.assertEqual(out, value)
 
     def test_active_and_deferred_still_work_on_both_routes(self):
         for sub in (True, False):
@@ -1009,3 +1027,230 @@ class TerminalApprovedValueDomainTests(unittest.TestCase):
     def test_cross_domain_value_still_refused_when_not_substituted(self):
         ok, _ = corrections.validate_approved_value("Loan Status", "60 DAYS", substituted=False)
         self.assertFalse(ok)
+
+
+class AuthoritativeLoanStatusDomainTests(unittest.TestCase):
+    """The reviewer's Loan Status domain is the client's own, taken from the
+    SRF template's "Reference Tables" sheet (identical across every servicer
+    workbook inspected). Loan Status review works like Delinquency Status
+    review: the reviewer picks from the real field domain.
+
+    The rule this encodes (2026-08-08):
+      the APPLICATION must never independently generate or automatically apply
+      a terminal collection status;
+      a HUMAN REVIEWER may explicitly select and approve any legitimate Loan
+      Status -- but nothing is written without explicit approval.
+    """
+
+    AUTHORITATIVE = [
+        "ACTIVE", "DEFERRED", "PAID-IN-FULL", "REO", "FORECLOSURE",
+        "BANKRUPTCY", "SUBSTITUTION-IN", "SUBSTITUTION-OUT", "LIQUIDATION",
+    ]
+    # What the application itself may ever produce. Deliberately narrower.
+    GENERATABLE = {"ACTIVE", "DEFERRED", "PAID-IN-FULL"}
+
+    def _loan_status_candidate(self):
+        file_bytes, excel_rows = _build_workbook_bytes([
+            {"SBA GP Number": "1", "Loan Status": "ACTIVE", "Delinquency Status": "CURRENT",
+             "Beginning Balance": 100000, "Ending Balance": 100000, "Payment Received": 0,
+             "Scheduled Payment": 500},
+        ])
+        entry = _correction_data_entry(
+            "1", excel_rows, reasons=("LOAN STATUS MISMATCH",),
+            expected_loan_status_raw="DEFERRED", deferral_type="full", deferral_phase="start",
+            srf_status="ACTIVE", soup_status="ACTIVE",
+        )
+        recs, candidates, _ = _recommend([entry])
+        return file_bytes, excel_rows, recs, candidates
+
+    def test_backend_domain_matches_the_template_reference_list(self):
+        self.assertEqual(corrections._PERMITTED_LOAN_STATUS, set(self.AUTHORITATIVE))
+
+    def test_charge_off_is_not_in_the_domain(self):
+        # Not in the template's Loan Status list -- it lives in the Servicer
+        # Memo's Securitization Action field, a different field entirely.
+        for spelling in ("CHARGE-OFF", "CHARGE OFF", "CHARGEOFF"):
+            with self.subTest(spelling=spelling):
+                self.assertFalse(corrections.validate_approved_value("Loan Status", spelling)[0])
+
+    def test_all_nine_are_accepted_as_reviewer_selections(self):
+        for value in self.AUTHORITATIVE:
+            with self.subTest(value=value):
+                ok, out = corrections.validate_approved_value("Loan Status", value, substituted=True)
+                self.assertTrue(ok, f"{value} should be selectable")
+                self.assertEqual(out, value)
+
+    def test_all_nine_are_written_end_to_end_when_approved(self):
+        for value in self.AUTHORITATIVE:
+            with self.subTest(value=value):
+                file_bytes, excel_rows, recs, candidates = self._loan_status_candidate()
+                outcome = _generate(file_bytes, candidates, [_approve(recs[0], approved_value=value)])
+                self.assertEqual(outcome["applied_count"], 1, outcome["corrections_not_applied"])
+                _, ws = _reload(outcome["file_bytes"])
+                self.assertEqual(_read_cell(ws, excel_rows[0], "Loan Status"), value)
+
+    def test_only_the_narrow_domain_may_be_application_generated(self):
+        for value in self.AUTHORITATIVE:
+            with self.subTest(value=value):
+                ok, _ = corrections.validate_approved_value("Loan Status", value, substituted=False)
+                self.assertEqual(ok, value in self.GENERATABLE)
+
+    def test_reviewer_selections_are_canonicalised(self):
+        for typed, canonical in (("paid in full", "PAID-IN-FULL"),
+                                 ("liquidation", "LIQUIDATION"),
+                                 ("substitution out", "SUBSTITUTION-OUT"),
+                                 ("Active", "ACTIVE")):
+            with self.subTest(typed=typed):
+                ok, out = corrections.validate_approved_value("Loan Status", typed, substituted=True)
+                self.assertTrue(ok)
+                self.assertEqual(out, canonical)
+
+    def test_values_outside_the_domain_are_still_refused(self):
+        for value in ("PAID IN FUL", "ACTIVE LOAN", "REOWNED", "", "UNVERIFIED"):
+            with self.subTest(value=value):
+                self.assertFalse(corrections.validate_approved_value("Loan Status", value)[0])
+
+    def test_cross_domain_delinquency_values_are_still_refused(self):
+        for value in ("CURRENT", "60 DAYS", "150+ DAYS", "DELINQUENT"):
+            with self.subTest(value=value):
+                ok, reason = corrections.validate_approved_value("Loan Status", value, substituted=True)
+                self.assertFalse(ok)
+                self.assertIn("Delinquency Status", reason)
+
+    def test_no_reviewer_selection_is_written_without_approval(self):
+        # The fail-closed guarantee, across the WHOLE domain: the write gate is
+        # the entirety of "never automatically applied", so it must hold for
+        # every value, not just terminal ones.
+        for value in self.AUTHORITATIVE:
+            with self.subTest(value=value):
+                file_bytes, excel_rows, _, _ = self._loan_status_candidate()
+                wb = load_workbook(io.BytesIO(file_bytes), data_only=False)
+                corr = {"gp": "1", "field": "Loan Status", "corrected_value": value,
+                        "excel_rows": excel_rows, "sheet_name": "Servicer Inputs",
+                        "header_excel_row": HEADER_ROW, "skipped_row_refs": [],
+                        "eligibility_rule": "test fixture", "reported_value": "ACTIVE"}
+                ok, detail = corrections._apply_one_correction(wb, corr)
+                self.assertFalse(ok)
+                self.assertIn("explicit reviewer approval", detail)
+                self.assertEqual(wb["Servicer Inputs"].cell(row=excel_rows[0], column=2).value, "ACTIVE")
+
+    def test_frontend_dropdown_matches_the_backend_domain(self):
+        # The frontend comment promises these are kept in sync; this is what
+        # makes that promise checkable rather than aspirational.
+        import re as _re
+        path = os.path.join(os.path.dirname(__file__), "..", "frontend", "src",
+                            "components", "CorrectionReview.jsx")
+        if not os.path.exists(path):
+            self.skipTest("frontend not present")
+        src = open(path).read()
+        block = src[src.index("const LOAN_STATUS_DOMAIN"):]
+        block = block[:block.index("]") + 1]
+        self.assertEqual(set(_re.findall(r"'([^']+)'", block)),
+                         corrections._PERMITTED_LOAN_STATUS)
+
+
+class CollectionStatusReviewRoutingTests(unittest.TestCase):
+    """FORECLOSURE, LIQUIDATION and REO must behave IDENTICALLY.
+
+    Two notions of "terminal" live in corrections.py and overlap only on
+    LIQUIDATION. Review routing follows the COLLECTION set
+    (FORECLOSURE/LIQUIDATION/REO, matching checks._TERMINAL_COLLECTION_KEYWORDS
+    so the review flag and the TERMINAL STATUS REVIEW reason can never
+    disagree). The deferral safety guards follow a different set that includes
+    PAID-IN-FULL, because "may we auto-derive DEFERRED for this loan?" is a
+    different question from "is this loan in collection?".
+
+    Keying review routing on the wrong set silently excluded FORECLOSURE and
+    REO -- latent only because the delivered data contains LIQUIDATION alone.
+    """
+
+    COLLECTION = ["FORECLOSURE", "LIQUIDATION", "REO"]
+
+    def _candidates_for(self, srf_status, soup_status="ACTIVE", expected="ACTIVE"):
+        entry = _correction_data_entry(
+            "1", [4],
+            reasons=["LOAN STATUS MISMATCH", "DELINQUENCY STATUS MISMATCH", "TERMINAL STATUS REVIEW"],
+            dq_match=False, calculated_dq="90 DAYS", srf_dq="120 DAYS", status_match=False,
+            srf_status=srf_status, soup_status=soup_status,
+            expected_loan_status_raw=None, expected_loan_status_effective=expected,
+        )
+        recs, _, _ = _recommend([entry])
+        return {r["field"]: r for r in recs}
+
+    def test_all_three_collection_statuses_generate_a_loan_status_candidate(self):
+        for status in self.COLLECTION:
+            with self.subTest(status=status):
+                recs = self._candidates_for(status)
+                self.assertIn("Loan Status", recs, f"{status} generated no Loan Status candidate")
+                self.assertEqual(recs["Loan Status"]["calculated"], "ACTIVE")
+
+    def test_all_three_collection_statuses_flag_the_loan_status_candidate(self):
+        for status in self.COLLECTION:
+            with self.subTest(status=status):
+                flag = self._candidates_for(status)["Loan Status"]["reviewFlag"]
+                self.assertIsNotNone(flag)
+                self.assertIn("terminal collection status", flag)
+
+    def test_all_three_collection_statuses_flag_the_dq_candidate(self):
+        for status in self.COLLECTION:
+            with self.subTest(status=status):
+                flag = self._candidates_for(status)["Delinquency Status"]["reviewFlag"]
+                self.assertIsNotNone(flag, f"{status} DQ candidate carried no review flag")
+                self.assertIn("terminal collection status", flag)
+
+    def test_the_three_produce_identical_shapes(self):
+        shapes = []
+        for status in self.COLLECTION:
+            recs = self._candidates_for(status)
+            shapes.append(tuple(sorted(
+                (f, r["calculated"], bool(r["reviewFlag"])) for f, r in recs.items())))
+        self.assertEqual(len(set(shapes)), 1, f"collection statuses diverged: {shapes}")
+
+    def test_paid_in_full_does_not_trigger_the_collection_review_path(self):
+        # PAID-IN-FULL is a finished loan, not an active collection proceeding.
+        # It must not generate the terminal-review Loan Status candidate, and
+        # its DQ candidate must not carry the terminal collection flag.
+        recs = self._candidates_for("PAID-IN-FULL")
+        self.assertNotIn("Loan Status", recs)
+        dq_flag = recs["Delinquency Status"]["reviewFlag"]
+        self.assertIsNone(dq_flag)
+
+    def test_bankruptcy_does_not_trigger_the_collection_review_path(self):
+        recs = self._candidates_for("BANKRUPTCY")
+        self.assertNotIn("Loan Status", recs)
+        self.assertIsNone(recs["Delinquency Status"]["reviewFlag"])
+
+    def test_collection_set_matches_the_checks_module_definition(self):
+        # If these ever drift, a loan could carry TERMINAL STATUS REVIEW while
+        # its recommendation shows no flag -- the exact defect this fixes.
+        self.assertEqual(set(corrections._COLLECTION_STATUS_KEYWORDS),
+                         set(checks._TERMINAL_COLLECTION_KEYWORDS))
+
+    def test_the_two_terminal_sets_remain_distinct(self):
+        # Documents that the overlap is LIQUIDATION only, and that PAID-IN-FULL
+        # is deliberately in the deferral-guard set and not the collection set.
+        self.assertEqual(
+            set(corrections._COLLECTION_STATUS_KEYWORDS) & set(corrections._LOAN_STATUS_TERMINAL_KEYWORDS),
+            {"LIQUIDATION"})
+        self.assertIn("PAID-IN-FULL", corrections._LOAN_STATUS_TERMINAL_KEYWORDS)
+        self.assertNotIn("PAID-IN-FULL", corrections._COLLECTION_STATUS_KEYWORDS)
+
+    def test_deferral_guard_still_blocks_auto_derived_deferred_for_all_of_them(self):
+        # The separate question: the application must not AUTO-DERIVE
+        # "-> DEFERRED" for a liquidating or paid-off loan. Unchanged.
+        for status in ("LIQUIDATION", "PAID-IN-FULL"):
+            with self.subTest(status=status):
+                entry = _correction_data_entry(
+                    "1", [4], reasons=("LOAN STATUS MISMATCH",),
+                    expected_loan_status_raw="DEFERRED", deferral_type="full",
+                    deferral_phase="start", srf_status=status, soup_status="ACTIVE",
+                )
+                recs, _, _ = _recommend([entry])
+                self.assertNotIn("DEFERRED", [r["calculated"] for r in recs])
+
+    def test_reviewer_may_still_select_any_of_the_nine_for_a_collection_loan(self):
+        # The re-keying must not narrow the reviewer's domain.
+        for value in sorted(corrections._PERMITTED_LOAN_STATUS):
+            with self.subTest(value=value):
+                self.assertTrue(
+                    corrections.validate_approved_value("Loan Status", value, substituted=True)[0])
