@@ -207,10 +207,38 @@ def _is_cross_domain_dq(value):
 # UNCHANGED: cross-domain protection; the deferral branch and its guards; and
 # the rule that nothing is written without explicit reviewer approval.
 #
+# TWO DIFFERENT NOTIONS OF "TERMINAL" live in this module, and conflating them
+# is a real bug rather than a nicety -- they overlap only on LIQUIDATION:
+#
+#   _COLLECTION_STATUS_KEYWORDS  FORECLOSURE / LIQUIDATION / REO. ACTIVE,
+#     ongoing collection proceedings. Matches checks._TERMINAL_COLLECTION_
+#     KEYWORDS exactly, which is what raises the TERMINAL STATUS REVIEW
+#     reason, so the review flag and the reason can never disagree about the
+#     same loan. This is the set the terminal-review logic uses.
+#
+#   _LOAN_STATUS_TERMINAL_KEYWORDS  LIQUIDATION / PAID-IN-FULL / PIF. Used
+#     ONLY by the deferral safety guards, which is a different question: may
+#     the application AUTO-DERIVE a "-> DEFERRED" Loan Status for this loan?
+#     PAID-IN-FULL belongs there (never re-defer a paid-off loan) and does NOT
+#     belong in the collection set (a paid-off loan is finished, not in
+#     collection). Keep them separate.
+_COLLECTION_STATUS_KEYWORDS = ("FORECLOSURE", "LIQUIDATION", "REO")
+
+
+def _is_collection_status(status_value):
+    """True when the servicer reports an ACTIVE collection proceeding. The
+    trigger for terminal-status REVIEW routing."""
+    s = str(status_value or "").strip().upper()
+    return any(k in s for k in _COLLECTION_STATUS_KEYWORDS)
+
+
 _LOAN_STATUS_TERMINAL_KEYWORDS = ("LIQUIDATION", "PAID-IN-FULL", "PIF")
 
 
 def _is_terminal_loan_status(status_value):
+    """True for a loan that is liquidating or already paid off. Used ONLY by
+    the deferral safety guards -- never for review routing, which uses
+    _is_collection_status."""
     s = str(status_value or "").strip().upper()
     return any(k in s for k in _LOAN_STATUS_TERMINAL_KEYWORDS)
 
@@ -533,7 +561,7 @@ def build_eligible_corrections(correction_data):
             # loan's corrections; it never suppresses them. The delinquency
             # figure was calculated by the same normal ladder as every other
             # loan, and the servicer's reported DQ played no part in it.
-            _terminal = _is_terminal_loan_status(c.get("srf_status"))
+            _terminal = _is_collection_status(c.get("srf_status"))
             _emit(
                 "Delinquency Status",
                 str(c["calculated_dq"]).strip().upper(),
@@ -608,7 +636,7 @@ def build_eligible_corrections(correction_data):
         _proposed_status = _canonical_proposable_loan_status(c.get("expected_loan_status_effective"))
         if (
             "LOAN STATUS MISMATCH" in reasons
-            and _is_terminal_loan_status(c.get("srf_status"))
+            and _is_collection_status(c.get("srf_status"))
             and _proposed_status is not None
             and _norm(_proposed_status) != _norm(c.get("srf_status"))
         ):

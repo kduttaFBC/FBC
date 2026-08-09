@@ -1148,3 +1148,109 @@ class AuthoritativeLoanStatusDomainTests(unittest.TestCase):
         self.assertEqual(set(_re.findall(r"'([^']+)'", block)),
                          corrections._PERMITTED_LOAN_STATUS)
 
+
+class CollectionStatusReviewRoutingTests(unittest.TestCase):
+    """FORECLOSURE, LIQUIDATION and REO must behave IDENTICALLY.
+
+    Two notions of "terminal" live in corrections.py and overlap only on
+    LIQUIDATION. Review routing follows the COLLECTION set
+    (FORECLOSURE/LIQUIDATION/REO, matching checks._TERMINAL_COLLECTION_KEYWORDS
+    so the review flag and the TERMINAL STATUS REVIEW reason can never
+    disagree). The deferral safety guards follow a different set that includes
+    PAID-IN-FULL, because "may we auto-derive DEFERRED for this loan?" is a
+    different question from "is this loan in collection?".
+
+    Keying review routing on the wrong set silently excluded FORECLOSURE and
+    REO -- latent only because the delivered data contains LIQUIDATION alone.
+    """
+
+    COLLECTION = ["FORECLOSURE", "LIQUIDATION", "REO"]
+
+    def _candidates_for(self, srf_status, soup_status="ACTIVE", expected="ACTIVE"):
+        entry = _correction_data_entry(
+            "1", [4],
+            reasons=["LOAN STATUS MISMATCH", "DELINQUENCY STATUS MISMATCH", "TERMINAL STATUS REVIEW"],
+            dq_match=False, calculated_dq="90 DAYS", srf_dq="120 DAYS", status_match=False,
+            srf_status=srf_status, soup_status=soup_status,
+            expected_loan_status_raw=None, expected_loan_status_effective=expected,
+        )
+        recs, _, _ = _recommend([entry])
+        return {r["field"]: r for r in recs}
+
+    def test_all_three_collection_statuses_generate_a_loan_status_candidate(self):
+        for status in self.COLLECTION:
+            with self.subTest(status=status):
+                recs = self._candidates_for(status)
+                self.assertIn("Loan Status", recs, f"{status} generated no Loan Status candidate")
+                self.assertEqual(recs["Loan Status"]["calculated"], "ACTIVE")
+
+    def test_all_three_collection_statuses_flag_the_loan_status_candidate(self):
+        for status in self.COLLECTION:
+            with self.subTest(status=status):
+                flag = self._candidates_for(status)["Loan Status"]["reviewFlag"]
+                self.assertIsNotNone(flag)
+                self.assertIn("terminal collection status", flag)
+
+    def test_all_three_collection_statuses_flag_the_dq_candidate(self):
+        for status in self.COLLECTION:
+            with self.subTest(status=status):
+                flag = self._candidates_for(status)["Delinquency Status"]["reviewFlag"]
+                self.assertIsNotNone(flag, f"{status} DQ candidate carried no review flag")
+                self.assertIn("terminal collection status", flag)
+
+    def test_the_three_produce_identical_shapes(self):
+        shapes = []
+        for status in self.COLLECTION:
+            recs = self._candidates_for(status)
+            shapes.append(tuple(sorted(
+                (f, r["calculated"], bool(r["reviewFlag"])) for f, r in recs.items())))
+        self.assertEqual(len(set(shapes)), 1, f"collection statuses diverged: {shapes}")
+
+    def test_paid_in_full_does_not_trigger_the_collection_review_path(self):
+        # PAID-IN-FULL is a finished loan, not an active collection proceeding.
+        # It must not generate the terminal-review Loan Status candidate, and
+        # its DQ candidate must not carry the terminal collection flag.
+        recs = self._candidates_for("PAID-IN-FULL")
+        self.assertNotIn("Loan Status", recs)
+        dq_flag = recs["Delinquency Status"]["reviewFlag"]
+        self.assertIsNone(dq_flag)
+
+    def test_bankruptcy_does_not_trigger_the_collection_review_path(self):
+        recs = self._candidates_for("BANKRUPTCY")
+        self.assertNotIn("Loan Status", recs)
+        self.assertIsNone(recs["Delinquency Status"]["reviewFlag"])
+
+    def test_collection_set_matches_the_checks_module_definition(self):
+        # If these ever drift, a loan could carry TERMINAL STATUS REVIEW while
+        # its recommendation shows no flag -- the exact defect this fixes.
+        self.assertEqual(set(corrections._COLLECTION_STATUS_KEYWORDS),
+                         set(checks._TERMINAL_COLLECTION_KEYWORDS))
+
+    def test_the_two_terminal_sets_remain_distinct(self):
+        # Documents that the overlap is LIQUIDATION only, and that PAID-IN-FULL
+        # is deliberately in the deferral-guard set and not the collection set.
+        self.assertEqual(
+            set(corrections._COLLECTION_STATUS_KEYWORDS) & set(corrections._LOAN_STATUS_TERMINAL_KEYWORDS),
+            {"LIQUIDATION"})
+        self.assertIn("PAID-IN-FULL", corrections._LOAN_STATUS_TERMINAL_KEYWORDS)
+        self.assertNotIn("PAID-IN-FULL", corrections._COLLECTION_STATUS_KEYWORDS)
+
+    def test_deferral_guard_still_blocks_auto_derived_deferred_for_all_of_them(self):
+        # The separate question: the application must not AUTO-DERIVE
+        # "-> DEFERRED" for a liquidating or paid-off loan. Unchanged.
+        for status in ("LIQUIDATION", "PAID-IN-FULL"):
+            with self.subTest(status=status):
+                entry = _correction_data_entry(
+                    "1", [4], reasons=("LOAN STATUS MISMATCH",),
+                    expected_loan_status_raw="DEFERRED", deferral_type="full",
+                    deferral_phase="start", srf_status=status, soup_status="ACTIVE",
+                )
+                recs, _, _ = _recommend([entry])
+                self.assertNotIn("DEFERRED", [r["calculated"] for r in recs])
+
+    def test_reviewer_may_still_select_any_of_the_nine_for_a_collection_loan(self):
+        # The re-keying must not narrow the reviewer's domain.
+        for value in sorted(corrections._PERMITTED_LOAN_STATUS):
+            with self.subTest(value=value):
+                self.assertTrue(
+                    corrections.validate_approved_value("Loan Status", value, substituted=True)[0])
