@@ -38,7 +38,7 @@ import re
 import unittest
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 import checks  # for the shared evidence contract only — memo_audit itself
                # must never import checks; DiagnosticIsolationTests enforces that
@@ -1014,3 +1014,117 @@ class DeferralEvidenceContractTests(unittest.TestCase):
         # These cross into JSON, Excel and the review page unchanged.
         for value in self._evidence(self._memo()).values():
             self.assertIsInstance(value, str)
+
+
+class SheetRowOffsetTests(unittest.TestCase):
+    """"Memo Sheet Row" must name the PHYSICAL worksheet row.
+
+    Calamine's to_python() returns the sheet's USED RANGE, not the raw grid:
+    leading empty rows are trimmed, so its row 0 is not necessarily Excel row
+    1. The delivered Servicer Memo Summary has 4 empty rows above its header
+    (432 rows returned against a 436-row sheet), which made every recorded
+    source row number 4 too low -- a reviewer following "Memo Sheet Row 92"
+    opened a different loan's record.
+
+    The offset is read from the workbook (CalamineSheet.start), never
+    hardcoded, so a sheet with no leading blanks is unaffected.
+    """
+
+    HEADERS = ["Report Date", "Lender", "SBA Loan ID", "Lender Loan ID",
+               "Borrower Name", "Securitization Action", "Servicer Action",
+               "Deferral Start Date", "Deferral End Date", "Regular Payment Resume Date"]
+
+    def _memo_bytes(self, blank_rows_above, header_row_within_block=1, n_data=3):
+        """Builds a memo workbook with `blank_rows_above` genuinely empty rows
+        above everything else, so calamine trims exactly that many."""
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Memo Summary"
+        top = blank_rows_above + 1
+        for i in range(1, header_row_within_block):
+            ws.cell(row=top + i - 1, column=1, value=f"title row {i}")
+        header_row = top + header_row_within_block - 1
+        for c, h in enumerate(self.HEADERS, start=1):
+            ws.cell(row=header_row, column=c, value=h)
+        for i in range(n_data):
+            r = header_row + 1 + i
+            for c, v in enumerate([
+                "2026-05-26", KNOWN_LENDER, f"600000000{i}", f"600000000{i}",
+                f"Borrower {i}", "Deferred", "3-month full principal and interest deferral",
+                "2026-04-01", "2026-06-01", "2026-07-01"], start=1):
+                ws.cell(row=r, column=c, value=v)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue(), header_row
+
+    def test_no_leading_blank_rows_is_unaffected(self):
+        raw, header_row = self._memo_bytes(blank_rows_above=0)
+        df = file_readers.read_service_memo(raw)
+        self.assertEqual(int(df["_header_excel_row"].iloc[0]), header_row)
+        self.assertEqual(list(df["_excel_row"]), [header_row + 1 + i for i in range(3)])
+
+    def test_leading_blank_rows_are_accounted_for(self):
+        for blanks in (1, 4, 7):
+            with self.subTest(blank_rows_above=blanks):
+                raw, header_row = self._memo_bytes(blank_rows_above=blanks)
+                df = file_readers.read_service_memo(raw)
+                self.assertEqual(int(df["_header_excel_row"].iloc[0]), header_row)
+                self.assertEqual(list(df["_excel_row"]),
+                                 [header_row + 1 + i for i in range(3)])
+
+    def test_row_numbers_resolve_to_the_right_record_in_the_workbook(self):
+        # The property that actually matters: open the workbook at the stated
+        # row and find the record the report describes.
+        raw, _ = self._memo_bytes(blank_rows_above=4, header_row_within_block=3)
+        df = file_readers.read_service_memo(raw)
+        ws = load_workbook(io.BytesIO(raw), data_only=True)["Memo Summary"]
+        borrower_col = self.HEADERS.index("Borrower Name") + 1
+        for _, row in df.iterrows():
+            with self.subTest(excel_row=int(row["_excel_row"])):
+                self.assertEqual(ws.cell(row=int(row["_excel_row"]), column=borrower_col).value,
+                                 row["Borrower Name"])
+
+    def test_offset_helper_reads_the_workbook_rather_than_assuming(self):
+        from python_calamine import CalamineWorkbook
+        for blanks in (0, 2, 5):
+            with self.subTest(blank_rows_above=blanks):
+                raw, _ = self._memo_bytes(blank_rows_above=blanks)
+                wb = CalamineWorkbook.from_object(io.BytesIO(raw))
+                self.assertEqual(file_readers._sheet_row_offset(wb, "Memo Summary"), blanks)
+
+    def test_offset_helper_degrades_to_zero_on_an_unknown_sheet(self):
+        from python_calamine import CalamineWorkbook
+        raw, _ = self._memo_bytes(blank_rows_above=3)
+        wb = CalamineWorkbook.from_object(io.BytesIO(raw))
+        self.assertEqual(file_readers._sheet_row_offset(wb, "No Such Sheet"), 0)
+
+    def test_servicer_workbook_row_numbers_still_land_on_the_right_row(self):
+        # The SRF path shares this code and DRIVES CORRECTION WRITES. Every
+        # delivered SRF sheet has offset 0, so nothing shifts -- but the
+        # property has to hold for both shapes, or a future template with a
+        # blank top row would write to the wrong loan.
+        for blanks in (0, 3):
+            with self.subTest(blank_rows_above=blanks):
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Servicer Inputs"
+                hdr = blanks + 3
+                cols = ["SBA GP Number", "Lender Loan Number", "Loan Status",
+                        "Delinquency Status", "Beginning Balance", "Ending Balance",
+                        "Payment Received"]
+                ws.cell(row=blanks + 1, column=1, value="Servicer: Test Bank")
+                for c, h in enumerate(cols, start=1):
+                    ws.cell(row=hdr, column=c, value=h)
+                for i in range(4):
+                    ws.cell(row=hdr + 1 + i, column=1, value=f"70000000{i}")
+                    ws.cell(row=hdr + 1 + i, column=3, value="ACTIVE")
+                buf = io.BytesIO()
+                wb.save(buf)
+                raw = buf.getvalue()
+                _, _, _, si, _ = file_readers.read_servicer_file(
+                    raw, filename="Test Bank||Test Bank__x.xlsx")
+                check = load_workbook(io.BytesIO(raw), data_only=True)["Servicer Inputs"]
+                for _, row in si.iterrows():
+                    self.assertEqual(
+                        str(check.cell(row=int(row["_excel_row"]), column=1).value),
+                        str(row["SBA GP Number"]))
