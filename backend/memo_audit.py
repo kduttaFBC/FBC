@@ -120,6 +120,11 @@ MEMO_QUALITY_FLAGS = (
 
 _FLAG_COLUMNS = {flag: f"flag_{flag.replace('-', '_')}" for flag in MEMO_QUALITY_FLAGS}
 
+# Scope label for a memo row whose Lender resolves to no servicer at all. Such
+# a row belongs to the FILE, not to any servicer in the audit, and is counted
+# separately so it is never presented as an uploaded servicer's issue.
+MEMO_SCOPE_UNATTRIBUTABLE = "UNATTRIBUTABLE — file level"
+
 _CLASSIFIER_COLUMNS = (
     ["memo_row_class", "memo_quality_flags", "memo_content_row",
      "date_order_violations", "date_order_detail"]
@@ -384,11 +389,31 @@ _HINTS = {
 }
 
 
-def memo_coverage_records(classified_df):
+def memo_coverage_records(classified_df, uploaded_soup_keys=None):
     """One record per PROBLEM row -- lookup-failed, or carrying any quality
     flag. Clean joined rows and all phantom rows produce nothing: this is an
     exception report, and the counts (memo_partition_counts) carry the
     denominators.
+
+    uploaded_soup_keys scopes the output to the servicers actually uploaded
+    for this audit. The memo workbook covers EVERY servicer, so without it a
+    single-servicer audit reports other servicers' rows as if they were its
+    own. Scoping is by the row's resolved Lender identity -- the same
+    memo_lender_soup_key attribution already shown in the "Resolved Servicer
+    Key" column, reused rather than reimplemented.
+
+    Scoping is deliberately NOT done by narrowing population_ids: lookup-failed
+    means "this loan ID is in no population", so a narrowed population would
+    reclassify every other servicer's rows as defects. Measured on the
+    delivered memo, that turns 22 findings into 195. Attribution and
+    population are different questions and must stay that way.
+
+    Rows whose Lender resolves to NO servicer are kept regardless of scope,
+    tagged MEMO_SCOPE_UNATTRIBUTABLE. They cannot be tied to the uploaded
+    servicer -- that inability IS the defect -- but dropping them would
+    restore exactly the silent zero this check exists to prevent. The caller
+    counts them separately so they are never presented as the uploaded
+    servicer's issues.
 
     Key order here is the column order report.py's _build_detail_sheet will
     render, since it derives headers from the first record's keys."""
@@ -402,6 +427,13 @@ def memo_coverage_records(classified_df):
 
     records = []
     for _, row in problem.iterrows():
+        resolved = memo_lender_soup_key(row.get("Lender"))
+        if resolved is None:
+            scope = MEMO_SCOPE_UNATTRIBUTABLE
+        elif uploaded_soup_keys is not None and resolved not in uploaded_soup_keys:
+            continue  # belongs to a servicer not part of this audit
+        else:
+            scope = resolved
         flags = [f for f in MEMO_QUALITY_FLAGS if row[_FLAG_COLUMNS[f]]]
         hint_keys = ([ROW_CLASS_LOOKUP_FAILED] if row["memo_row_class"] == ROW_CLASS_LOOKUP_FAILED else []) + flags
         hints = [
@@ -411,6 +443,9 @@ def memo_coverage_records(classified_df):
             for key in hint_keys
         ]
         records.append({
+            # First column on purpose: a reviewer must see whose issue a row
+            # is before reading anything else about it.
+            "Memo Scope": scope,
             "Memo Sheet Row": row.get("_excel_row", ""),
             "Content Row #": int(row["memo_content_row"]),
             "Memo Row Class": row["memo_row_class"],
@@ -436,7 +471,8 @@ def memo_coverage_records(classified_df):
     return records
 
 
-def build_memo_coverage_result(memo_df, population_ids, servicer_label="Memo Summary"):
+def build_memo_coverage_result(memo_df, population_ids, uploaded_soup_keys=None,
+                               servicer_label="Memo Summary"):
     """The MEMO-01 result dict, in the same shape checks._result produces so
     it flows through main.py's response, report.py's tab builder, and
     checks.summarize untouched.
@@ -445,6 +481,28 @@ def build_memo_coverage_result(memo_df, population_ids, servicer_label="Memo Sum
     diagnostic over the memo workbook, not a per-servicer reconciliation
     check, and run_servicer_reconciliation would run it once per uploaded
     servicer file against the same global memo_df.
+
+    SCOPING. The memo workbook covers every servicer, but an audit covers only
+    the servicer files uploaded for it. uploaded_soup_keys (the canonical
+    soup_keys of those files) restricts the AUDIT-FACING output to rows that
+    belong to them. Two counts are reported and never added together:
+
+        issues_found        rows attributable to the uploaded servicers.
+                            THIS is the audit's memo-coverage issue count.
+        unattributable_count  rows whose Lender resolves to no servicer at
+                            all. They are shown, tagged
+                            MEMO_SCOPE_UNATTRIBUTABLE, but they are a
+                            property of the FILE and are never counted as an
+                            uploaded servicer's issues -- doing so would
+                            assert they belong to a servicer we know they do
+                            not belong to.
+
+    Passing uploaded_soup_keys=None disables scoping and reports every row,
+    which is what the standalone CLI wants.
+
+    The full-file partition counts are still returned unchanged as diagnostic
+    metadata (and on result["memo_file_counts"]), so the file-level view and
+    the regression baselines built on it are unaffected by scoping.
 
     Returns (result_dict, counts). result_dict is None when there is no memo
     file -- absent memo stays the existing graceful degradation, never a
@@ -455,23 +513,47 @@ def build_memo_coverage_result(memo_df, population_ids, servicer_label="Memo Sum
 
     classified = classify_memo_rows(memo_df, population_ids)
     counts = memo_partition_counts(classified)
-    records = memo_coverage_records(classified)
+    records = memo_coverage_records(classified, uploaded_soup_keys)
 
-    issues = len(records)
+    # Scoped rows first, then the file-level ones, so the servicer's own
+    # issues are what a reviewer reads before anything that isn't theirs.
+    scoped = [r for r in records if r["Memo Scope"] != MEMO_SCOPE_UNATTRIBUTABLE]
+    unattributable = [r for r in records if r["Memo Scope"] == MEMO_SCOPE_UNATTRIBUTABLE]
+    records = scoped + unattributable
+
+    issues = len(scoped)
     unmapped = unresolved_lender_spellings(classified)
-    details = "No issues found." if issues == 0 else (
-        f"{issues} of {counts['content']} real memo row(s) could not be relied on: "
-        f"{counts['lookup_failed']} whose loan ID is in no uploaded population, "
-        f"{counts['lender_unmapped']} under an unrecognized Lender spelling"
-        + (f" ({', '.join(u['lender_as_written'] for u in unmapped)})" if unmapped else "")
-        + f", {counts['deferral_dates_missing']} asserting a deferral with no usable start date, "
-        f"{counts['date_anomaly_violations']} impossible date ordering(s) across "
-        f"{counts['date_anomaly_rows']} row(s), and {counts['label_conflict']} where a "
-        f"non-Deferred action carries real deferral dates. "
-        f"{counts['phantom']} blank/phantom row(s) were excluded from these totals. "
-        f"Each row below names its own defect; none of them is evidence that the loan "
-        f"has no deferral."
+    scope_note = (
+        f" Scoped to the servicer file(s) in this audit ({', '.join(sorted(uploaded_soup_keys))})."
+        if uploaded_soup_keys else ""
     )
+    unattributable_note = (
+        f" Separately, {len(unattributable)} memo row(s) could not be attributed to ANY "
+        f"servicer because the Lender cell is empty or unrecognized. They are listed below "
+        f"under '{MEMO_SCOPE_UNATTRIBUTABLE}' and are NOT counted as issues for the "
+        f"servicer(s) in this audit — they are a defect in the memo file itself and need "
+        f"a Lender filled in at source."
+        if unattributable else ""
+    )
+
+    if issues == 0:
+        details = ("No issues found." + scope_note + unattributable_note).strip()
+    else:
+        details = (
+            f"{issues} memo row(s) for the servicer(s) in this audit could not be relied on."
+            + scope_note
+            + f" Across the whole memo file: {counts['lookup_failed']} row(s) whose loan ID is "
+            f"in no SOUP population, {counts['lender_unmapped']} under an unrecognized or "
+            f"blank Lender"
+            + (f" ({', '.join(u['lender_as_written'] for u in unmapped)})" if unmapped else "")
+            + f", {counts['deferral_dates_missing']} asserting a deferral with no usable start "
+            f"date, {counts['date_anomaly_violations']} impossible date ordering(s) across "
+            f"{counts['date_anomaly_rows']} row(s), and {counts['label_conflict']} where a "
+            f"non-Deferred action carries real deferral dates."
+            + unattributable_note
+            + " Each row below names its own defect; none of them is evidence that the loan "
+            "has no deferral."
+        )
 
     result = {
         "id": f"MEMO-01::{servicer_label}",
@@ -479,9 +561,16 @@ def build_memo_coverage_result(memo_df, population_ids, servicer_label="Memo Sum
         "name": "Servicer Memo Coverage",
         "category": "Data Quality",
         "severity": "WARN",
-        "status": "PASS" if issues == 0 else "WARN",
+        "status": "PASS" if (issues == 0 and not unattributable) else "WARN",
         "issues_found": issues,
         "details": details,
         "records": records,
+        # Rows shown but deliberately NOT counted in issues_found. main.py
+        # reads this so the workbook tab still appears when the only findings
+        # are file-level -- otherwise a servicer with no memo issues of its
+        # own would hide them, which is the silent zero all over again.
+        "unattributable_count": len(unattributable),
+        # Full-file diagnostic metadata, unaffected by scoping.
+        "memo_file_counts": counts,
     }
     return result, counts

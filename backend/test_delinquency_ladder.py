@@ -226,14 +226,25 @@ class LadderConsistencyAcrossBranchesTests(unittest.TestCase):
 
 
 class TerminalCollectionOpenEndedBucketTests(unittest.TestCase):
-    """Loan 5387239101 (2026-08-04): a Servicer Delinquency Status with an
-    open-ended '+' suffix (e.g. "150+ Days") must NEVER be trusted
-    numerically for a FORECLOSURE/LIQUIDATION/REO loan -- it's a bucket
-    label ("at least this much"), not a precise ladder rung, and blindly
-    parsing its digits can silently IMPROVE the ranking with zero payment
-    evidence to justify it. The correct result advances from the loan's own
-    prior SOUP history instead, exactly like a normal missed-payment cycle,
-    never letting the terminal-collection branch improve the ranking."""
+    """REWRITTEN 2026-08-08 for the superseded terminal-status rule.
+
+    These cases were written for the 2026-08-04 rule, under which a
+    FORECLOSURE/LIQUIDATION/REO loan had its own delinquency calculation: a
+    degradation-only floor, max()-ed against the servicer's own reported DQ,
+    with catch-up credit forbidden. That rule is superseded -- terminal
+    collection status and delinquency calculation are separate concepts, and
+    the servicer's reported DQ must never determine the audited figure.
+
+    These loans now use the SAME normal ladder as every other loan. The cases
+    are kept (they are still the right questions to ask) with expectations
+    updated to normal-ladder results, and each records what the old rule
+    would have produced.
+
+    Loan 5387239101's original bug -- a "150+ Days" bucket parsing LOWER than
+    the loan's own prior 240 DAYS and silently improving the ranking -- stays
+    fixed, but now BY CONSTRUCTION rather than by special case: the servicer's
+    DQ never enters the calculation at all, so an untrustworthy bucket cannot
+    corrupt it."""
 
     def _run(self, srf_dq, prior_soup_dq, received=0, scheduled=500.0):
         import pandas as pd
@@ -263,11 +274,14 @@ class TerminalCollectionOpenEndedBucketTests(unittest.TestCase):
         # trailing "+" -- confirm case doesn't matter for detecting the "+".
         self.assertEqual(self._run("90+ days", "180 DAYS"), "210 DAYS")
 
-    def test_clean_worse_servicer_value_is_still_trusted(self):
-        # No "+" suffix, and the servicer's report is WORSE than the prior
-        # status -- this must still be trusted (client Rule 2), not
-        # overridden by the degradation-only floor.
-        self.assertEqual(self._run("360 DAYS", "240 DAYS"), "360 DAYS")
+    def test_clean_worse_servicer_value_is_no_longer_trusted(self):
+        # SUPERSEDED 2026-08-08: the old rule trusted a precise servicer value
+        # whenever it was WORSE than the floor, giving "360 DAYS". The
+        # servicer's report no longer determines the calculated value at all.
+        # Prior 240 DAYS with no payment advances one level by the normal
+        # ladder. The servicer's 360 DAYS is still displayed and still raises
+        # DELINQUENCY STATUS MISMATCH -- it just does not decide the answer.
+        self.assertEqual(self._run("360 DAYS", "240 DAYS"), "270 DAYS")
 
     def test_clean_better_servicer_value_is_not_trusted(self):
         # No "+" suffix, but the servicer's report is BETTER than what a
@@ -275,33 +289,43 @@ class TerminalCollectionOpenEndedBucketTests(unittest.TestCase):
         # the degradation-only floor wins over the servicer's own number.
         self.assertEqual(self._run("30 DAYS", "240 DAYS"), "270 DAYS")
 
-    def test_sufficient_payment_holds_steady_not_improves(self):
-        # A payment that would normally justify catch-up credit for a
-        # non-terminal loan must NOT reduce the ranking here -- it can only
-        # hold steady, never improve.
-        self.assertEqual(self._run("150+ Days", "240 DAYS", received=2000, scheduled=500), "240 DAYS")
+    def test_sufficient_payment_now_earns_catch_up_credit(self):
+        # SUPERSEDED 2026-08-08: the old rule forbade catch-up credit for
+        # these loans, so a large payment could only hold steady ("240 DAYS").
+        # Normal catch-up rules now apply exactly as they do for every other
+        # loan: $2,000 against a $500 schedule clears multiple missed
+        # payments and improves the ranking.
+        self.assertEqual(self._run("150+ Days", "240 DAYS", received=2000, scheduled=500), "150 DAYS")
 
-    def test_no_prior_history_and_open_ended_bucket_is_unverified(self):
-        # With no usable prior SOUP status AND an untrustworthy "+" bucket,
-        # there's no floor to fall back on -- must be UNVERIFIED, not a guess.
-        self.assertEqual(self._run("150+ Days", ""), "UNVERIFIED")
+    def test_no_prior_history_falls_back_the_same_way_as_any_other_loan(self):
+        # SUPERSEDED 2026-08-08: the old terminal branch returned an explicit
+        # "UNVERIFIED" when it had no floor to stand on. These loans now take
+        # the ordinary fallback for an unparseable prior status -- the same
+        # empty result ANY loan gets with no prior SOUP delinquency status and
+        # no payment activity to reason from. This is normal-path behaviour,
+        # not a terminal-specific outcome; changing it would be a separate
+        # decision affecting every loan.
+        self.assertEqual(self._run("150+ Days", ""), "")
 
 
 class TerminalCollectionNegativePaymentPendingDecisionTests(unittest.TestCase):
-    """*** PENDING BUSINESS RULE DECISION (as of 2026-08-04) ***
+    """*** PENDING DECISION RESOLVED 2026-08-08 ***
 
-    This documents CURRENT behavior, not a confirmed final rule. A negative
-    Payment Received (a reversal) for a FORECLOSURE/LIQUIDATION/REO loan is
-    currently treated the same as "no payment" (a flat +1 to the missed
-    count), NOT run through the full reversal-equivalents formula used for
-    non-terminal loans elsewhere in this file.
+    The open question was: should a negative Payment Received (a reversal)
+    for a FORECLOSURE/LIQUIDATION/REO loan run through the full
+    reversal-equivalents formula used for non-terminal loans, or stay a flat
+    +1 as the 2026-08-04 rule had it?
 
-    If/when this is explicitly decided one way or the other, these
-    expectations must be updated DELIBERATELY, alongside the corresponding
-    comment in checks.py's terminal-collection branch — a change to these
-    numbers should never happen silently as a side effect of an unrelated
-    fix. Do not treat a failure here as "the test is wrong" without first
-    confirming a deliberate decision was actually made."""
+    It is answered, though not by a decision about reversals specifically.
+    The 2026-08-08 rule states that these loans follow the same normal
+    delinquency logic as every other loan, using the standard ladder and
+    catch-up rules. The reversal-equivalents formula is part of that normal
+    logic, so it now applies here too and a large reversal can advance more
+    than one level.
+
+    The old comment demanded these numbers never change silently as a side
+    effect. They have not: the change is deliberate and recorded here, in the
+    superseded-rule comment in checks.py, and in the commit message."""
 
     def _run(self, received, scheduled, prior_soup_dq):
         import pandas as pd
@@ -326,14 +350,13 @@ class TerminalCollectionNegativePaymentPendingDecisionTests(unittest.TestCase):
         # regardless of the reversal's size.
         self.assertEqual(self._run(-50, 500.0, "240 DAYS"), "270 DAYS")
 
-    def test_current_behavior_a_large_reversal_still_only_advances_one_level(self):
-        # Under the non-terminal reversal formula, a reversal this large
-        # relative to scheduled payment would advance MULTIPLE levels
-        # (see test_reversal_thresholds.py's transition table). For a
-        # terminal-collection loan, CURRENT behavior still only advances
-        # ONE level -- this is exactly the pending decision: should a large
-        # reversal advance further for these loans too?
-        self.assertEqual(self._run(-2000, 500.0, "240 DAYS"), "270 DAYS")
+    def test_a_large_reversal_now_advances_multiple_levels(self):
+        # RESOLVED 2026-08-08 (was "270 DAYS" under the flat +1 rule). A
+        # -$2,000 reversal against a $500 schedule is four payment-equivalents
+        # removed, so the normal reversal formula advances several levels --
+        # the same result this reversal would produce on any non-terminal
+        # loan. See test_reversal_thresholds.py for the transition table.
+        self.assertEqual(self._run(-2000, 500.0, "240 DAYS"), "420 DAYS")
 
     def test_current_behavior_matches_a_plain_zero_payment(self):
         # Documents that -$50 and $0 currently produce an IDENTICAL result
