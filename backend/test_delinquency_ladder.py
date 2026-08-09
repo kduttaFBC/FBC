@@ -22,6 +22,7 @@ Run with:
 import unittest
 
 import checks
+import file_readers
 
 
 class LadderRoundTripTests(unittest.TestCase):
@@ -371,3 +372,126 @@ class TerminalCollectionNegativePaymentPendingDecisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PartialDeferralResumeResetTests(unittest.TestCase):
+    """A PARTIAL P&I deferral must reset to CURRENT when it ends, exactly as a
+    full deferral does (client-confirmed 2026-08-08).
+
+    The resume boundary is a property of the deferral WINDOW, not of its type.
+    Before this fix the resume phase was assigned only for full/unclassified
+    deferrals, so a partial loan carried its accumulated ranking forward past
+    the end of the deferral indefinitely — e.g. a loan at 90 DAYS that paid in
+    full on its resume month stayed at 90 DAYS instead of returning to CURRENT.
+
+    What is NOT changed: partial deferrals still use the normal payment ladder
+    (including catch-up credit) for every cycle INSIDE the deferral, and full
+    deferrals still advance one rank per cycle regardless of payment.
+    """
+
+    import pandas as _pd
+
+    def _memo(self, action):
+        import pandas as pd
+        df = pd.DataFrame([{
+            "Lender": "Millennium Bank", "SBA Loan ID": "9990000001",
+            "Lender Loan ID": "9990000001", "Borrower Name": "T",
+            "Securitization Action": "Deferred", "Servicer Action": action,
+            "Deferral Start Date": pd.Timestamp("2026-01-01"),
+            "Deferral End Date": pd.Timestamp("2026-05-01"),
+            "Regular Payment Resume Date": pd.Timestamp("2026-06-01"),
+            "Report Date": pd.Timestamp("2026-05-01"),
+        }])
+        df["gp_sba"] = df["SBA Loan ID"]
+        df["gp_lender"] = df["Lender Loan ID"]
+        df["deferral_type"] = df["Servicer Action"].apply(file_readers.classify_deferral_type)
+        return df
+
+    PARTIAL = "6-month principal only deferment"
+    FULL = "6-month principal and interest deferment"
+
+    def _run(self, action, cycle, prior_dq, received, scheduled=500.0):
+        import pandas as pd
+        calc, expected, deferral, *_ = checks._calculate_expected_status(
+            "9990000001", "ACTIVE", "DEFERRED", prior_dq, received, scheduled,
+            True, self._memo(action), "Millennium Bank", pd.Timestamp(cycle),
+            srf_dq="180 DAYS", servicing_fee=0.0)
+        return calc, expected, (deferral or {}).get("phase")
+
+    # --- the fix -----------------------------------------------------------
+    def test_partial_reaches_the_resume_phase(self):
+        _, _, phase = self._run(self.PARTIAL, "2026-06-01", "90 DAYS", 500.0)
+        self.assertEqual(phase, "resume")
+
+    def test_partial_resets_to_current_then_credits_the_resume_payment(self):
+        # Reset to CURRENT, then one satisfied installment holds at CURRENT.
+        calc, _, _ = self._run(self.PARTIAL, "2026-06-01", "90 DAYS", 500.0)
+        self.assertEqual(calc, "CURRENT")
+
+    def test_partial_resume_with_no_payment_drops_exactly_one_rank(self):
+        # Reset to CURRENT, then a miss -> one rung down, NOT 90 -> 120 DAYS.
+        for prior in ("30 DAYS", "90 DAYS", "120 DAYS"):
+            with self.subTest(prior=prior):
+                calc, _, _ = self._run(self.PARTIAL, "2026-06-01", prior, 0.0)
+                self.assertEqual(calc, "DELINQUENT")
+
+    def test_partial_resume_never_carries_the_deferral_ranking_forward(self):
+        # The defect: the pre-fix result was the prior rank (or worse).
+        for prior, paid in (("90 DAYS", 500.0), ("30 DAYS", 500.0), ("120 DAYS", 1000.0)):
+            with self.subTest(prior=prior, paid=paid):
+                calc, _, _ = self._run(self.PARTIAL, "2026-06-01", prior, paid)
+                self.assertEqual(calc, "CURRENT")
+
+    def test_partial_resume_scheduled_zero_still_advances(self):
+        # Rule 2 preserved: a zero payment is always a miss, whatever the
+        # scheduled amount says.
+        calc, _, _ = self._run(self.PARTIAL, "2026-06-01", "90 DAYS", 0.0, scheduled=0.0)
+        self.assertEqual(calc, "DELINQUENT")
+
+    def test_partial_and_full_agree_at_the_resume_month(self):
+        # One implementation of "reset, then evaluate" -- not two.
+        for prior in ("CURRENT", "30 DAYS", "90 DAYS"):
+            for paid in (0.0, 500.0, 1500.0):
+                with self.subTest(prior=prior, paid=paid):
+                    self.assertEqual(self._run(self.PARTIAL, "2026-06-01", prior, paid),
+                                     self._run(self.FULL, "2026-06-01", prior, paid))
+
+    def test_partial_resume_loan_status_is_no_longer_forced_to_deferred(self):
+        # The deferral has ended; Expected Loan Status follows the servicer's
+        # current report rather than asserting DEFERRED.
+        _, expected, _ = self._run(self.PARTIAL, "2026-06-01", "90 DAYS", 500.0)
+        self.assertEqual(expected, "ACTIVE")
+
+    # --- what must NOT change ---------------------------------------------
+    def test_partial_inside_deferral_still_uses_the_normal_ladder(self):
+        # 1x holds, 2x improves one rung, 3x improves two, 0x advances one.
+        for paid, expect in ((500.0, "30 DAYS"), (1000.0, "DELINQUENT"),
+                             (1500.0, "CURRENT"), (0.0, "60 DAYS")):
+            with self.subTest(paid=paid):
+                calc, _, phase = self._run(self.PARTIAL, "2026-03-01", "30 DAYS", paid)
+                self.assertEqual(calc, expect)
+                self.assertIsNone(phase)   # no start/mid phase for partial
+
+    def test_partial_inside_deferral_still_expects_deferred_loan_status(self):
+        _, expected, _ = self._run(self.PARTIAL, "2026-03-01", "30 DAYS", 500.0)
+        self.assertEqual(expected, "DEFERRED")
+
+    def test_full_advances_one_rank_regardless_of_payment_at_every_phase(self):
+        for cycle in ("2026-01-01", "2026-03-01", "2026-05-01"):
+            for paid in (0.0, 500.0, 2000.0):
+                with self.subTest(cycle=cycle, paid=paid):
+                    calc, expected, _ = self._run(self.FULL, cycle, "30 DAYS", paid)
+                    self.assertEqual(calc, "60 DAYS")
+                    self.assertEqual(expected, "DEFERRED")
+
+    def test_partial_without_a_resume_date_gets_no_phase_and_no_reset(self):
+        # Never infer a boundary that the memo does not state.
+        import pandas as pd
+        m = self._memo(self.PARTIAL)
+        m.loc[:, "Regular Payment Resume Date"] = pd.NaT
+        calc, _, deferral, *_ = checks._calculate_expected_status(
+            "9990000001", "ACTIVE", "DEFERRED", "90 DAYS", 500.0, 500.0, True,
+            m, "Millennium Bank", pd.Timestamp("2026-06-01"),
+            srf_dq="180 DAYS", servicing_fee=0.0)
+        self.assertIsNone((deferral or {}).get("phase"))
+        self.assertEqual(calc, "90 DAYS")   # normal ladder: 1x holds
