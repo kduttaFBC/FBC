@@ -1309,6 +1309,19 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
                 "This loan's deferral phase could not be determined confidently for this cycle "
                 "— surfaced for manual review rather than guessing."
             )
+    elif chosen_resume_month is not None and cycle_period == chosen_resume_month:
+        # A PARTIAL deferral has no start/mid freeze -- it follows the normal
+        # payment ladder throughout -- but it still ENDS, and its end is the
+        # same event as a full deferral's: the cycle containing the Regular
+        # Payment Resume Date. The resume boundary is a property of the
+        # WINDOW, not of the deferral's type.
+        #
+        # Only "resume" is assigned here. start / mid / resume_unverified stay
+        # full-only above: they describe the full-P&I freeze, which has no
+        # partial equivalent. The full ladder above is untouched, including
+        # its client-confirmed precedence (start before resume before mid), so
+        # a full deferral's phase is decided exactly as before.
+        phase = "resume"
     else:
         phase = None
 
@@ -1520,7 +1533,11 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     # are being reviewed separately.
     if is_terminal_this_cycle and not srf_status_is_terminal_collection:
         calculated_dq = "CURRENT"
-    elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES and deferral["phase"] == "resume":
+    # Keys on the PHASE, not the type: the reset at the end of a deferral is
+    # the same event whatever kind of deferral it was. Reusing this branch
+    # rather than adding a partial-specific copy keeps one implementation of
+    # "reset to CURRENT, then evaluate the resume-month payment".
+    elif deferral and deferral["phase"] == "resume":
         # Client-confirmed: the cycle containing Regular Payment Resume
         # Date resets the delinquency baseline to CURRENT, then applies
         # normal payment evaluation THIS cycle — the rank accumulated
