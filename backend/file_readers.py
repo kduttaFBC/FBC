@@ -260,6 +260,33 @@ def _sheet_rows(wb, sheet_name):
     return sheet.to_python()
 
 
+def _sheet_row_offset(wb, sheet_name):
+    """How many physical worksheet rows sit ABOVE the first row
+    _sheet_rows returns.
+
+    Calamine's to_python() yields the sheet's USED RANGE, not the raw grid: it
+    trims leading empty rows, so its row 0 is not necessarily Excel row 1. The
+    Servicer Memo Summary is exactly this shape -- 4 empty rows above its
+    header, 432 rows returned against a 436-row sheet -- which silently made
+    every recorded source row number 4 too low.
+
+    The offset is READ FROM THE WORKBOOK (CalamineSheet.start, the 0-based
+    coordinate of the first populated cell), never assumed or hardcoded: a
+    sheet with no leading blanks reports 0 and nothing shifts.
+
+    Excel row of returned row i  ==  _sheet_row_offset(...) + i + 1"""
+    try:
+        start = wb.get_sheet_by_name(sheet_name).start
+    except Exception:
+        return 0
+    if not start:
+        return 0
+    try:
+        return int(start[0])
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
 def _find_best_header(wb, required_fields, sheet_filter=None, _rows_cache=None):
     """Scans every sheet (or only sheets matching sheet_filter, a substring
     match on sheet name) for the row that best matches required_fields.
@@ -286,7 +313,7 @@ def _find_best_header(wb, required_fields, sheet_filter=None, _rows_cache=None):
     return best
 
 
-def _rows_to_df(rows, header_row_idx, sheet_name=None):
+def _rows_to_df(rows, header_row_idx, sheet_name=None, sheet_row_offset=0):
     """Builds a DataFrame from a list-of-lists sheet, starting at a given
     header row index (0-based).
 
@@ -296,6 +323,12 @@ def _rows_to_df(rows, header_row_idx, sheet_name=None):
       - "_sheet_name":        the sheet this row came from (constant)
       - "_header_excel_row":  the 1-based Excel row of the header row itself
       - "_excel_row":         this row's own 1-based Excel row number
+
+    sheet_row_offset is how many physical worksheet rows sit above `rows[0]`
+    (see _sheet_row_offset). It MUST be supplied whenever these row numbers
+    are meant to name real worksheet rows, because calamine returns the used
+    range rather than the raw grid. Defaulting to 0 keeps every caller that
+    reads a sheet starting at row 1 byte-identical.
 
     Row numbers are computed BEFORE the blank-row filter below runs, and
     carried forward as an explicit column rather than relying on the
@@ -316,7 +349,10 @@ def _rows_to_df(rows, header_row_idx, sheet_name=None):
     headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(header_row)]
 
     if sheet_name is not None:
-        header_excel_row = header_row_idx + 1  # 1-based Excel row of the header itself
+        # 1-based PHYSICAL worksheet row of the header itself. The offset is
+        # what makes this the real row rather than a position within calamine's
+        # trimmed view -- see _sheet_row_offset.
+        header_excel_row = sheet_row_offset + header_row_idx + 1
         # Enumerate BEFORE filtering blanks, so a blank row earlier in the
         # sheet can never shift a later real row's recorded position.
         numbered = list(enumerate(data_section[1:]))
@@ -435,7 +471,11 @@ def read_servicer_file(file_bytes, filename=None):
         si_best = _find_best_header(wb, SERVICER_INPUTS_FIELDS, _rows_cache=rows_cache)
     if si_best["matches"] < len(SERVICER_INPUTS_FIELDS) // 2:
         raise ValueError("Could not find the Servicer Inputs columns in this file.")
-    servicer_inputs_df = _rows_to_df(rows_cache[si_best["sheet_name"]], si_best["row_idx"], sheet_name=si_best["sheet_name"])
+    servicer_inputs_df = _rows_to_df(
+        rows_cache[si_best["sheet_name"]], si_best["row_idx"],
+        sheet_name=si_best["sheet_name"],
+        sheet_row_offset=_sheet_row_offset(wb, si_best["sheet_name"]),
+    )
 
     lt_best = _find_best_header(wb, LOAN_TERMS_FIELDS, sheet_filter="loan terms", _rows_cache=rows_cache)
     if lt_best["matches"] < len(LOAN_TERMS_FIELDS) // 2:
@@ -581,7 +621,11 @@ def read_service_memo(file_bytes):
     best = _find_best_header(wb, SERVICE_MEMO_FIELDS, _rows_cache=rows_cache)
     if best["matches"] < len(SERVICE_MEMO_FIELDS) // 2:
         raise ValueError("Could not find the expected Servicer Memo Summary columns in this file.")
-    df = _rows_to_df(rows_cache[best["sheet_name"]], best["row_idx"], sheet_name=best["sheet_name"])
+    df = _rows_to_df(
+        rows_cache[best["sheet_name"]], best["row_idx"],
+        sheet_name=best["sheet_name"],
+        sheet_row_offset=_sheet_row_offset(wb, best["sheet_name"]),
+    )
     rows_cache.clear()
     del wb
 
