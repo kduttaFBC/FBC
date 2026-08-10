@@ -51,11 +51,16 @@ import memo_audit  # noqa: E402
 # fixed by the memo sheet alone. These two are measured against the real SOUP
 # population — the brief's 189/9 came from the OriginationTapes proxy, which
 # lacks AD TRANSPORTATION INC (5850799108).
+# UPDATED 2026-08-10, client-approved: 198/190 -> 200/192. Two memo rows were
+# appended (Excel rows 204 and 205 -- GP 1534469103 Community Bank & Trust and
+# GP 3585327005 Mission Valley Bank, both Deferred, both joining to SOUP, both
+# unflagged). No existing row changed and every quality-flag count below is
+# unchanged. See backend/test_memo_audit.py for the full provenance note.
 BASELINE = {
-    "total_rows": 198,
+    "total_rows": 200,
     "phantom": 0,
-    "content": 198,
-    "joined": 190,
+    "content": 200,
+    "joined": 192,
     "lookup_failed": 8,
     "deferral_dates_missing": 4,
     "date_anomaly_violations": 5,
