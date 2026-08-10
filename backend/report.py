@@ -293,10 +293,16 @@ def report_filename():
 # ---------------------------------------------------------------------------
 # Portfolio Summary workbook — CLIENT-CONFIRMED (2026-08-04): a SEPARATE
 # downloadable workbook, entirely independent of the detailed reconciliation
-# workbook above. Built from the SAME PORT-01 records already produced by
-# checks.portfolio_summary_check for each servicer in a multi-servicer run —
-# this file does NOT re-derive anything from raw servicer/SOUP data itself,
-# it only formats records that were already computed and tested elsewhere.
+# workbook above. Built from the SAME per-servicer summary records already
+# produced during the audit — this file does NOT re-derive anything from raw
+# servicer/SOUP data itself, it only formats records that were already
+# computed and tested elsewhere.
+#
+# Since 2026-08-10 the only workbook generated is the AUDITED one, fed by
+# checks.audited_portfolio_summary_record. The generator stays source-agnostic
+# because both that record and PORT-01's share one shape (both come from
+# checks._build_portfolio_summary_record) — nothing here changed when the
+# Original workbook was removed.
 # ---------------------------------------------------------------------------
 
 PORTFOLIO_SUMMARY_CATEGORIES = [
@@ -306,9 +312,9 @@ PORTFOLIO_SUMMARY_CATEGORIES = [
 ]
 
 
-def generate_portfolio_summary_bytes(port01_records, buffer):
-    """port01_records: a list of the single-record dict each servicer's
-    PORT-01 result produces (checks.portfolio_summary_check's records[0]),
+def generate_portfolio_summary_bytes(records, buffer):
+    """records: a list of the single portfolio-summary record dict produced
+    per servicer (today always checks.audited_portfolio_summary_record),
     one per uploaded servicer file, in upload order. Every uploaded
     servicer gets its own row on both sheets, in the same order — a
     servicer split across multiple note-series files (e.g. "Lendistry
@@ -323,7 +329,7 @@ def generate_portfolio_summary_bytes(port01_records, buffer):
     dollars_ws.title = "Portfolio Summary Dollars"
     dollar_rows = [
         [rec.get("Servicer", "")] + [rec.get(f"{c} ($)", 0) for c in PORTFOLIO_SUMMARY_CATEGORIES]
-        for rec in port01_records
+        for rec in records
     ]
     _write_header(dollars_ws, headers)
     _write_rows(dollars_ws, headers, dollar_rows, currency_cols=dollar_col_indices)
@@ -334,7 +340,7 @@ def generate_portfolio_summary_bytes(port01_records, buffer):
     pct_col_indices = set(range(2, len(headers) + 1))
     pct_rows = [
         [rec.get("Servicer", "")] + [rec.get(f"{c} (%)", 0.0) for c in PORTFOLIO_SUMMARY_CATEGORIES]
-        for rec in port01_records
+        for rec in records
     ]
     _write_header(pct_ws, headers)
     _write_rows(pct_ws, headers, pct_rows, currency_cols=set(), percentage_cols=pct_col_indices)
@@ -345,7 +351,7 @@ def generate_portfolio_summary_bytes(port01_records, buffer):
     buffer.seek(0)
 
 
-def portfolio_summary_filename(cycle_month=None, label="Original"):
+def portfolio_summary_filename(cycle_month, label):
     """cycle_month, when available, is the audit's actual reporting period
     (a pandas Timestamp from STAT-01's internal correction data, e.g.
     representing June 2026) — NOT today's date, since this filename should
@@ -354,9 +360,13 @@ def portfolio_summary_filename(cycle_month=None, label="Original"):
     (e.g. a servicer file was missing the columns STAT-01 needs), matching
     the same graceful-degradation convention used elsewhere in this app.
 
-    label is "Original" or "Audited" (CLIENT-CONFIRMED 2026-08-04) — the
-    two workbooks are otherwise identical in structure and only differ in
-    which Delinquency Status source feeds the aging buckets."""
+    label names the workbook. Only "Audited" is produced today: the
+    ORIGINAL Portfolio Summary — same structure, aging buckets fed by the
+    servicer's own unreconciled Delinquency Status — was removed at the
+    client's request on 2026-08-10, and the Audited file keeps its existing
+    name. Both parameters are REQUIRED rather than defaulted, so no caller
+    can silently resurrect the removed workbook's filename by omitting
+    them; pass cycle_month=None explicitly for the today's-date fallback."""
     if cycle_month is not None:
         try:
             return f"Portfolio_Summary_{label}_{cycle_month.strftime('%B_%Y')}.xlsx"
