@@ -51,21 +51,14 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
   }
 
   // CLIENT-CONFIRMED (2026-08-04, revised): TWO SEPARATE downloadable
-  // workbooks, both independent of the detailed reconciliation report
-  // above — Original uses the servicer's own reported Delinquency Status
-  // for the aging buckets, Audited uses STAT-01's reconciled status. Each
-  // is only present when the backend actually produced one (the b64
-  // field is null if no servicer record was available, e.g. every
-  // uploaded file failed to parse before that point).
-  const hasPortfolioSummaryOriginal = Boolean(audit.portfolio_summary_original_b64)
-  const handleDownloadPortfolioSummaryOriginal = () => {
-    downloadBase64File(
-      audit.portfolio_summary_original_b64,
-      audit.portfolio_summary_original_filename || 'Portfolio_Summary_Original.xlsx',
-      XLSX_MIME
-    )
-  }
-
+  // workbook, independent of the detailed reconciliation report above, whose
+  // aging buckets use STAT-01's reconciled status. Only present when the
+  // backend actually produced one (the b64 field is null if no servicer
+  // record was available, e.g. every uploaded file failed to parse before
+  // that point).
+  //
+  // The ORIGINAL Portfolio Summary — the servicer's own reported Delinquency
+  // Status, unreconciled — was removed 2026-08-10 at the client's request.
   const hasPortfolioSummaryAudited = Boolean(audit.portfolio_summary_audited_b64)
   const handleDownloadPortfolioSummaryAudited = () => {
     downloadBase64File(
@@ -88,17 +81,6 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
             <a className="btn btn-teal" onClick={handleDownload} target="_blank" rel="noreferrer">
             Download Excel Report
           </a>
-          {hasPortfolioSummaryOriginal && (
-            <a
-              className="btn btn-teal"
-              onClick={handleDownloadPortfolioSummaryOriginal}
-              target="_blank"
-              rel="noreferrer"
-              style={{ marginLeft: 10 }}
-            >
-              Download Original Portfolio Summary
-            </a>
-          )}
           {hasPortfolioSummaryAudited && (
             <a
               className="btn btn-teal"

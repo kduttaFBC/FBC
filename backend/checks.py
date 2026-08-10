@@ -389,7 +389,7 @@ def population_check(loan_terms_df, soup_servicer_df, servicer_name, deal=None):
 # since their balance naturally reflects more than one payment.
 # ---------------------------------------------------------------------------
 
-def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
+def balance_continuity_check(servicer_inputs_df, soup_servicer_df, closed_at_zero=None):
     records = []
 
     required = {"SBA GP Number", "Beginning Balance"}
@@ -420,7 +420,15 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
         soup_latest = soup.groupby("SBA GP Number").tail(1)
     soup_latest = soup_latest.set_index("SBA GP Number")
 
+    suppressed_closed_gps = []
     for gp, row in si_consolidated.iterrows():
+        # CLOSED-AT-ZERO SUPPRESSION (see _CLOSED_AT_ZERO_STATUS_KEYWORDS).
+        # Prior SOUP already establishes this loan as closed at a zero
+        # balance, so it is not eligible to be a client-facing exception
+        # whatever the servicer now reports.
+        if closed_at_zero and str(gp).strip() in closed_at_zero:
+            suppressed_closed_gps.append(str(gp).strip())
+            continue
         if gp not in soup_latest.index:
             continue  # already caught by the population check
         prior_ending = soup_latest.loc[gp].get("Ending Actual Balance")
@@ -459,6 +467,7 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
         "issues_found": len(records),
         "details": details,
         "records": records,
+        "suppressed_closed_gps": suppressed_closed_gps,
     }
 
 
@@ -478,7 +487,7 @@ def balance_continuity_check(servicer_inputs_df, soup_servicer_df):
 _LIQUIDATION_STATUS_KEYWORD = "LIQUIDATION"
 
 
-def liquidation_balance_check(servicer_inputs_df):
+def liquidation_balance_check(servicer_inputs_df, closed_at_zero=None):
     records = []
 
     required = {"SBA GP Number", "Loan Status", "Ending Balance"}
@@ -494,7 +503,15 @@ def liquidation_balance_check(servicer_inputs_df):
     # loan actually ended the cycle as.
     consolidated = consolidate_cycle_postings(servicer_inputs_df)
 
+    suppressed_closed_gps = []
     for gp, row in consolidated.iterrows():
+        # CLOSED-AT-ZERO SUPPRESSION (see _CLOSED_AT_ZERO_STATUS_KEYWORDS).
+        # Prior SOUP already establishes this loan as closed at a zero
+        # balance, so it is not eligible to be a client-facing exception
+        # whatever the servicer now reports.
+        if closed_at_zero and str(gp).strip() in closed_at_zero:
+            suppressed_closed_gps.append(str(gp).strip())
+            continue
         loan_status = str(row.get("loan_status", "")).strip().upper()
         if loan_status != _LIQUIDATION_STATUS_KEYWORD:
             continue
@@ -528,6 +545,7 @@ def liquidation_balance_check(servicer_inputs_df):
         "issues_found": len(records),
         "details": details,
         "records": records,
+        "suppressed_closed_gps": suppressed_closed_gps,
     }
 
 
@@ -1371,6 +1389,116 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
 # are intentionally left out rather than assumed to belong here too.
 _VALID_EXIT_TRANSITION_KEYWORDS = ("PAID-IN-FULL", "PIF")
 
+# CLIENT-CONFIRMED (2026-08-10): the other direction of the rule above.
+#
+# _VALID_EXIT_TRANSITION_KEYWORDS suppresses a flag when a loan ARRIVES at
+# PAID-IN-FULL. Its own comment records the reverse case -- a loan LEAVING a
+# closed status -- as "a different, unvalidated scenario" left flagged pending
+# confirmation. That confirmation is now given:
+#
+#   When the client's OWN prior SOUP history already establishes that a loan
+#   reached PAID-IN-FULL or LIQUIDATION with an Ending Actual Balance of 0,
+#   the loan is CLOSED. It must not appear anywhere in the current
+#   client-facing exception population, whatever Loan Status or balance the
+#   servicer subsequently reports.
+#
+# This is an ELIGIBILITY gate, not a calculation: every value is still
+# computed exactly as before, and audited_status_by_loan is still captured, so
+# nothing about how the audit reasons changes. Only whether the loan is
+# reportable changes.
+#
+# Zero is judged with the same BALANCE_TOLERANCE every other balance
+# comparison in this module uses, and the whole SOUP history is scanned -- not
+# just the latest row -- because a loan that closed and later reappeared is
+# still closed on the client's own evidence.
+_CLOSED_AT_ZERO_STATUS_KEYWORDS = ("PAID-IN-FULL", "PIF", "LIQUIDATION")
+
+
+def loans_closed_at_zero(soup_servicer_df):
+    """{gp: {closed_month, closed_status, closed_balance, closed_deal}} for
+    every loan the client's own SOUP history establishes as CLOSED.
+
+    Two qualifications, both learned from real data rather than assumed:
+
+    1. NOT CONTRADICTED BY LATER ACTIVITY. A closed status at a zero balance
+       only establishes closure if nothing afterwards says otherwise. Three
+       Lendistry 2024 loans (4704279102, 4811009108, 4831479106) each carry a
+       PAID-IN-FULL $0.00 row in 2025-08 and then keep amortising normally for
+       nine more months. A loan that is still paying down is not closed, and
+       the client's own later data is what proves it.
+
+    2. DEAL-AWARE. Those same rows are a DEAL exit, not a loan closure: the
+       PAID-IN-FULL row sits under SOUP2025_1 while the loan continues under
+       SOUP2024_1, same GP, same DtbseID, same month. A closure of one Deal
+       must never suppress a loan still active under another. So closure is
+       resolved per (GP, Deal) and a GP qualifies only when EVERY one of its
+       deals is closed.
+
+    Compare GP 4338609104, which does qualify: a single deal, whose
+    PAID-IN-FULL $0.00 row is its final SOUP activity with nothing after it.
+
+    Returns {} when required columns are absent, so a file missing them
+    degrades to "suppress nothing" rather than erroring. When SOUP carries no
+    Deal column at all, every row falls into one partition and the rule
+    reduces to qualification 1 alone.
+    """
+    if soup_servicer_df is None or soup_servicer_df.empty:
+        return {}
+    needed = {"SBA GP Number", "Loan Status", "Ending Actual Balance"}
+    if not needed.issubset(soup_servicer_df.columns):
+        return {}
+
+    df = soup_servicer_df.copy()
+    df["_gp"] = _norm_id(df["SBA GP Number"])
+    df["_status"] = df["Loan Status"].astype("string").str.strip().str.upper()
+    df["_bal"] = pd.to_numeric(df["Ending Actual Balance"], errors="coerce")
+    df["_month"] = (pd.to_datetime(df["Payment Month"], errors="coerce")
+                    if "Payment Month" in df.columns else pd.NaT)
+    df["_deal"] = (df["Deal"].astype("string").str.strip()
+                   if "Deal" in df.columns else "")
+    df = df[df["_gp"].notna()]
+
+    def _is_closed(status):
+        return any(k in str(status) for k in _CLOSED_AT_ZERO_STATUS_KEYWORDS)
+
+    out = {}
+    for gp, gp_rows in df.groupby("_gp"):
+        gp = str(gp).strip()
+        deal_closures = {}
+        all_deals_closed = True
+        for deal, rows in gp_rows.groupby("_deal", dropna=False):
+            rows = rows.sort_values("_month")
+            closure = None
+            for _, r in rows.iterrows():
+                if _is_closed(r["_status"]) and pd.notna(r["_bal"]) and abs(r["_bal"]) <= BALANCE_TOLERANCE:
+                    closure = r          # latest qualifying row in this deal
+            if closure is None:
+                all_deals_closed = False
+                continue
+            # Qualification 1: nothing later in THIS deal contradicts it.
+            later = rows[rows["_month"] > closure["_month"]] if pd.notna(closure["_month"]) else rows.iloc[0:0]
+            contradicted = any(
+                (not _is_closed(r["_status"])) and pd.notna(r["_bal"]) and abs(r["_bal"]) > BALANCE_TOLERANCE
+                for _, r in later.iterrows()
+            )
+            if contradicted:
+                all_deals_closed = False
+                continue
+            deal_closures[deal] = closure
+
+        # Qualification 2: every deal for this GP must be closed.
+        if deal_closures and all_deals_closed:
+            latest = max(deal_closures.values(),
+                         key=lambda r: (pd.Timestamp.min if pd.isna(r["_month"]) else r["_month"]))
+            out[gp] = {
+                "closed_month": str(latest["_month"])[:10] if pd.notna(latest["_month"]) else "",
+                "closed_status": str(latest["Loan Status"]).strip(),
+                "closed_balance": round(float(latest["_bal"]), 2),
+                "closed_deal": str(latest["_deal"]) if str(latest["_deal"]) else "",
+            }
+    return out
+
+
 # CLIENT-CONFIRMED (2026-08-04): a terminal COLLECTION
 # status appearing in EITHER the SERVICER'S REPORTED DELINQUENCY STATUS or
 # the SERVICER'S REPORTED LOAN STATUS is a fundamentally different situation
@@ -1741,9 +1869,10 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     return calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, is_terminal_this_cycle, reversal_info, deferral_evidence
 
 
-def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None):
+def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None, closed_at_zero=None):
     records = []
     correction_data = []
+    suppressed_closed_gps = []
     # CLIENT-CONFIRMED (2026-08-04): a record whose ONLY reason is the
     # informational "DEFERRAL RESUME INFORMATION" marker (both Loan Status
     # and DQ Status genuinely match, no real warning) must stay visible in
@@ -1813,6 +1942,25 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # reported status for those, the same conservative "no information,
         # don't guess" default used elsewhere in this codebase).
         audited_status_by_loan[gp] = calculated_dq
+
+        # CLOSED-AT-ZERO SUPPRESSION (see _CLOSED_AT_ZERO_STATUS_KEYWORDS).
+        # Deliberately placed AFTER the capture above: the audited status is
+        # still computed and recorded for this loan, because suppression is an
+        # ELIGIBILITY decision about reporting, not a change to the audit's
+        # reasoning. The Audited Portfolio Summary excludes the loan through
+        # its own explicit exclusion set instead -- an explicitly excluded loan
+        # and a loan with no audited status are different states, and the
+        # fallback for the latter would wrongly bucket it on the servicer's
+        # own reported value.
+        #
+        # Placed BEFORE the skip block below so no record and no
+        # correction_data entry is produced -- which is what makes both the
+        # Loan Status and Delinquency Status findings, and every downstream
+        # recommendation, disappear by construction rather than by a second
+        # filter in corrections.py.
+        if closed_at_zero and str(gp).strip() in closed_at_zero:
+            suppressed_closed_gps.append(str(gp).strip())
+            continue
 
         # CLIENT-CONFIRMED (2026-08-04): a terminal collection status
         # (FORECLOSURE/LIQUIDATION/REO) can appear in EITHER the SERVICER'S
@@ -2126,6 +2274,9 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
     result["correction_data"] = correction_data
     result["_cycle_month"] = cycle_month
     result["audited_status_by_loan"] = audited_status_by_loan
+    # Loans withheld from this check's client-facing output by the
+    # closed-at-zero rule. Internal only -- main.py logs it and pops it.
+    result["suppressed_closed_gps"] = suppressed_closed_gps
     return result
 
 
@@ -2147,7 +2298,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
 # $0 Ending Balance."
 # ---------------------------------------------------------------------------
 
-def terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_name=None):
+def terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_name=None, closed_at_zero=None):
     records = []
 
     required = {"SBA GP Number", "Loan Status"}
@@ -2167,7 +2318,15 @@ def terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_
         soup_latest = (soup.sort_values(["SBA GP Number", sort_month]) if sort_month else soup).groupby("SBA GP Number").tail(1)
         soup_latest = soup_latest.set_index("SBA GP Number")
 
+    suppressed_closed_gps = []
     for gp, row in si_grouped.iterrows():
+        # CLOSED-AT-ZERO SUPPRESSION (see _CLOSED_AT_ZERO_STATUS_KEYWORDS).
+        # Prior SOUP already establishes this loan as closed at a zero
+        # balance, so it is not eligible to be a client-facing exception
+        # whatever the servicer now reports.
+        if closed_at_zero and str(gp).strip() in closed_at_zero:
+            suppressed_closed_gps.append(str(gp).strip())
+            continue
         srf_status = str(row.get("loan_status", "")).strip()
         srf_status_u = srf_status.upper()
 
@@ -2192,7 +2351,7 @@ def terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_
 
     records.sort(key=lambda r: r["SBA GP Number"])
 
-    return _result(
+    result = _result(
         "STAT-02", "Terminal Status Review", "SBA Reconciliation", "WARN", records,
         lambda n: f"{n} loan(s) reported by the servicer as FORECLOSURE, LIQUIDATION, or REO this "
                   f"cycle — surfaced for manual review. A servicer-reported terminal status is "
@@ -2202,6 +2361,8 @@ def terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_
                   f"cycle's payment activity). The servicer's reported Delinquency Status is shown "
                   f"for comparison only and never determines the calculated value.",
     )
+    result["suppressed_closed_gps"] = suppressed_closed_gps
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2563,7 +2724,8 @@ def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
     return result
 
 
-def audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan, servicer_name=None):
+def audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan, servicer_name=None,
+                                     excluded_gps=None):
     """CLIENT-CONFIRMED (2026-08-04): the AUDITED Portfolio Summary record
     — identical to portfolio_summary_check in every respect EXCEPT the
     aging-bucket source, which uses STAT-01's real calculated_dq for every
@@ -2580,6 +2742,19 @@ def audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan,
     table, it exists purely to feed the Audited Portfolio Summary
     workbook."""
     si_grouped = consolidate_cycle_postings(servicer_inputs_df)
+    # CLIENT-CONFIRMED (2026-08-10): a loan the closed-at-zero rule suppressed
+    # is EXPLICITLY EXCLUDED from the audited population -- it contributes
+    # neither its count nor its (stale) current servicer balance to any
+    # audited category.
+    #
+    # Done by dropping the row, NOT by removing the loan from
+    # audited_status_by_loan: the lambda below falls back to the servicer's own
+    # reported dq_status when a loan has no audited entry, so omission would
+    # bucket the loan on the very value the audit rejected. An explicitly
+    # excluded loan and a loan with no audited status are different states.
+    if excluded_gps:
+        excluded = {str(g).strip() for g in excluded_gps}
+        si_grouped = si_grouped[~si_grouped.index.astype(str).str.strip().isin(excluded)]
     return _build_portfolio_summary_record(
         si_grouped, servicer_name,
         lambda gp, row: audited_status_by_loan.get(gp, row.get("dq_status", "")),
@@ -3031,12 +3206,19 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
     alone — see population_check's docstring-level comment for why. Only
     affects POP-01; BAL-01, BAL-02, STAT-01, STAT-02, PAY-01/02, DUP-01, NEG-01, and PORT-01
     are unchanged by this parameter."""
+    # CLOSED-AT-ZERO ELIGIBILITY, resolved ONCE per servicer and shared by
+    # every client-facing exception check. Computed here rather than inside
+    # each check so all four apply an identical rule to an identical set --
+    # the alternative, four independent derivations, is exactly the drift
+    # consolidate_cycle_postings exists to prevent.
+    closed_at_zero = loans_closed_at_zero(soup_servicer_df)
+
     results = [
         population_check(loan_terms_df, soup_servicer_df, servicer_name, deal=deal),
-        balance_continuity_check(servicer_inputs_df, soup_servicer_df),
-        liquidation_balance_check(servicer_inputs_df),
-        status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name),
-        terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_name=servicer_name),
+        balance_continuity_check(servicer_inputs_df, soup_servicer_df, closed_at_zero=closed_at_zero),
+        liquidation_balance_check(servicer_inputs_df, closed_at_zero=closed_at_zero),
+        status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name, closed_at_zero=closed_at_zero),
+        terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_name=servicer_name, closed_at_zero=closed_at_zero),
         missing_payment_periods_check(soup_servicer_df, loan_terms_df),
         payment_shortfall_check(servicer_inputs_df),
         duplicate_postings_check(servicer_inputs_df),
@@ -3051,6 +3233,42 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
     for r in results:
         r["servicer"] = servicer_name
         r["id"] = f"{r['id']}::{servicer_name}"
+
+    # ---- suppression trace -------------------------------------------------
+    # One entry per suppressed loan, carrying the evidence that justified the
+    # suppression plus which checks it was withheld from. Attached to STAT-01
+    # as a sibling key -- the same pattern correction_data/audited_status_by_loan
+    # already use -- so main.py can log it and strip it before the response.
+    # Suppression must be auditable; silent exclusion is what this whole
+    # session's memo-coverage work was about.
+    suppressed_by_gp = {}
+    for r in results:
+        for gp in r.pop("suppressed_closed_gps", []) or []:
+            suppressed_by_gp.setdefault(gp, []).append(r["id"].split("::")[0])
+    trace = []
+    if suppressed_by_gp:
+        srf = consolidate_cycle_postings(servicer_inputs_df)
+        for gp, checks_suppressed in sorted(suppressed_by_gp.items()):
+            evidence = closed_at_zero.get(gp, {})
+            row = srf.loc[gp] if gp in srf.index else None
+            trace.append({
+                "SBA GP Number": gp,
+                "Servicer": servicer_name,
+                "Prior Closed Status": evidence.get("closed_status", ""),
+                "Prior Closed Month": evidence.get("closed_month", ""),
+                "Prior Closed Deal": evidence.get("closed_deal", ""),
+                "Prior Ending Actual Balance": evidence.get("closed_balance"),
+                "Current Servicer Loan Status": str(row.get("loan_status", "")).strip() if row is not None else "",
+                "Current Servicer Ending Balance": (
+                    round(float(row.get("ending_balance")), 2)
+                    if row is not None and row.get("ending_balance") is not None
+                    and pd.notna(row.get("ending_balance")) else None
+                ),
+                "Checks Suppressed": sorted(checks_suppressed),
+            })
+    stat01 = next((r for r in results if r["id"].split("::")[0] == "STAT-01"), None)
+    if stat01 is not None:
+        stat01["suppressed_closed_loans"] = trace
 
     return results
 

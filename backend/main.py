@@ -171,8 +171,9 @@ def _filter_report_results(all_results):
         regardless of findings. PAY-01/DUP-01 are informational and can
         create noise even when they DO find something; PAY-02 isn't yet
         validated against the client's corrected SRF expectations;
-        PORT-01 has its own separate Original/Audited Portfolio Summary
-        workbooks entirely outside this one.
+        PORT-01 is computed and kept in all_results for traceability
+        but has no client-facing output of its own since the Original
+        Portfolio Summary was removed (2026-08-10).
       - REPORT_CONDITIONAL_CHECK_IDS: excluded only when the check has
         NOTHING to report (issues_found == 0) — included with its own tab
         the moment it actually finds something. POP-01 doesn't need a tab
@@ -308,7 +309,6 @@ async def audit(
         # original bytes + their SHA-256 + the eligible candidate set. Written
         # into SESSION_CACHE once the session_id is minted (end of this handler).
         correction_session_state = {}
-        portfolio_summary_original_records = []
         portfolio_summary_audited_records = []
         portfolio_summary_cycle_months = set()
         # Canonical soup_keys of the servicer files in THIS audit, used to
@@ -447,30 +447,40 @@ async def audit(
             # reaches the API response.
             if stat01_result is not None:
                 audited_status_by_loan = stat01_result.get("audited_status_by_loan", {})
+                # CLIENT-CONFIRMED (2026-08-10): loans suppressed by the
+                # closed-at-zero rule are EXPLICITLY excluded from the audited
+                # population -- neither their count nor their stale current
+                # servicer balance contributes to any audited category. Passed
+                # as an exclusion set rather than by withholding their audited
+                # status, since a missing status falls back to the servicer's
+                # own reported value.
+                suppressed_trace = stat01_result.get("suppressed_closed_loans") or []
                 portfolio_summary_audited_records.append(
                     checks_mod.audited_portfolio_summary_record(
-                        servicer_inputs_df, audited_status_by_loan, servicer_name=display_label
+                        servicer_inputs_df, audited_status_by_loan, servicer_name=display_label,
+                        excluded_gps=[t["SBA GP Number"] for t in suppressed_trace],
                     )
                 )
 
             if stat01_result is not None:
+                # Suppression must be auditable even though it is deliberately
+                # invisible to the client: log every withheld loan with the
+                # evidence that justified it, then strip the trace from the
+                # payload alongside the other internal-only sibling keys.
+                for t in stat01_result.get("suppressed_closed_loans") or []:
+                    print(
+                        f"[closed-at-zero suppression] {t['Servicer']} GP {t['SBA GP Number']}: "
+                        f"prior SOUP {t['Prior Closed Status']!r} at {t['Prior Ending Actual Balance']} "
+                        f"on {t['Prior Closed Month']} (deal {t['Prior Closed Deal'] or 'n/a'}); "
+                        f"servicer now reports "
+                        f"{t['Current Servicer Loan Status']!r} at {t['Current Servicer Ending Balance']}; "
+                        f"withheld from {', '.join(t['Checks Suppressed'])} and from all recommendations",
+                        file=sys.stderr,
+                    )
+                stat01_result.pop("suppressed_closed_loans", None)
                 stat01_result.pop("correction_data", None)
                 stat01_result.pop("_cycle_month", None)
                 stat01_result.pop("audited_status_by_loan", None)
-
-            # CLIENT-CONFIRMED (2026-08-04): collect this servicer's PORT-01
-            # record for the ORIGINAL Portfolio Summary workbook (see
-            # report_mod.generate_portfolio_summary_bytes below) — built
-            # entirely from the same tested PORT-01 records already
-            # produced above, never re-derived from raw file data. A
-            # servicer split across multiple note-series files (e.g.
-            # "Lendistry 2025"/"Lendistry 2024") naturally produces two
-            # separate records here, one per file, since each file gets its
-            # own run_servicer_reconciliation call with its own
-            # display_label.
-            port01_result = next((r for r in results if r["id"].split("::")[0] == "PORT-01"), None)
-            if port01_result is not None and port01_result["records"]:
-                portfolio_summary_original_records.append(port01_result["records"][0])
 
             all_results.extend(results)
             servicer_loan_counts[display_label] = len(servicer_inputs_df)
@@ -554,27 +564,23 @@ async def audit(
         report_mod.generate_report_bytes(report_results, report_summary, excel_buffer)
         excel_b64 = base64.b64encode(excel_buffer.getvalue()).decode("utf-8")
 
-        # CLIENT-CONFIRMED (2026-08-04, revised): TWO separate downloadable
-        # workbooks, entirely independent of the detailed reconciliation
-        # workbook above and of each other — built from the SAME per-
-        # servicer records already collected during the loop (Original
-        # from PORT-01's own records; Audited from
-        # audited_portfolio_summary_record, which reuses STAT-01's real
-        # calculated_dq via audited_status_by_loan). Neither is re-derived
-        # from raw file data here. Only generated when at least one
-        # servicer's record was actually produced (always true for a
-        # normal successful run; guarded purely so an edge case upstream
-        # can't produce an empty, meaningless workbook).
-        portfolio_summary_original_b64 = None
-        portfolio_summary_original_filename_value = None
-        if portfolio_summary_original_records:
-            original_buffer = io.BytesIO()
-            report_mod.generate_portfolio_summary_bytes(portfolio_summary_original_records, original_buffer)
-            portfolio_summary_original_b64 = base64.b64encode(original_buffer.getvalue()).decode("utf-8")
-            portfolio_summary_original_filename_value = report_mod.portfolio_summary_filename(
-                portfolio_summary_cycle_month, label="Original"
-            )
-
+        # CLIENT-CONFIRMED (2026-08-04, revised 2026-08-10): ONE downloadable
+        # Portfolio Summary workbook, entirely independent of the detailed
+        # reconciliation workbook above — built from the SAME per-servicer
+        # records already collected during the loop
+        # (audited_portfolio_summary_record, which reuses STAT-01's real
+        # calculated_dq via audited_status_by_loan), never re-derived from raw
+        # file data here. Only generated when at least one servicer's record
+        # was actually produced (always true for a normal successful run;
+        # guarded purely so an edge case upstream can't produce an empty,
+        # meaningless workbook).
+        #
+        # The ORIGINAL Portfolio Summary — the same shape built from PORT-01's
+        # own records, i.e. the servicer's unreconciled reported Delinquency
+        # Status — was removed at the client's request on 2026-08-10. PORT-01
+        # still RUNS and its full result is still in all_results for
+        # traceability; only the client-facing workbook is gone. The Audited
+        # file keeps its existing name.
         portfolio_summary_audited_b64 = None
         portfolio_summary_audited_filename_value = None
         if portfolio_summary_audited_records:
@@ -616,8 +622,6 @@ async def audit(
             "summary": summary,
             "report_b64": excel_b64,
             "report_filename": report_mod.report_filename(),
-            "portfolio_summary_original_b64": portfolio_summary_original_b64,
-            "portfolio_summary_original_filename": portfolio_summary_original_filename_value,
             "portfolio_summary_audited_b64": portfolio_summary_audited_b64,
             "portfolio_summary_audited_filename": portfolio_summary_audited_filename_value,
             "chat_context": chat_context,

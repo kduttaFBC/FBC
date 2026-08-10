@@ -225,23 +225,15 @@ class DetailedReconciliationWorkbookUnaffectedTests(unittest.TestCase):
 
 class PortfolioSummaryFilenameTests(unittest.TestCase):
     """Filename reflects the actual reporting period when available,
-    falling back to today's date otherwise. Default label is "Original";
-    CLIENT-CONFIRMED (2026-08-04) the Audited workbook uses label="Audited"."""
+    falling back to today's date otherwise.
 
-    def test_filename_uses_cycle_month_when_available_default_original(self):
-        import pandas as pd
-        cycle_month = pd.Timestamp("2026-06-01")
-        self.assertEqual(report.portfolio_summary_filename(cycle_month), "Portfolio_Summary_Original_June_2026.xlsx")
+    Only the Audited workbook is produced: the Original was removed at the
+    client's request on 2026-08-10 (the tests for its label, and for the two
+    workbooks' mutual independence, went with it). cycle_month and label are
+    both required, so a caller cannot omit them and silently resurrect the
+    removed workbook's name."""
 
-    def test_filename_original_label_explicit(self):
-        import pandas as pd
-        cycle_month = pd.Timestamp("2026-06-01")
-        self.assertEqual(
-            report.portfolio_summary_filename(cycle_month, label="Original"),
-            "Portfolio_Summary_Original_June_2026.xlsx",
-        )
-
-    def test_filename_audited_label(self):
+    def test_filename_uses_cycle_month_when_available(self):
         import pandas as pd
         cycle_month = pd.Timestamp("2026-06-01")
         self.assertEqual(
@@ -251,51 +243,12 @@ class PortfolioSummaryFilenameTests(unittest.TestCase):
 
     def test_filename_falls_back_to_today_when_no_cycle_month(self):
         from datetime import date
-        filename = report.portfolio_summary_filename(None, label="Original")
-        self.assertEqual(filename, f"Portfolio_Summary_Original_{date.today().isoformat()}.xlsx")
+        filename = report.portfolio_summary_filename(None, label="Audited")
+        self.assertEqual(filename, f"Portfolio_Summary_Audited_{date.today().isoformat()}.xlsx")
 
-    def test_both_labels_use_the_same_resolved_cycle_month(self):
-        # Both workbooks in one run must be named for the SAME reporting
-        # period -- confirms nothing about the label changes which month
-        # gets used.
-        import pandas as pd
-        cycle_month = pd.Timestamp("2026-06-01")
-        original_name = report.portfolio_summary_filename(cycle_month, label="Original")
-        audited_name = report.portfolio_summary_filename(cycle_month, label="Audited")
-        self.assertIn("June_2026", original_name)
-        self.assertIn("June_2026", audited_name)
-
-
-class TwoWorkbookIndependenceTests(unittest.TestCase):
-    """CLIENT-CONFIRMED (2026-08-04): generate_portfolio_summary_bytes
-    itself is UNCHANGED and reused as-is for both workbooks -- these tests
-    confirm calling it twice, once per record set, produces two genuinely
-    independent workbooks with no shared state or cross-contamination."""
-
-    def test_original_and_audited_workbooks_are_independent(self):
-        original_records = [_make_record("Test Bank", outstanding=100000.0,
-                                          **{"Current ($)": 100000.0, "Current (%)": 100.0})]
-        audited_records = [_make_record("Test Bank", outstanding=100000.0,
-                                         **{"Delinquent ($)": 100000.0, "Delinquent (%)": 100.0})]
-
-        original_buf = io.BytesIO()
-        report.generate_portfolio_summary_bytes(original_records, original_buf)
-        audited_buf = io.BytesIO()
-        report.generate_portfolio_summary_bytes(audited_records, audited_buf)
-
-        original_wb = load_workbook(original_buf)
-        audited_wb = load_workbook(audited_buf)
-
-        original_ws = original_wb["Portfolio Summary Dollars"]
-        audited_ws = audited_wb["Portfolio Summary Dollars"]
-
-        current_col = report.PORTFOLIO_SUMMARY_CATEGORIES.index("Current") + 2
-        delinquent_col = report.PORTFOLIO_SUMMARY_CATEGORIES.index("Delinquent") + 2
-
-        self.assertEqual(original_ws.cell(row=2, column=current_col).value, 100000.0)
-        self.assertEqual(original_ws.cell(row=2, column=delinquent_col).value, 0.0)
-        self.assertEqual(audited_ws.cell(row=2, column=current_col).value, 0.0)
-        self.assertEqual(audited_ws.cell(row=2, column=delinquent_col).value, 100000.0)
+    def test_both_parameters_are_required(self):
+        with self.assertRaises(TypeError):
+            report.portfolio_summary_filename()
 
 
 if __name__ == "__main__":
