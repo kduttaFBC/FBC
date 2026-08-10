@@ -457,8 +457,11 @@ class PartialDeferralResumeResetTests(unittest.TestCase):
                                      self._run(self.FULL, "2026-06-01", prior, paid))
 
     def test_partial_resume_loan_status_is_no_longer_forced_to_deferred(self):
-        # The deferral has ended; Expected Loan Status follows the servicer's
-        # current report rather than asserting DEFERRED.
+        # The deferral has ended, so Expected Loan Status is no longer DEFERRED.
+        # The value is unchanged, but its SOURCE changed on 2026-08-10: it is
+        # now derived from the memo's confirmed resume rather than copied from
+        # the servicer's own current report (which here happens to be ACTIVE
+        # too). See test_resume_expected_loan_status.py.
         _, expected, _ = self._run(self.PARTIAL, "2026-06-01", "90 DAYS", 500.0)
         self.assertEqual(expected, "ACTIVE")
 

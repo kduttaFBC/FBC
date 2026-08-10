@@ -100,6 +100,19 @@ REVIEW_REASON_TERMINAL_STATUS = (
     "anything is written."
 )
 
+# Carries the contradiction that checks.py's site-4 DEFERRAL DATA QUALITY
+# WARNING used to state (superseded 2026-08-10). Same information, moved onto
+# the control where the decision is made instead of a column that suppressed
+# every correction on the loan.
+REVIEW_REASON_RESUME_CONTRADICTION = (
+    "The Servicer Memo Summary confirms this cycle is the deferral resume "
+    "cycle (Regular Payment Resume Date falls in this reporting month), but "
+    "the current servicer file still reports Loan Status = DEFERRED. The memo "
+    "evidence is documented and internally consistent, so this is a Loan "
+    "Status contradiction rather than a deferral data-quality problem. "
+    "Requires explicit reviewer approval before anything is written."
+)
+
 # SUPERSEDED 2026-08-08 (same day, later clarification). An earlier version of
 # this module carried _NEVER_WRITABLE_LOAN_STATUS = (LIQUIDATION, FORECLOSURE,
 # REO), refusing those values unconditionally at three layers. That conflated
@@ -230,6 +243,20 @@ def _is_collection_status(status_value):
     trigger for terminal-status REVIEW routing."""
     s = str(status_value or "").strip().upper()
     return any(k in s for k in _COLLECTION_STATUS_KEYWORDS)
+
+
+def _is_deferred_status(status_value):
+    """True when the servicer reports the loan as still DEFERRED. The trigger
+    for confirmed-resume contradiction routing."""
+    return "DEFERRED" in str(status_value or "").strip().upper()
+
+
+# The shared deferral-evidence contract value (checks.EVIDENCE_DOCUMENTED /
+# DEFERRAL_EVIDENCE_STATUSES) meaning: deferral confirmed, dates consistent,
+# type known. Spelled as a literal because this module deliberately does not
+# import checks -- STAT-01 decides what the evidence says and this module only
+# reads the verdict.
+_EVIDENCE_DOCUMENTED = "documented"
 
 
 _LOAN_STATUS_TERMINAL_KEYWORDS = ("LIQUIDATION", "PAID-IN-FULL", "PIF")
@@ -647,6 +674,58 @@ def build_eligible_corrections(correction_data):
                 "derived Expected Loan Status",
                 review_required=True,
                 review_reason=REVIEW_REASON_TERMINAL_STATUS,
+            )
+
+        # --- Loan Status: confirmed deferral resume contradicted by the
+        # --- servicer still reporting DEFERRED (2026-08-10) -------------------
+        # SEPARATE from both branches above, which are untouched. Scoped to one
+        # situation: the Servicer Memo confirms this cycle is the deferral
+        # resume cycle, its evidence is documented, and the servicer still
+        # reports DEFERRED.
+        #
+        # SUPERSEDES the v1 scope decision recorded on the "-> DEFERRED" branch
+        # above: "a correction is only ever generated INTO Deferred, never out
+        # of it -- v1 never auto-exits a loan from Deferred during a resume
+        # cycle, by construction." That was a deliberate v1 narrowing, not a
+        # safety property, and the client superseded it on 2026-08-10. Nothing
+        # is auto-applied: review_required is always True here and the
+        # reviewer_approved gate in _apply_one_correction still governs every
+        # write, so "never automatically" survives intact.
+        #
+        # The proposed value is expected_loan_status_effective, STAT-01's single
+        # source of truth, run through _canonical_proposable_loan_status --
+        # which restricts what the APPLICATION may generate to
+        # ACTIVE/DEFERRED/PAID-IN-FULL, so a terminal collection status can
+        # never be machine-generated from this path either.
+        #
+        # evidence_status must be "documented". A resume phase can also be
+        # reached on a date-anomaly record, and this branch proposes EXITING a
+        # deferral -- the one direction v1 refused -- so it is deliberately
+        # gated on the strongest evidence the contract defines rather than
+        # merely on the phase. (The unclassified-type case is already excluded
+        # upstream by WARNING_REASONS; this gate is what covers the rest.)
+        #
+        # Cannot collide with the two branches above: the "-> DEFERRED" branch
+        # requires expected_loan_status_raw == "DEFERRED" (here it is ACTIVE)
+        # and phase in (start, mid) (here it is resume); the terminal branch
+        # requires _is_collection_status(srf_status), and DEFERRED is not a
+        # collection status.
+        _proposed_resume = _canonical_proposable_loan_status(c.get("expected_loan_status_effective"))
+        if (
+            "LOAN STATUS MISMATCH" in reasons
+            and c.get("deferral_phase") == "resume"
+            and c.get("evidence_status") == _EVIDENCE_DOCUMENTED
+            and _is_deferred_status(c.get("srf_status"))
+            and _proposed_resume is not None
+            and _norm(_proposed_resume) != _norm(c.get("srf_status"))
+        ):
+            _emit(
+                "Loan Status",
+                _proposed_resume,
+                "STAT-01 confirmed deferral resume contradicted by the servicer still "
+                "reporting DEFERRED",
+                review_required=True,
+                review_reason=REVIEW_REASON_RESUME_CONTRADICTION,
             )
 
     return eligible

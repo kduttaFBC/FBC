@@ -1685,28 +1685,106 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
         # resume, not a mismatch. Leaving expected_loan_status as None here
         # made it fall back to comparing against soup_status, which is
         # SOUP's PRIOR (still-DEFERRED) month — incorrectly flagging every
-        # legitimate deferral exit as a Loan Status mismatch. Accept
-        # whatever non-deferred status the servicer reports as the expected
-        # outcome of this transition (same "arriving is not a mismatch"
-        # principle already applied to PAID-IN-FULL).
+        # legitimate deferral exit as a Loan Status mismatch.
+        #
+        # CLIENT-CONFIRMED (2026-08-10): the expected outcome is ACTIVE,
+        # DERIVED FROM THE MEMO — never copied from the servicer's own
+        # current Loan Status. This branch previously did
+        # `expected_loan_status = srf_status`, which was the last surviving
+        # path where a servicer's assertion validated itself: the audit
+        # adopted the servicer's status as the expected one, so the two
+        # could never disagree and no LOAN STATUS MISMATCH was possible.
+        # That is exactly the reasoning behind the SUPERSEDED 2026-08-08
+        # block further down for terminal collection statuses; this branch
+        # predates it (it was written for GP 5658839107) and was missed.
+        # Found on GP 6717929105 (July 2026, Community Bank and Trust),
+        # where a servicer-reported LIQUIDATION on a confirmed resume cycle
+        # matched itself, produced no Loan Status recommendation, and left
+        # the reviewer with no way to correct it.
+        #
+        # The independent evidence is the Servicer Memo's Regular Payment
+        # Resume Date — a separate document from the SRF submission being
+        # audited, and the very thing that put this cycle in the `resume`
+        # phase. A loan whose confirmed deferral window has ended and whose
+        # regular payment schedule has resumed is back in normal servicing,
+        # which is ACTIVE. This branch already trusts that same date for
+        # something more consequential (resetting the delinquency ladder to
+        # CURRENT above, discarding the whole window's accumulated rank);
+        # trusting it to move the number but not the status is incoherent.
+        #
+        # Deliberately type-agnostic, matching this branch's existing
+        # phase-not-type keying: full, partial and unclassified deferrals
+        # all end on the same memo-supplied resume date, and full-vs-partial
+        # governs only the payment treatment DURING the window. An
+        # unclassified deferral still carries DEFERRAL DATA QUALITY WARNING,
+        # which corrections.WARNING_REASONS excludes from correction
+        # candidacy entirely — so weak evidence is reported here but can
+        # never produce a write candidate.
+        #
+        # Three arrivals are deliberately NOT handled here because they are
+        # already handled independently, and none of them reads
+        # expected_loan_status:
+        #   PAID-IN-FULL/PIF — is_valid_exit_transition short-circuits the
+        #       match test in status_match_check before the comparison.
+        #   BANKRUPTCY       — the `if "BANKRUPT" in srf_status_u` override
+        #       below runs AFTER this branch and wins as the final word.
+        #   DEFERRED         — the contradiction path immediately below.
         #
         # The one case NOT auto-accepted: if the servicer is STILL
         # reporting DEFERRED on a cycle the memo confirms should have
-        # resumed, that's a real contradiction worth a human look — surface
-        # it as a deferral data-quality review item rather than silently
-        # accepting or silently flagging it as a hard mismatch.
-        if "DEFERRED" in srf_status_u:
-            expected_loan_status = None  # matches SOUP's still-DEFERRED prior; won't hard-fail, but...
-            warning_type = "deferral_dates"
-            memo_warning = (
-                "The Servicer Memo Summary confirms this cycle is the Full P&I deferral resume "
-                "cycle (Regular Payment Resume Date falls in this reporting month), but the "
-                "current servicer file still reports Loan Status = DEFERRED. This is a "
-                "contradiction between the memo and the servicer's own current-cycle report — "
-                "surfaced for manual review rather than assumed to be an error on either side."
-            )
-        else:
-            expected_loan_status = srf_status
+        # resumed, that is a LOAN STATUS CONTRADICTION -- and it is reported as
+        # one, because expected_loan_status is ACTIVE here too.
+        #
+        # SUPERSEDED 2026-08-10 (site 4). This sub-branch previously set
+        # expected_loan_status = None and raised warning_type =
+        # "deferral_dates", producing a DEFERRAL DATA QUALITY WARNING. Both
+        # were wrong, for two separate reasons:
+        #
+        #   1. expected_loan_status = None fell through to
+        #      `expected_loan_status or soup_status` in status_match_check,
+        #      so the servicer's DEFERRED was compared against SOUP's STALE
+        #      PRIOR month -- which still reads DEFERRED precisely because the
+        #      resume had not happened yet. It "matched", and no LOAN STATUS
+        #      MISMATCH was possible. Same self-validation defect as the
+        #      `else` branch above, reached by a different route.
+        #
+        #   2. DEFERRAL DATA QUALITY WARNING means, in this codebase's own
+        #      words, "found the right memo record, but its dates don't let us
+        #      confidently place this cycle in the deferral timeline." That is
+        #      false here: the dates place it exactly, evidence_status reads
+        #      `documented`, and it is the SERVICER's report that disagrees
+        #      with good evidence. Because the tag is in
+        #      corrections.WARNING_REASONS it also excluded the loan from
+        #      correction candidacy ENTIRELY -- silently suppressing the
+        #      unrelated, deterministic Delinquency Status correction on the
+        #      grounds that the evidence could not be trusted, when it could.
+        #
+        # Found on GP 6673679110 (July 2026, Community Bank and Trust): memo
+        # row 183 confirms 2026-04-01 -> 2026-06-01 with Regular Payment
+        # Resume Date 2026-07-01, the servicer still reported DEFERRED, and
+        # the loan produced ZERO recommendations despite two real problems.
+        #
+        # The contradiction is not lost -- it is now expressed as LOAN STATUS
+        # MISMATCH and carried to the reviewer as the review_reason on the
+        # DEFERRED -> ACTIVE recommendation (corrections.
+        # REVIEW_REASON_RESUME_CONTRADICTION), i.e. on the control where the
+        # decision is actually made rather than in a column that suppressed it.
+        #
+        # Scoped to THIS call site only. The five other producers of
+        # warning_type = "deferral_dates" are untouched and still suppress
+        # corrections: blank Regular Payment Resume Date (resume_unverified),
+        # indeterminate phase, unclassified deferral type, and the two
+        # "reported DEFERRED with no memo deferral found at all" paths. Note
+        # deliberately NOT implemented as a predicate on evidence_status ==
+        # "documented": a resume_unverified loan with a BLANK resume date is
+        # also `documented` (orderly dates, known type), so such a predicate
+        # would silently disarm the most important warning in the set.
+        #
+        # No assignment to warning_type/memo_warning happens here at all now,
+        # so a warning _lookup_deferral already raised for this loan (e.g. the
+        # unclassified-type one) survives instead of being overwritten by this
+        # message -- strictly more warning coverage than before, not less.
+        expected_loan_status = "ACTIVE"
     elif deferral and deferral["deferral_type"] in _FULL_PNI_CALC_TYPES and deferral["phase"] == "resume_unverified":
         # Client-confirmed: past Deferral End Date with no known Regular
         # Payment Resume Date. Do NOT advance the deferral rank (that would
