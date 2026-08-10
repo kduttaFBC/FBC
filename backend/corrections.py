@@ -1075,7 +1075,21 @@ def generate_reviewed_workbook(
     Returns a dict:
       {file_bytes, filename, applied_count, rejected_count, returned_count,
        corrections_not_applied: [{gp, field, reason}],
-       unknown_ids: [...], skip_reason}
+       unknown_ids: [...], skip_reason,
+       verified_overrides: {(gp, field): approved_value}}
+
+    verified_overrides is the VERIFIED layer -- the third of the three the
+    client confirmed on 2026-08-10:
+
+        Original   what the lender submitted
+        Audited    what the audit calculated / recommended
+        Verified   the final value after Manual Review
+
+    It carries an entry ONLY where a value was approved, validated and
+    successfully written, so it describes the same cells the corrected
+    workbook contains and cannot drift from it. Absence means the lender's
+    original value stands -- which is equally true of the workbook, since
+    nothing was written to those cells.
 
     Never raises for expected conditions (unknown id, unsupported format,
     template drift, an invalid substituted value) — each is reported so one
@@ -1087,6 +1101,9 @@ def generate_reviewed_workbook(
         "file_bytes": None, "filename": None,
         "applied_count": 0, "rejected_count": 0, "returned_count": 0,
         "corrections_not_applied": [], "unknown_ids": [], "skip_reason": None,
+        # Always present, even on an early return, so every caller sees one
+        # contract and never has to guess whether the key exists.
+        "verified_overrides": {},
     }
 
     by_id = {c["id"]: c for c in (candidates or [])}
@@ -1111,6 +1128,20 @@ def generate_reviewed_workbook(
     log_rows = []
     corrections_not_applied = []
     applied_count = rejected_count = returned_count = 0
+    # {(gp, field): approved_value} -- the VERIFIED layer.
+    #
+    # Populated in exactly one place: the `written_ok` branch below, the same
+    # condition that increments applied_count. So an entry exists if and only
+    # if a reviewer approved the value, it passed validate_approved_value, AND
+    # it was actually written to the workbook. Reject, return, undecided, a
+    # domain-refused substitution and a failed write all correctly produce no
+    # entry -- and "no entry" means "the lender's original value stands",
+    # which is exactly what the corrected workbook contains for those cells.
+    #
+    # This is what lets the corrected workbook and the Final Audited Portfolio
+    # Summary be generated from ONE source: there is no second decision point
+    # where they could disagree.
+    verified_overrides = {}
 
     for d in actionable:
         cand = by_id[d["id"]]
@@ -1195,6 +1226,7 @@ def generate_reviewed_workbook(
         corr["reviewer_approved"] = True
         written_ok, detail = _apply_one_correction(wb, corr)
         if written_ok:
+            verified_overrides[(gp, field)] = approved_value
             log_rows.append({
                 **detail,
                 "review_status": "Applied",
@@ -1246,4 +1278,5 @@ def generate_reviewed_workbook(
         "corrections_not_applied": corrections_not_applied,
         "unknown_ids": unknown_ids,
         "skip_reason": None,
+        "verified_overrides": verified_overrides,
     }
