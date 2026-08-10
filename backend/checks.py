@@ -2788,14 +2788,31 @@ def _build_portfolio_summary_record(si_grouped, servicer_name, dq_status_for_agi
 def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
     """PORT-01 — the ORIGINAL Portfolio Summary: aging buckets use the
     consolidated, servicer-reported Delinquency Status as-is (dq_status
-    from consolidate_cycle_postings), unaudited."""
+    from consolidate_cycle_postings), unaudited.
+
+    CLIENT-CONFIRMED (2026-08-10): displayed as "Original Portfolio Summary".
+    This is the LENDER-REPORTED STARTING POSITION and is deliberately RETAINED
+    -- it has audit value as the before picture. It is NOT the audited figure
+    and NOT the post-review figure. Three distinct layers exist:
+
+        Original Portfolio Summary       this function -- what the lender said
+        Audited Portfolio Summary        audited_portfolio_summary_record --
+                                         what the audit calculated
+        Final Audited Portfolio Summary  verified_portfolio_summary_record --
+                                         what the reviewer verified
+
+    The label matters: these values were previously shown on the results
+    screen as a bare "Portfolio Summary", indistinguishable from the audited
+    workbook the client downloads, which is exactly how the two came to be
+    read as the same report disagreeing with itself rather than as two
+    different reports. Naming is the whole fix here -- no value changes."""
     si_grouped = consolidate_cycle_postings(servicer_inputs_df)
     record = _build_portfolio_summary_record(
         si_grouped, servicer_name, lambda gp, row: row.get("dq_status", "")
     )
 
     result = _result(
-        "PORT-01", "Portfolio Summary", "SBA Reconciliation", "INFO", [record],
+        "PORT-01", "Original Portfolio Summary", "SBA Reconciliation", "INFO", [record],
         lambda n: "",
         issues_found=0,  # a summary, never an "issue" -- stays visible via the informational override, doesn't count toward the audit's issue tally
     )
@@ -3253,7 +3270,7 @@ ALL_CHECKS_META = [
     ("PAY-02", "Payment Shortfall Check"),
     ("DUP-01", "Duplicate Postings"),
     ("NEG-01", "Negative Payment Flags"),
-    ("PORT-01", "Portfolio Summary"),
+    ("PORT-01", "Original Portfolio Summary"),
     ("DQ-01", "Final Posting Incomplete"),
 ]
 
