@@ -447,13 +447,37 @@ async def audit(
             # reaches the API response.
             if stat01_result is not None:
                 audited_status_by_loan = stat01_result.get("audited_status_by_loan", {})
+                # CLIENT-CONFIRMED (2026-08-10): loans suppressed by the
+                # closed-at-zero rule are EXPLICITLY excluded from the audited
+                # population -- neither their count nor their stale current
+                # servicer balance contributes to any audited category. Passed
+                # as an exclusion set rather than by withholding their audited
+                # status, since a missing status falls back to the servicer's
+                # own reported value.
+                suppressed_trace = stat01_result.get("suppressed_closed_loans") or []
                 portfolio_summary_audited_records.append(
                     checks_mod.audited_portfolio_summary_record(
-                        servicer_inputs_df, audited_status_by_loan, servicer_name=display_label
+                        servicer_inputs_df, audited_status_by_loan, servicer_name=display_label,
+                        excluded_gps=[t["SBA GP Number"] for t in suppressed_trace],
                     )
                 )
 
             if stat01_result is not None:
+                # Suppression must be auditable even though it is deliberately
+                # invisible to the client: log every withheld loan with the
+                # evidence that justified it, then strip the trace from the
+                # payload alongside the other internal-only sibling keys.
+                for t in stat01_result.get("suppressed_closed_loans") or []:
+                    print(
+                        f"[closed-at-zero suppression] {t['Servicer']} GP {t['SBA GP Number']}: "
+                        f"prior SOUP {t['Prior Closed Status']!r} at {t['Prior Ending Actual Balance']} "
+                        f"on {t['Prior Closed Month']} (deal {t['Prior Closed Deal'] or 'n/a'}); "
+                        f"servicer now reports "
+                        f"{t['Current Servicer Loan Status']!r} at {t['Current Servicer Ending Balance']}; "
+                        f"withheld from {', '.join(t['Checks Suppressed'])} and from all recommendations",
+                        file=sys.stderr,
+                    )
+                stat01_result.pop("suppressed_closed_loans", None)
                 stat01_result.pop("correction_data", None)
                 stat01_result.pop("_cycle_month", None)
                 stat01_result.pop("audited_status_by_loan", None)
