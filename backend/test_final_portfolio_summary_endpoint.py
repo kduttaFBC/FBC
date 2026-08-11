@@ -115,15 +115,38 @@ def _post(payload):
     return response.status_code, json.loads(bytes(response.body).decode())
 
 
+def _section(b64, title="BALANCE ($)"):
+    """Reads one stacked section of the single-worksheet Final Audited
+    Portfolio Summary. Returns (header, total_row, servicer_rows) with the
+    Total row separated out, since it is written FIRST in every section."""
+    ws = load_workbook(io.BytesIO(base64.b64decode(b64))).active
+    col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+    start = col_a.index(title)                      # 0-based; sheet row is start + 1
+    header = [ws.cell(row=start + 2, column=c).value
+              for c in range(1, ws.max_column + 1)]
+    rows = []
+    r = start + 3
+    while r <= ws.max_row and ws.cell(row=r, column=1).value:
+        rows.append([ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)])
+        r += 1
+    return header, rows[0], rows[1:]
+
+
 def _summary_rows(b64):
-    ws = load_workbook(io.BytesIO(base64.b64decode(b64)))["Portfolio Summary Dollars"]
-    rows = list(ws.iter_rows(values_only=True))
-    return rows[0], [r for r in rows[1:] if r and r[0]]
+    """Back-compatible shim: the BALANCE ($) section's servicer rows, Total
+    excluded, so the dollar assertions below read exactly as before."""
+    header, _total, servicer_rows = _section(b64)
+    return header, servicer_rows
 
 
-def _row(body, servicer):
-    header, data = _summary_rows(body["portfolio_summary_final_b64"])
-    return dict(zip(header, next(r for r in data if r[0] == servicer)))
+def _row(body, servicer, section="BALANCE ($)"):
+    header, _total, rows = _section(body["portfolio_summary_final_b64"], section)
+    return dict(zip(header, next(r for r in rows if r[0] == servicer)))
+
+
+def _total(body, section="BALANCE ($)"):
+    header, total_row, _rows = _section(body["portfolio_summary_final_b64"], section)
+    return dict(zip(header, total_row))
 
 
 class ServicerCoverageTests(unittest.TestCase):
@@ -268,13 +291,58 @@ class ResponseAndErrorContractTests(unittest.TestCase):
         self.assertEqual(body["portfolio_summary_final_filename"],
                          "Portfolio_Summary_Final_Audited_June_2026.xlsx")
 
-    def test_the_workbook_has_both_sheets(self):
+    def test_the_workbook_is_one_sheet_with_three_stacked_sections(self):
+        # CHANGED 2026-08-10: the Final Audited workbook moved from the
+        # two-sheet Audited layout to ONE worksheet carrying COUNT, BALANCE %
+        # and BALANCE ($) stacked, Total first in each. The Audited workbook
+        # keeps the two-sheet layout, asserted separately.
         sid = _session(candidates_a=[_candidate("1000000001", "Delinquency Status", "60 DAYS", "a1", 10)])
         _, body = _post({"session_id": sid, "reviewed_by": "QA",
                          "decisions": [{"id": "a1", "decision": "approve"}]})
         wb = load_workbook(io.BytesIO(base64.b64decode(body["portfolio_summary_final_b64"])))
-        self.assertEqual(wb.sheetnames,
-                         ["Portfolio Summary Dollars", "Portfolio Summary Percentages"])
+        self.assertEqual(wb.sheetnames, ["Final Audited Portfolio Summary"])
+        col_a = [wb.active.cell(row=r, column=1).value for r in range(1, wb.active.max_row + 1)]
+        self.assertEqual([v for v in col_a if v in ("COUNT", "BALANCE %", "BALANCE ($)")],
+                         ["COUNT", "BALANCE %", "BALANCE ($)"])
+
+    def test_all_three_sections_carry_the_same_servicers(self):
+        sid = _session(candidates_a=[_candidate("1000000001", "Delinquency Status", "60 DAYS", "a1", 10)])
+        _, body = _post({"session_id": sid, "reviewed_by": "QA",
+                         "decisions": [{"id": "a1", "decision": "approve"}]})
+        names = []
+        for section in ("COUNT", "BALANCE %", "BALANCE ($)"):
+            _h, _t, rows = _section(body["portfolio_summary_final_b64"], section)
+            names.append([r[0] for r in rows])
+        self.assertEqual(names[0], names[1])
+        self.assertEqual(names[1], names[2])
+        self.assertEqual(names[0], ["Bank A", "Bank B"])
+
+    def test_the_count_section_agrees_with_the_dollar_section(self):
+        # An approved correction must move Count and Dollars together.
+        sid = _session(candidates_a=[_candidate("1000000001", "Delinquency Status", "60 DAYS", "a1", 10)])
+        _, body = _post({"session_id": sid, "reviewed_by": "QA",
+                         "decisions": [{"id": "a1", "decision": "approve"}]})
+        counts = _row(body, "Bank A", "COUNT")
+        dollars = _row(body, "Bank A", "BALANCE ($)")
+        self.assertEqual(counts["60 Days"], 1)
+        self.assertEqual(dollars["60 Days"], 100000.0)
+
+    def test_the_total_row_sums_counts_and_dollars(self):
+        sid = _session(candidates_a=[_candidate("1000000001", "Delinquency Status", "60 DAYS", "a1", 10)])
+        _, body = _post({"session_id": sid, "reviewed_by": "QA",
+                         "decisions": [{"id": "a1", "decision": "approve"}]})
+        for section, category in (("COUNT", "Outstanding"), ("BALANCE ($)", "Outstanding")):
+            _h, total_row, rows = _section(body["portfolio_summary_final_b64"], section)
+            header, _t, _r = _section(body["portfolio_summary_final_b64"], section)
+            idx = header.index(category)
+            with self.subTest(section=section):
+                self.assertAlmostEqual(total_row[idx], sum(r[idx] for r in rows), places=2)
+
+    def test_total_outstanding_percentage_is_100(self):
+        sid = _session(candidates_a=[_candidate("1000000001", "Delinquency Status", "60 DAYS", "a1", 10)])
+        _, body = _post({"session_id": sid, "reviewed_by": "QA",
+                         "decisions": [{"id": "a1", "decision": "approve"}]})
+        self.assertEqual(_total(body, "BALANCE %")["Outstanding"], 100.0)
 
     def test_zero_decisions_behaviour_is_unchanged(self):
         sid = _session(candidates_a=[_candidate("1000000001", "Delinquency Status", "60 DAYS", "a1", 10)])

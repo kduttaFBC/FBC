@@ -801,6 +801,7 @@ async def corrections_review(payload: dict):
         # PORT-01 minus any suppressed loans). Dict insertion order preserves
         # upload order, matching the Audited workbook's row order.
         portfolio_summary_final_records = []
+        portfolio_summary_final_counts = []
         final_cycle_months = set()
         for servicer, entry in correction_state.items():
             try:
@@ -813,14 +814,18 @@ async def corrections_review(payload: dict):
                 # per-servicer generation loop above uses.
                 traceback.print_exc()
                 continue
-            portfolio_summary_final_records.append(
-                checks_mod.verified_portfolio_summary_record(
-                    servicer_inputs_df,
-                    verified_overrides_by_servicer.get(servicer) or {},
-                    servicer_name=servicer,
-                    excluded_gps=entry.get("excluded_gps") or [],
-                )
+            # ONE verified population per servicer, feeding all three views --
+            # Count, Balance % and Balance ($). verified_portfolio_summary_views
+            # builds it once; constructing it separately per view is the
+            # failure mode this call shape exists to prevent.
+            views = checks_mod.verified_portfolio_summary_views(
+                servicer_inputs_df,
+                verified_overrides_by_servicer.get(servicer) or {},
+                servicer_name=servicer,
+                excluded_gps=entry.get("excluded_gps") or [],
             )
+            portfolio_summary_final_records.append(views["dollars"])
+            portfolio_summary_final_counts.append(views["counts"])
             if entry.get("cycle_month") is not None:
                 final_cycle_months.add(entry["cycle_month"])
 
@@ -829,8 +834,15 @@ async def corrections_review(payload: dict):
         if portfolio_summary_final_records:
             final_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
             final_buffer = io.BytesIO()
-            report_mod.generate_portfolio_summary_bytes(
-                portfolio_summary_final_records, final_buffer
+            # Total row computed from the per-servicer records: counts and
+            # dollars summed, percentages RECOMPUTED from aggregate dollars --
+            # never averaged across servicers.
+            final_total = checks_mod.portfolio_summary_totals(
+                portfolio_summary_final_records, portfolio_summary_final_counts
+            )
+            report_mod.generate_final_portfolio_summary_bytes(
+                portfolio_summary_final_records, portfolio_summary_final_counts,
+                final_total, final_buffer,
             )
             portfolio_summary_final_b64 = base64.b64encode(final_buffer.getvalue()).decode("utf-8")
             # Underscored: the label is interpolated straight into the
