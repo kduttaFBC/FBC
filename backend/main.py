@@ -160,7 +160,7 @@ REPORT_ALWAYS_EXCLUDED_CHECK_IDS = {"PAY-01", "PAY-02", "DUP-01", "PORT-01"}
 # Lender spelling or an orphaned memo row means real deferral evidence never
 # reached the audit at all, which a reviewer has to see in the workbook itself
 # -- the whole point of the check is that this failure is otherwise silent.
-REPORT_CONDITIONAL_CHECK_IDS = {"POP-01", "NEG-01", "MEMO-01"}
+REPORT_CONDITIONAL_CHECK_IDS = {"POP-01", "CONT-01", "NEG-01", "MEMO-01"}
 
 
 def _filter_report_results(all_results):
@@ -178,9 +178,14 @@ def _filter_report_results(all_results):
         NOTHING to report (issues_found == 0) — included with its own tab
         the moment it actually finds something. POP-01 doesn't need a tab
         for the common "no population differences" case, but a real
-        mismatch is worth a client seeing directly. NEG-01's negative
-        payments are important enough to see when they occur, but an
-        empty PASS worksheet (the common case) adds little value.
+        mismatch is worth a client seeing directly. CONT-01 is the same
+        shape: the clean case is the norm (validated on real June 2026
+        data — zero findings across all eight servicer files), but a loan
+        that carried a live balance last month and then vanished from the
+        submission is exactly what a reviewer needs in the workbook.
+        NEG-01's negative payments are important enough to see when they
+        occur, but an empty PASS worksheet (the common case) adds little
+        value.
 
     A missing worksheet under either tier is NEVER evidence a check
     failed to run — every check's real, complete result is still in

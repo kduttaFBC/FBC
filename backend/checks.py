@@ -384,6 +384,219 @@ def population_check(loan_terms_df, soup_servicer_df, servicer_name, deal=None):
 
 
 # ---------------------------------------------------------------------------
+# CONT-01 — Prior Period Loan Continuity
+# CLIENT-CONFIRMED (2026-08-11).
+#
+# Answers exactly ONE question, deliberately narrow:
+#
+#   A loan carried an Ending Actual Balance above BALANCE_TOLERANCE in the
+#   IMMEDIATELY PRIOR finalized reporting month, but does not appear at all
+#   in this cycle's Servicer Inputs.
+#
+# SOUP is the authoritative prior finalized period. _infer_cycle_month already
+# codifies the architectural fact this depends on: SOUP only has data through
+# the PRIOR cycle, so SOUP's latest Payment Month IS last month's finalized
+# report. Validated on real data -- SOUP 2026-05 Ending Actual Balance matched
+# the June 2026 SRF's own "Loan Terms & Prior Period" closing balance for all
+# 122 loans in common, with no loan on either side only.
+#
+# NOT a balance-comparison check. When the loan IS present, whether its
+# Beginning Balance ties to the prior Ending Balance is BAL-01's question and
+# BAL-01's alone -- re-deriving that here would create a second implementation
+# of a live rule that could drift from the first, exactly what
+# consolidate_cycle_postings exists to prevent. CONT-01 covers the gap (loan
+# vanished); BAL-01 covers the overlap (loan present, balance doesn't tie).
+# Together they are the whole continuity rule with nothing duplicated.
+#
+# Also NOT POP-01. POP-01 compares the servicer's Loan Terms population
+# against SOUP's; both sources can agree a loan exists while the loan is
+# simply absent from the postings that report on it. Validated on the real
+# July 2026 Lendistry 2024 fixture: GP 5561999102 (BANKRUPTCY, prior balance
+# $12,675.95) sits in BOTH the Loan Terms sheet and SOUP, so POP-01 passes it
+# correctly, while it is missing from Servicer Inputs entirely. POP-01 is not
+# modified by this check and reuse of it was investigated and rejected.
+#
+# PRIOR-MONTH ANCHORING. The prior population is the rows at SOUP's LATEST
+# Payment Month for this servicer/deal -- not the latest row per loan. A loan
+# whose SOUP history ended months ago is PAY-01's "stopped reporting" case,
+# and anchoring per-loan would re-flag it here every cycle forever. Anchoring
+# also removed the only two false positives seen across real June data: two
+# PAID-IN-FULL loans whose stale final rows carry floating-point balance
+# residue (Lendistry 5214559105 at 2.04e-12, Poppy 6625075009 at 0.0007).
+#
+# ZERO IS TOLERANCE-JUDGED, never a strict `> 0`, for that same residue --
+# consistent with every other balance comparison in this module.
+#
+# LEGITIMATE EXITS, and only these:
+#   - a prior balance at or below BALANCE_TOLERANCE (the loan already closed
+#     to zero -- this alone accounted for every real dropout across all eight
+#     June 2026 servicer files: 15 loans, all at zero, zero false positives)
+#   - SUBSTITUTION-OUT, via the existing _POPULATION_EXIT_STATUS_KEYWORDS
+#   - closed-at-zero suppression, via the shared loans_closed_at_zero set
+# Deliberately NOT _TERMINAL_STATUS_KEYWORDS: a PAID-IN-FULL or LIQUIDATION
+# status still carrying a real balance is precisely a loan that must keep
+# reporting until it closes, so widening the exit list would suppress the
+# finding this check exists to make. BANKRUPTCY, FORECLOSURE, REO and
+# deferral are never exits -- the fixture case is a BANKRUPTCY loan with a
+# live balance.
+#
+# No documented-approved-exception bypass in this version (client decision,
+# 2026-08-11): there is no exception register in this codebase yet, and an
+# unreviewed suppression channel is the one thing that could make this check
+# silently miss a real gap. Revisit only if real cases demand it.
+# ---------------------------------------------------------------------------
+
+def prior_period_continuity_check(servicer_inputs_df, soup_servicer_df,
+                                  loan_terms_df=None, servicer_name=None,
+                                  deal=None, closed_at_zero=None):
+    records = []
+    suppressed_closed_gps = []
+
+    def _empty():
+        return {
+            "id": "CONT-01",
+            "name": "Prior Period Loan Continuity",
+            "category": "SBA Reconciliation",
+            "severity": "FAIL",
+            "status": "PASS",
+            "issues_found": 0,
+            "details": "No issues found.",
+            "records": [],
+            "suppressed_closed_gps": [],
+        }
+
+    # Degrade to "nothing to report" rather than raising, the same way every
+    # other check in this module handles a source it can't evaluate.
+    if soup_servicer_df is None or soup_servicer_df.empty:
+        return _empty()
+    if not {"SBA GP Number", "Payment Month", "Ending Actual Balance"}.issubset(soup_servicer_df.columns):
+        return _empty()
+    if servicer_inputs_df is None or servicer_inputs_df.empty:
+        # A submission with no readable postings at all is a file-level
+        # failure the readers and preflight already surface. Reporting every
+        # loan in the portfolio as "missing" would bury that, not reveal it.
+        return _empty()
+    if "SBA GP Number" not in servicer_inputs_df.columns:
+        return _empty()
+
+    # DEAL SCOPING, for the same reason POP-01 needs it: SOUP files every note
+    # series a servicer has under one Servicer value, so comparing Lendistry
+    # 2024 against unscoped Lendistry SOUP would drag in the 2025 deal's 1,241
+    # loans and report almost all of them as missing. Falls back to
+    # servicer-only, with an explicit note, when the deal can't be determined.
+    soup_scoped = soup_servicer_df
+    deal_scoped = False
+    if deal and "Deal" in soup_servicer_df.columns:
+        soup_scoped = soup_servicer_df[soup_servicer_df["Deal"].astype("string").str.strip() == deal]
+        deal_scoped = True
+
+    scope_note = (
+        f", scoped to Deal '{deal}'" if deal_scoped
+        else " (Deal could not be determined for this file -- compared by servicer only, not Servicer + Deal)"
+    )
+
+    if soup_scoped.empty:
+        return _empty()
+
+    soup = soup_scoped.copy()
+    soup["_gp"] = _norm_id(soup["SBA GP Number"])
+    soup["_month"] = pd.to_datetime(soup["Payment Month"], errors="coerce")
+    soup = soup[soup["_gp"].notna()].dropna(subset=["_month"])
+    if soup.empty:
+        return _empty()
+
+    prior_month = soup["_month"].max()
+    prior = soup[soup["_month"] == prior_month]
+    # One record per loan even if the prior month somehow carries more than
+    # one row for the same GP within a single deal.
+    prior = prior.groupby("_gp").tail(1)
+
+    reported_this_cycle = set(_norm_id(servicer_inputs_df["SBA GP Number"]).dropna())
+
+    # Corroborating reviewer evidence ONLY: the current submission's own
+    # "Loan Terms & Prior Period" sheet states the prior closing balance it
+    # then failed to report on. Read-only display, never an input to the
+    # test -- the same convention correction_data's review-evidence fields
+    # follow. SOUP alone decides whether a loan is flagged, because a
+    # servicer that drops a loan from Servicer Inputs could equally drop it
+    # from its own prior-period sheet.
+    lt_prior_balances = {}
+    if (loan_terms_df is not None and not loan_terms_df.empty
+            and {"SBA GP Number", "Ending Balance"}.issubset(loan_terms_df.columns)):
+        lt = loan_terms_df.copy()
+        lt["_gp"] = _norm_id(lt["SBA GP Number"])
+        lt["_bal"] = pd.to_numeric(lt["Ending Balance"], errors="coerce")
+        for lt_gp, lt_bal in zip(lt["_gp"], lt["_bal"]):
+            if pd.notna(lt_gp) and pd.notna(lt_bal):
+                lt_prior_balances[str(lt_gp).strip()] = round(float(lt_bal), 2)
+
+    deal_label = deal or "unknown"
+    prior_month_label = prior_month.strftime("%m/%Y")
+
+    for _, row in prior.iterrows():
+        gp = str(row["_gp"]).strip()
+
+        if gp in reported_this_cycle:
+            continue  # reported -- any balance break is BAL-01's question
+
+        prior_balance = pd.to_numeric(row.get("Ending Actual Balance"), errors="coerce")
+        if pd.isna(prior_balance):
+            continue  # can't evaluate the rule without a prior balance
+        if prior_balance <= BALANCE_TOLERANCE:
+            continue  # already closed to zero -- a legitimate exit
+
+        prior_status = str(row.get("Loan Status", "") or "").strip()
+        if any(k in prior_status.upper() for k in _POPULATION_EXIT_STATUS_KEYWORDS):
+            continue  # substituted out of the deal -- expected to stop reporting
+
+        # CLOSED-AT-ZERO SUPPRESSION (see _CLOSED_AT_ZERO_STATUS_KEYWORDS),
+        # applied LAST rather than first as BAL-01/BAL-02 do. Those iterate
+        # the current cycle's population, so checking up front bounds their
+        # trace; this iterates the PRIOR population, where an up-front check
+        # would fill the trace with closed loans that were never going to be
+        # flagged anyway. Applied here, a trace entry means what it says: this
+        # loan would have been a CONT-01 finding and was withheld.
+        if closed_at_zero and gp in closed_at_zero:
+            suppressed_closed_gps.append(gp)
+            continue
+
+        prior_balance = round(float(prior_balance), 2)
+        records.append({
+            "SBA GP Number": gp,
+            "Deal": deal_label,
+            "Prior Reporting Month": prior_month_label,
+            "Prior Loan Status": prior_status,
+            "Prior Delinquency Status": str(row.get("Delinquency Status", "") or "").strip(),
+            "Prior Ending Balance": prior_balance,
+            "Reported This Cycle": "NO",
+            "Issue": (
+                f"Loan carried a prior Ending Balance of ${prior_balance:,.2f} and "
+                f"did not appear in this cycle's Servicer Inputs."
+            ),
+            "Prior Period Sheet Balance": lt_prior_balances.get(gp, ""),
+        })
+
+    records.sort(key=lambda r: r["SBA GP Number"])
+
+    details = "No issues found." if not records else (
+        f"{len(records)} loan(s) carried a prior Ending Balance above zero but were not "
+        f"reported in this cycle for {servicer_name}{scope_note}."
+    )
+
+    return {
+        "id": "CONT-01",
+        "name": "Prior Period Loan Continuity",
+        "category": "SBA Reconciliation",
+        "severity": "FAIL",
+        "status": "PASS" if not records else "FAIL",
+        "issues_found": len(records),
+        "details": details,
+        "records": records,
+        "suppressed_closed_gps": suppressed_closed_gps,
+    }
+
+
+# ---------------------------------------------------------------------------
 # BAL-01 — Balance Continuity
 # This cycle's Beginning Balance (Servicer Inputs) should tie to SOUP's most
 # recent Ending Actual Balance for that loan. Loans with multiple payment
@@ -3615,6 +3828,7 @@ def payment_shortfall_check(servicer_inputs_df):
 
 ALL_CHECKS_META = [
     ("POP-01", "Population Check"),
+    ("CONT-01", "Prior Period Loan Continuity"),
     ("BAL-01", "Balance Continuity"),
     ("BAL-02", "Liquidation Balance Validation"),
     ("STAT-01", "Status / Delinquency Match"),
@@ -3649,10 +3863,10 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
     "Lendistry SBLC, LLC, CA" rather than plain "Lendistry". Falls back to
     servicer_name if not supplied, for backward compatibility.
 
-    deal (from file_readers.extract_deal_from_note_series) scopes POP-01 to
-    Servicer + Deal + normalized GP Number instead of Servicer + GP Number
-    alone — see population_check's docstring-level comment for why. Only
-    affects POP-01; BAL-01, BAL-02, STAT-01, STAT-02, PAY-01/02, DUP-01, NEG-01, and PORT-01
+    deal (from file_readers.extract_deal_from_note_series) scopes POP-01 and
+    CONT-01 to Servicer + Deal + normalized GP Number instead of Servicer + GP
+    Number alone — see population_check's docstring-level comment for why.
+    Affects only those two; BAL-01, BAL-02, STAT-01, STAT-02, PAY-01/02, DUP-01, NEG-01, and PORT-01
     are unchanged by this parameter."""
     # CLOSED-AT-ZERO ELIGIBILITY, resolved ONCE per servicer and shared by
     # every client-facing exception check. Computed here rather than inside
@@ -3663,6 +3877,10 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
 
     results = [
         population_check(loan_terms_df, soup_servicer_df, servicer_name, deal=deal),
+        prior_period_continuity_check(
+            servicer_inputs_df, soup_servicer_df, loan_terms_df=loan_terms_df,
+            servicer_name=servicer_name, deal=deal, closed_at_zero=closed_at_zero,
+        ),
         balance_continuity_check(servicer_inputs_df, soup_servicer_df, closed_at_zero=closed_at_zero),
         liquidation_balance_check(servicer_inputs_df, closed_at_zero=closed_at_zero),
         status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name, closed_at_zero=closed_at_zero),
