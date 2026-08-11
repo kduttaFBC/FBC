@@ -37,6 +37,32 @@ function downloadBase64File(base64, filename, mimeType) {
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
+// CLIENT-CONFIRMED (2026-08-11): checks that are computed and returned in full
+// by the API, but are NOT rendered as a row in the on-screen Check results
+// table because a dedicated client-facing artifact already serves their
+// purpose.
+//
+// PORT-01 is the Original Portfolio Summary. It has its own downloadable
+// workbook (see the Download Original Portfolio Summary button above), so a
+// duplicate on-screen row showing "INFO / 0 issues" per servicer -- eight rows
+// on the June set -- adds nothing a reader can act on.
+//
+// DISPLAY ONLY. PORT-01 stays in all_results and in the /api/audit response
+// unchanged, because main.py builds the Original Portfolio Summary workbook
+// FROM that record, and because this app's stated contract is that every
+// check's complete result is always in the JSON regardless of what any
+// client-facing view chooses to show (see main.py _filter_report_results).
+// Hiding a row here must never be read as the check not having run.
+export const CHECKS_HIDDEN_FROM_RESULTS_TABLE = ['PORT-01']
+
+// Exported as a pure function of the results list so the hiding rule can be
+// asserted directly rather than inferred from rendered output.
+export function visibleResults(results) {
+  return (results || []).filter(
+    (r) => !CHECKS_HIDDEN_FROM_RESULTS_TABLE.includes(String(r.id || '').split('::')[0])
+  )
+}
+
 export default function ResultsScreen({ audit, onNewAudit, onExit }) {
   const { results, summary, report_id } = audit
   const recommendations = audit.recommendations || []
@@ -153,7 +179,7 @@ export default function ResultsScreen({ audit, onNewAudit, onExit }) {
             </tr>
           </thead>
           <tbody>
-            {results.map((r) => (
+            {visibleResults(results).map((r) => (
               <React.Fragment key={r.id}>
                 <tr className="clickable" onClick={() => toggle(r.id)}>
                   <td className="caret">{expanded === r.id ? '▾' : '▸'}</td>
