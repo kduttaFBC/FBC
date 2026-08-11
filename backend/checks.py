@@ -2788,14 +2788,31 @@ def _build_portfolio_summary_record(si_grouped, servicer_name, dq_status_for_agi
 def portfolio_summary_check(servicer_inputs_df, servicer_name=None):
     """PORT-01 — the ORIGINAL Portfolio Summary: aging buckets use the
     consolidated, servicer-reported Delinquency Status as-is (dq_status
-    from consolidate_cycle_postings), unaudited."""
+    from consolidate_cycle_postings), unaudited.
+
+    CLIENT-CONFIRMED (2026-08-10): displayed as "Original Portfolio Summary".
+    This is the LENDER-REPORTED STARTING POSITION and is deliberately RETAINED
+    -- it has audit value as the before picture. It is NOT the audited figure
+    and NOT the post-review figure. Three distinct layers exist:
+
+        Original Portfolio Summary       this function -- what the lender said
+        Audited Portfolio Summary        audited_portfolio_summary_record --
+                                         what the audit calculated
+        Final Audited Portfolio Summary  verified_portfolio_summary_record --
+                                         what the reviewer verified
+
+    The label matters: these values were previously shown on the results
+    screen as a bare "Portfolio Summary", indistinguishable from the audited
+    workbook the client downloads, which is exactly how the two came to be
+    read as the same report disagreeing with itself rather than as two
+    different reports. Naming is the whole fix here -- no value changes."""
     si_grouped = consolidate_cycle_postings(servicer_inputs_df)
     record = _build_portfolio_summary_record(
         si_grouped, servicer_name, lambda gp, row: row.get("dq_status", "")
     )
 
     result = _result(
-        "PORT-01", "Portfolio Summary", "SBA Reconciliation", "INFO", [record],
+        "PORT-01", "Original Portfolio Summary", "SBA Reconciliation", "INFO", [record],
         lambda n: "",
         issues_found=0,  # a summary, never an "issue" -- stays visible via the informational override, doesn't count toward the audit's issue tally
     )
@@ -2836,6 +2853,89 @@ def audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan,
     return _build_portfolio_summary_record(
         si_grouped, servicer_name,
         lambda gp, row: audited_status_by_loan.get(gp, row.get("dq_status", "")),
+    )
+
+
+# Which consolidated column each reviewable field writes to. This mapping is
+# the ONLY route a reviewer decision has into the Portfolio Summary, and it is
+# deliberately limited to the two fields Manual Review may correct.
+#
+# CLIENT-CONFIRMED (2026-08-10): financial values are NOT manually editable.
+# beginning_balance, ending_balance and received have no entry here and cannot
+# be reached from a review decision -- a financial value can only ever enter
+# the verified frame from the lender's own submission. If a financial value is
+# wrong, that requires servicer correction or resubmission, not a silent edit
+# through this feature. The correction allow-list (corrections.
+# build_eligible_corrections) never proposes a financial field in the first
+# place, so this is the second of two independent barriers.
+_VERIFIED_OVERRIDE_COLUMNS = {
+    "Loan Status": "loan_status",
+    "Delinquency Status": "dq_status",
+}
+
+
+def _apply_verified_overrides(si_grouped, verified_overrides):
+    """Returns a COPY of the consolidated frame with reviewer-approved values
+    written over the lender's. verified_overrides is
+    {(gp, field): approved_value} exactly as corrections.
+    generate_reviewed_workbook returns it.
+
+    Unknown GPs and unmapped fields are ignored rather than raising: the map
+    comes from a completed review, and a loan or field that isn't in this
+    frame simply has nothing to override. Never mutates the input."""
+    if not verified_overrides:
+        return si_grouped
+    out = si_grouped.copy()
+    index = {str(gp).strip(): gp for gp in out.index}
+    for (gp, field), value in verified_overrides.items():
+        column = _VERIFIED_OVERRIDE_COLUMNS.get(field)
+        key = index.get(str(gp).strip())
+        if column is None or key is None or column not in out.columns:
+            continue
+        out.at[key, column] = value
+    return out
+
+
+def verified_portfolio_summary_record(servicer_inputs_df, verified_overrides,
+                                      servicer_name=None, excluded_gps=None):
+    """CLIENT-CONFIRMED (2026-08-10): the FINAL AUDITED Portfolio Summary
+    record — the third and last of the three layers:
+
+        Original Portfolio Summary        portfolio_summary_check -- what the
+                                          lender reported
+        Audited Portfolio Summary         audited_portfolio_summary_record --
+                                          what the audit calculated
+        Final Audited Portfolio Summary   THIS -- what the reviewer verified
+
+    This is NOT a third calculation. It is PORT-01's calculation applied to
+    post-review values, and the aging lambda below is deliberately IDENTICAL
+    to portfolio_summary_check's — because after review the row's own values
+    ARE the verified ones. Deliberately NOT audited_status_by_loan: that would
+    reinstate the audit's recommendation on loans the reviewer REJECTED, which
+    is precisely what the three-layer model exists to prevent.
+
+    That identity is also what makes this reproduce the historical workflow.
+    Before this feature the client downloaded a corrected workbook, re-uploaded
+    it and re-ran PORT-01 on it; this removes the round trip while computing
+    the same thing from the same values.
+
+    excluded_gps carries the closed-at-zero suppression set. Confirmed against
+    all eight banks' historical corrected (vF) workbooks: the ONLY rows the
+    client ever removed by hand were exactly the closed-at-zero loans, and
+    every one of them was removed (Community Bank 4338609104; Peoples
+    1271409104 / 1328729108 / 1430308405 / 3179359109). Suppression mechanises
+    that practice rather than diverging from it — and since the new workflow
+    cannot delete rows, it is the only mechanism that reproduces it.
+
+    Returns the raw record dict directly, not wrapped in _result()."""
+    si_grouped = _apply_verified_overrides(
+        consolidate_cycle_postings(servicer_inputs_df), verified_overrides
+    )
+    if excluded_gps:
+        excluded = {str(g).strip() for g in excluded_gps}
+        si_grouped = si_grouped[~si_grouped.index.astype(str).str.strip().isin(excluded)]
+    return _build_portfolio_summary_record(
+        si_grouped, servicer_name, lambda gp, row: row.get("dq_status", "")
     )
 
 
@@ -3253,7 +3353,7 @@ ALL_CHECKS_META = [
     ("PAY-02", "Payment Shortfall Check"),
     ("DUP-01", "Duplicate Postings"),
     ("NEG-01", "Negative Payment Flags"),
-    ("PORT-01", "Portfolio Summary"),
+    ("PORT-01", "Original Portfolio Summary"),
     ("DQ-01", "Final Posting Incomplete"),
 ]
 

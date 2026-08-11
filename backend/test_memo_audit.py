@@ -670,10 +670,34 @@ SOUP_PATH = os.environ.get("FALCONBRIDGE_SOUP_XLSX")
 #                           they are asserted only with a real SOUP file and a
 #                           message that says a move needs interpreting rather
 #                           than fixing.
+# UPDATED 2026-08-10, client-approved: total_rows/content 198 -> 200 and
+# joined 190 -> 192. The delivered memo gained TWO appended rows (physical
+# Excel rows 204 and 205) and nothing else changed -- no existing row was
+# edited, and every data-quality flag below is UNCHANGED, which is why only
+# the three row counts move here.
+#
+#   row 204  Community Bank & Trust, Climbzone Palisades LLC, GP 1534469103,
+#            Deferred, 2-month PNI (full), 2026-07-05 -> 2026-08-05,
+#            resume 2026-09-05. Report Date 2026-08-05, the latest in the file.
+#   row 205  Mission Valley Bank, Duke Controls Inc, GP 3585327005, Deferred,
+#            3-month principal deferment (partial), 2026-05-05 -> 2026-07-05,
+#            resume 2026-08-05.
+#
+# Both join to SOUP, neither carries a quality flag, and neither GP had any
+# other memo row. They are RESPONSIVE additions: both loans were previously
+# flagged "reports the loan as DEFERRED, but the available Servicer Memo
+# information does not provide sufficient deferral dates" -- these rows supply
+# exactly that missing evidence, so the warning clears and each loan's
+# previously suppressed Delinquency Status correction becomes available.
+#
+# Verified two ways before updating: removing rows 204/205 reproduces the old
+# 198/190 baseline exactly on all nine counts, and the July Community Bank
+# recommendation set with those rows excluded is identical to a capture taken
+# before the file changed.
 POPULATION_INDEPENDENT_BASELINE = {
-    "total_rows": 198,
+    "total_rows": 200,
     "phantom": 0,
-    "content": 198,
+    "content": 200,
     "deferral_dates_missing": 4,
     "date_anomaly_violations": 5,
     "date_anomaly_rows": 4,
@@ -691,7 +715,10 @@ POPULATION_INDEPENDENT_BASELINE = {
 # each appear twice): Oakley Hills, World Class Real Estate, Jkari Hospitality,
 # BCRS, Chico Fine Art — the #N/A-deal set the brief names.
 POPULATION_DEPENDENT_BASELINE = {
-    "joined": 190,
+    # 190 -> 192: both rows added on 2026-08-10 join to SOUP (see the note on
+    # POPULATION_INDEPENDENT_BASELINE above). lookup_failed is UNCHANGED at 8 --
+    # the orphan set is exactly the same five borrowers across eight rows.
+    "joined": 192,
     "lookup_failed": 8,
 }
 

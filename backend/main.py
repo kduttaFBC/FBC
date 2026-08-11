@@ -408,16 +408,35 @@ async def audit(
             # Stash this servicer's ORIGINAL bytes + hash + candidate set for
             # the review endpoint. SHA-256 captured now, alongside the bytes,
             # so the Correction Log can later prove which source artifact was
-            # reviewed. Only stored when there is something reviewable.
-            if candidates:
-                correction_session_state[display_label] = {
-                    "original_bytes": file_bytes,
-                    "original_filename": uploaded.filename,
-                    "source_sha256": hashlib.sha256(file_bytes).hexdigest(),
-                    "institution": display_label,
-                    "cycle_month": (stat01_result or {}).get("_cycle_month"),
-                    "candidates": candidates,
-                }
+            # reviewed.
+            #
+            # CLIENT-CONFIRMED (2026-08-10): stored for EVERY servicer, not
+            # only those with reviewable corrections. The Final Audited
+            # Portfolio Summary is generated after Manual Review from these
+            # bytes, and it must carry one row per uploaded servicer -- a
+            # servicer the audit found nothing to correct on still holds
+            # portfolio balances. Guarding this on `candidates` made those
+            # servicers disappear from the summary entirely, which is a worse
+            # failure than the memory it saves (~4.5 MB across the eight-bank
+            # June set, held for the existing 1h TTL).
+            #
+            # excluded_gps carries the closed-at-zero suppression set forward,
+            # captured HERE while suppressed_closed_loans is still on
+            # stat01_result -- it is popped further below. Stashing the GP list
+            # rather than recomputing it at review time keeps
+            # loans_closed_at_zero the single derivation of that rule.
+            correction_session_state[display_label] = {
+                "original_bytes": file_bytes,
+                "original_filename": uploaded.filename,
+                "source_sha256": hashlib.sha256(file_bytes).hexdigest(),
+                "institution": display_label,
+                "cycle_month": (stat01_result or {}).get("_cycle_month"),
+                "candidates": candidates,
+                "excluded_gps": [
+                    t["SBA GP Number"]
+                    for t in ((stat01_result or {}).get("suppressed_closed_loans") or [])
+                ],
+            }
             del file_bytes
             gc.collect()
 
@@ -688,7 +707,12 @@ async def corrections_review(payload: dict):
             })
 
         correction_state = session.get("corrections") or {}
-        if not correction_state:
+        # Checks for reviewable CANDIDATES, not merely for a session entry:
+        # since 2026-08-10 every servicer is stashed (the Final Audited
+        # Portfolio Summary needs one row each), so a non-empty
+        # correction_state no longer implies anything was reviewable. This
+        # keeps the original meaning of the guard exactly.
+        if not any((entry.get("candidates") or []) for entry in correction_state.values()):
             return JSONResponse(status_code=400, content={
                 "error": "This audit produced no reviewable corrections.",
             })
@@ -711,6 +735,9 @@ async def corrections_review(payload: dict):
         corrected_workbooks = []
         corrections_not_applied = []
         applied_total = rejected_total = returned_total = 0
+        # {servicer: {(gp, field): approved_value}} -- the VERIFIED layer, the
+        # single source both post-review artifacts are built from.
+        verified_overrides_by_servicer = {}
 
         for servicer, servicer_decisions in decisions_by_servicer.items():
             entry = correction_state[servicer]
@@ -725,6 +752,8 @@ async def corrections_review(payload: dict):
                 entry["cycle_month"],
                 reviewed_on=reviewed_on,
             )
+
+            verified_overrides_by_servicer[servicer] = outcome.get("verified_overrides") or {}
 
             applied_total += outcome["applied_count"]
             rejected_total += outcome["rejected_count"]
@@ -754,8 +783,70 @@ async def corrections_review(payload: dict):
                     "reason": outcome["skip_reason"],
                 })
 
+        # ---- Final Audited Portfolio Summary --------------------------------
+        # CLIENT-CONFIRMED (2026-08-10): the third layer, generated ONLY here,
+        # only after Manual Review, from
+        #
+        #     original lender data + verified_overrides + closed-at-zero suppression
+        #
+        # Built with checks_mod.verified_portfolio_summary_record, which reuses
+        # _build_portfolio_summary_record -- there is no separate calculation
+        # engine, and the Original (PORT-01) and Audited summaries are
+        # untouched. It shares verified_overrides with the corrected workbook
+        # above, so the two artifacts cannot disagree.
+        #
+        # Iterates correction_state, NOT decisions_by_servicer: every uploaded
+        # servicer gets exactly one row, including servicers the reviewer made
+        # no decisions on (their overrides are simply empty, so their row is
+        # PORT-01 minus any suppressed loans). Dict insertion order preserves
+        # upload order, matching the Audited workbook's row order.
+        portfolio_summary_final_records = []
+        final_cycle_months = set()
+        for servicer, entry in correction_state.items():
+            try:
+                _, _, _, servicer_inputs_df, _ = file_readers.read_servicer_file(
+                    entry["original_bytes"], filename=entry.get("original_filename"),
+                )
+            except Exception:
+                # One unreadable servicer must not lose the whole summary; the
+                # others are still reported. Same isolation principle the
+                # per-servicer generation loop above uses.
+                traceback.print_exc()
+                continue
+            portfolio_summary_final_records.append(
+                checks_mod.verified_portfolio_summary_record(
+                    servicer_inputs_df,
+                    verified_overrides_by_servicer.get(servicer) or {},
+                    servicer_name=servicer,
+                    excluded_gps=entry.get("excluded_gps") or [],
+                )
+            )
+            if entry.get("cycle_month") is not None:
+                final_cycle_months.add(entry["cycle_month"])
+
+        portfolio_summary_final_b64 = None
+        portfolio_summary_final_filename_value = None
+        if portfolio_summary_final_records:
+            final_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
+            final_buffer = io.BytesIO()
+            report_mod.generate_portfolio_summary_bytes(
+                portfolio_summary_final_records, final_buffer
+            )
+            portfolio_summary_final_b64 = base64.b64encode(final_buffer.getvalue()).decode("utf-8")
+            # Underscored: the label is interpolated straight into the
+            # filename, so "Final Audited" would yield
+            # "Portfolio_Summary_Final Audited_June_2026.xlsx" -- a space, and
+            # inconsistent with the Original/Audited files beside it. Fixed
+            # here at the call site rather than by teaching the shared filename
+            # helper to rewrite labels.
+            portfolio_summary_final_filename_value = report_mod.portfolio_summary_filename(
+                final_cycle_month, label="Final_Audited"
+            )
+
         return JSONResponse({
             "corrected_workbooks": corrected_workbooks,
+            "portfolio_summary_final_b64": portfolio_summary_final_b64,
+            "portfolio_summary_final_filename": portfolio_summary_final_filename_value,
             "summary": {
                 "applied": applied_total,
                 "rejected": rejected_total,
