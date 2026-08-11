@@ -417,24 +417,127 @@ class DealGroupedWorkbookTests(unittest.TestCase):
         self.col_a = [self.ws.cell(row=r, column=1).value
                       for r in range(1, self.ws.max_row + 1)]
 
+    def _section_labels(self, section):
+        """Labels of one section's body, in order, blank separators included
+        as None -- read positionally from the section title rather than at
+        hardcoded offsets, so adding a spacer row cannot silently break this."""
+        i = self.col_a.index(section)
+        labels, blanks = [], 0
+        for value in self.col_a[i + 2:]:
+            if value in report.FINAL_SUMMARY_SECTIONS:
+                break
+            if value is None:
+                blanks += 1
+                if blanks > 1:          # two blanks = end of section
+                    break
+                labels.append(None)
+                continue
+            blanks = 0
+            labels.append(value)
+        while labels and labels[-1] is None:
+            labels.pop()
+        return labels
+
     def test_every_section_shows_2024_block_then_2025_block(self):
         for section in report.FINAL_SUMMARY_SECTIONS:
-            i = self.col_a.index(section)
             with self.subTest(section=section):
-                self.assertEqual(self.col_a[i + 2], "2024 SOUP Deal Total")
-                self.assertEqual(self.col_a[i + 3], "Bank 1")
-                self.assertEqual(self.col_a[i + 4], "Bank 2")
-                self.assertEqual(self.col_a[i + 5], "2025 SOUP Deal Total")
-                self.assertEqual(self.col_a[i + 6], "Bank 0")
+                self.assertEqual(
+                    self._section_labels(section),
+                    ["2024 SOUP Deal Total", "Bank 1", "Bank 2",
+                     None,                                  # the block separator
+                     "2025 SOUP Deal Total", "Bank 0"])
+
+    def test_one_blank_row_separates_the_deal_blocks_in_every_section(self):
+        for section in report.FINAL_SUMMARY_SECTIONS:
+            with self.subTest(section=section):
+                labels = self._section_labels(section)
+                self.assertEqual(labels.count(None), 1)
+                self.assertEqual(labels.index(None), 3)     # after the 2024 block
+
+    def test_the_separator_row_is_completely_unstyled(self):
+        i = self.col_a.index("COUNT")
+        separator = i + 2 + 3 + 1        # title, header, 3 body rows -> sheet row
+        for col in range(1, len(CATEGORIES) + 2):
+            cell = self.ws.cell(row=separator, column=col)
+            with self.subTest(col=col):
+                self.assertIsNone(cell.value)
 
     def test_each_deal_reads_100_percent_outstanding_in_the_workbook(self):
         i = self.col_a.index("BALANCE %")
-        for offset in (2, 5):                       # the two deal total rows
-            with self.subTest(row=i + offset):
-                self.assertEqual(self.ws.cell(row=i + offset + 1, column=2).value, 100.0)
+        totals = [r for r in range(i + 3, i + 3 + len(self._section_labels("BALANCE %")))
+                  if str(self.ws.cell(row=r, column=1).value or "").endswith("Deal Total")]
+        self.assertEqual(len(totals), 2)
+        for row in totals:
+            with self.subTest(row=row):
+                self.assertEqual(self.ws.cell(row=row, column=2).value, 100.0)
 
     def test_no_row_is_labelled_just_total(self):
         self.assertNotIn("Total", self.col_a)
+
+
+class ReportHeadingAndHeaderDisplayTests(unittest.TestCase):
+    """Formatting only -- no figure is affected by anything asserted here."""
+
+    def _build(self, cycle_month=None):
+        views = [checks.verified_portfolio_summary_views(SAMPLE, {}, "Bank A")]
+        blocks = checks.group_portfolio_summary_by_deal(
+            [views[0]["dollars"]], [views[0]["counts"]], ["SOUP2024_1"])
+        buf = io.BytesIO()
+        report.generate_final_portfolio_summary_bytes(blocks, buf, cycle_month=cycle_month)
+        return load_workbook(io.BytesIO(buf.getvalue())).active
+
+    def test_the_heading_names_the_report_and_the_period(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        self.assertEqual(ws.cell(row=1, column=1).value, "Final Audited Portfolio Summary")
+        self.assertEqual(ws.cell(row=2, column=1).value, "Reporting Period: June 2026")
+
+    def test_the_heading_is_visually_emphasised(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        self.assertTrue(ws.cell(row=1, column=1).font.bold)
+        self.assertGreater(ws.cell(row=1, column=1).font.size, 11)
+
+    def test_a_missing_cycle_month_omits_the_period_rather_than_guessing(self):
+        ws = self._build(None)
+        self.assertEqual(ws.cell(row=1, column=1).value, "Final Audited Portfolio Summary")
+        self.assertIsNone(ws.cell(row=2, column=1).value)
+
+    def test_the_first_section_starts_below_the_heading(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        self.assertIsNone(ws.cell(row=3, column=1).value)      # spacer
+        self.assertEqual(ws.cell(row=4, column=1).value, "COUNT")
+
+    def test_header_rows_have_an_explicit_height_so_wrapped_names_display(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+        for section in report.FINAL_SUMMARY_SECTIONS:
+            header_row = col_a.index(section) + 2      # 0-based index -> sheet row + 1
+            with self.subTest(section=section):
+                self.assertEqual(ws.cell(row=header_row, column=1).value, "Servicer")
+                self.assertIsNotNone(ws.row_dimensions[header_row].height)
+                self.assertGreaterEqual(ws.row_dimensions[header_row].height, 30)
+
+    def test_category_names_are_written_in_full_and_wrap(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+        header_row = col_a.index("COUNT") + 2
+        written = [ws.cell(row=header_row, column=c).value
+                   for c in range(2, len(CATEGORIES) + 2)]
+        self.assertEqual(written, CATEGORIES)              # no truncation, no abbreviation
+        self.assertIn("Not Making Payment", written)
+        for c in range(2, len(CATEGORIES) + 2):
+            self.assertTrue(ws.cell(row=header_row, column=c).alignment.wrap_text)
+
+    def test_column_a_freeze_is_unchanged(self):
+        self.assertEqual(self._build(pd.Timestamp("2026-06-01")).freeze_panes, "B1")
+
+    def test_foreclosure_and_liquidation_are_kept_even_when_zero(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+        header_row = col_a.index("COUNT") + 2
+        written = [ws.cell(row=header_row, column=c).value
+                   for c in range(2, len(CATEGORIES) + 2)]
+        self.assertIn("Foreclosure", written)
+        self.assertIn("Liquidation", written)
 
 
 class ProtectedLogicUnchangedTests(unittest.TestCase):

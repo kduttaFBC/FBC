@@ -854,7 +854,11 @@ async def corrections_review(payload: dict):
                 portfolio_summary_final_records, portfolio_summary_final_counts,
                 portfolio_summary_final_deals,
             )
-            report_mod.generate_final_portfolio_summary_bytes(final_blocks, final_buffer)
+            # cycle_month feeds the heading's "Reporting Period" line only --
+            # the same value the filename already uses. It never touches a figure.
+            report_mod.generate_final_portfolio_summary_bytes(
+                final_blocks, final_buffer, cycle_month=final_cycle_month,
+            )
             portfolio_summary_final_b64 = base64.b64encode(final_buffer.getvalue()).decode("utf-8")
             # Underscored: the label is interpolated straight into the
             # filename, so "Final Audited" would yield
