@@ -314,9 +314,12 @@ PORTFOLIO_SUMMARY_CATEGORIES = [
 
 def generate_portfolio_summary_bytes(records, buffer):
     """records: a list of the single portfolio-summary record dict produced
-    per servicer (today always checks.audited_portfolio_summary_record),
-    one per uploaded servicer file, in upload order. Every uploaded
-    servicer gets its own row on both sheets, in the same order — a
+    per servicer — either checks.portfolio_summary_check's PORT-01 record
+    (Original) or checks.audited_portfolio_summary_record's (Audited);
+    this function is deliberately source-agnostic, since both records come
+    from the one shared checks._build_portfolio_summary_record and so share
+    an identical shape. One record per uploaded servicer file, in upload
+    order. Every uploaded servicer gets its own row on both sheets — a
     servicer split across multiple note-series files (e.g. "Lendistry
     2025" / "Lendistry 2024") appears as two distinct rows, since each is
     its own PORT-01 record with its own Servicer label already."""
@@ -545,13 +548,15 @@ def portfolio_summary_filename(cycle_month, label):
     (e.g. a servicer file was missing the columns STAT-01 needs), matching
     the same graceful-degradation convention used elsewhere in this app.
 
-    label names the workbook. Only "Audited" is produced today: the
-    ORIGINAL Portfolio Summary — same structure, aging buckets fed by the
-    servicer's own unreconciled Delinquency Status — was removed at the
-    client's request on 2026-08-10, and the Audited file keeps its existing
-    name. Both parameters are REQUIRED rather than defaulted, so no caller
-    can silently resurrect the removed workbook's filename by omitting
-    them; pass cycle_month=None explicitly for the today's-date fallback."""
+    label names the workbook. Two are produced today — "Original" (aging
+    buckets fed by the servicer's own unreconciled Delinquency Status) and
+    "Audited" (fed by STAT-01's calculated status). Both parameters are
+    REQUIRED rather than defaulted: label previously defaulted to
+    "Original", which meant a caller that simply forgot the argument
+    silently produced an Original-named file from whatever records it
+    happened to hold. Requiring it means the caller always states which
+    workbook it is naming; pass cycle_month=None explicitly for the
+    today's-date fallback."""
     if cycle_month is not None:
         try:
             return f"Portfolio_Summary_{label}_{cycle_month.strftime('%B_%Y')}.xlsx"

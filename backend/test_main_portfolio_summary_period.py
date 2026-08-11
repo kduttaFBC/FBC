@@ -36,8 +36,15 @@ class SingleReportingMonthTests(unittest.TestCase):
         june = pd.Timestamp("2026-06-01")
         cycle_month, error = main._resolve_portfolio_summary_cycle_month({june})
         self.assertIsNone(error)
-        filename = report.portfolio_summary_filename(cycle_month, label="Audited")
-        self.assertEqual(filename, "Portfolio_Summary_Audited_June_2026.xlsx")
+        # BOTH workbooks are named from this one resolved cycle month.
+        self.assertEqual(
+            report.portfolio_summary_filename(cycle_month, label="Original"),
+            "Portfolio_Summary_Original_June_2026.xlsx",
+        )
+        self.assertEqual(
+            report.portfolio_summary_filename(cycle_month, label="Audited"),
+            "Portfolio_Summary_Audited_June_2026.xlsx",
+        )
 
     def test_single_month_added_multiple_times_is_still_one_month(self):
         # Multiple servicers all reporting the SAME month -- a set
@@ -104,8 +111,14 @@ class BlankCycleMonthFallbackTests(unittest.TestCase):
         from datetime import date
         cycle_month, error = main._resolve_portfolio_summary_cycle_month(set())
         self.assertIsNone(error)
-        filename = report.portfolio_summary_filename(cycle_month, label="Audited")
-        self.assertEqual(filename, f"Portfolio_Summary_Audited_{date.today().isoformat()}.xlsx")
+        self.assertEqual(
+            report.portfolio_summary_filename(cycle_month, label="Original"),
+            f"Portfolio_Summary_Original_{date.today().isoformat()}.xlsx",
+        )
+        self.assertEqual(
+            report.portfolio_summary_filename(cycle_month, label="Audited"),
+            f"Portfolio_Summary_Audited_{date.today().isoformat()}.xlsx",
+        )
 
     def test_one_real_month_resolves_cleanly_with_no_conflicting_month(self):
         # This is the key case: a blank cycle month is represented by
