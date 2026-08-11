@@ -341,10 +341,22 @@ class OriginalSummaryEndpointTests(unittest.TestCase):
         }
 
     def _original_current_dollars(self, b64):
-        ws = load_workbook(io.BytesIO(base64.b64decode(b64)))["Portfolio Summary Dollars"]
+        """The Current figure from the Original workbook's BALANCE ($) section.
+
+        CLIENT-CONFIRMED (2026-08-11): the Original summary adopted the Final
+        Audited layout -- one sheet, three stacked sections, a Total row per
+        SOUP deal. It is no longer a two-sheet workbook with the servicer on
+        row 2, so this locates the section by its title band and reads the
+        deal Total beneath it. The ASSERTION it serves is unchanged: the
+        Original must report the LENDER's bucket."""
         import report
-        col = report.PORTFOLIO_SUMMARY_CATEGORIES.index("Current") + 2
-        return ws.cell(row=2, column=col).value
+        ws = load_workbook(io.BytesIO(base64.b64decode(b64)))["Original Portfolio Summary"]
+        col = report.FINAL_SUMMARY_CATEGORIES.index("Current") + 2
+        for row in range(1, ws.max_row + 1):
+            if ws.cell(row=row, column=1).value == "BALANCE ($)":
+                # title band, then the header row, then the first deal Total.
+                return ws.cell(row=row + 2, column=col).value
+        self.fail("no BALANCE ($) section found in the Original workbook")
 
     def test_original_workbook_carries_the_lender_reported_bucket(self):
         body = self._run_audit().json()

@@ -324,6 +324,13 @@ async def audit(
         # into SESSION_CACHE once the session_id is minted (end of this handler).
         correction_session_state = {}
         portfolio_summary_original_records = []
+        # CLIENT-CONFIRMED (2026-08-11): the Original summary now reports loan
+        # COUNTS beside dollars and totals PER SOUP DEAL, matching the Final
+        # Audited presentation. Both extra lists are filled from the SAME
+        # lender-only source as the dollars (see the loop below) -- one source
+        # per table, never two.
+        portfolio_summary_original_counts = []
+        portfolio_summary_original_deals = []
         portfolio_summary_audited_records = []
         portfolio_summary_cycle_months = set()
         # Canonical soup_keys of the servicer files in THIS audit, used to
@@ -516,25 +523,36 @@ async def audit(
                 stat01_result.pop("_cycle_month", None)
                 stat01_result.pop("audited_status_by_loan", None)
 
-            # CLIENT-CONFIRMED (2026-08-04, restored 2026-08-11): collect this
-            # servicer's PORT-01 record for the ORIGINAL Portfolio Summary
-            # workbook (see report_mod.generate_portfolio_summary_bytes below)
-            # — built entirely from the same tested PORT-01 records already
-            # produced above, never re-derived from raw file data. A servicer
-            # split across multiple note-series files (e.g. "Lendistry
-            # 2025"/"Lendistry 2024") naturally produces two separate records
-            # here, one per file, since each file gets its own
-            # run_servicer_reconciliation call with its own display_label.
+            # CLIENT-CONFIRMED (2026-08-04, restored 2026-08-11, extended
+            # 2026-08-11): collect this servicer's ORIGINAL Portfolio Summary
+            # views -- dollars AND loan counts -- plus its SOUP deal, for the
+            # workbook built after the loop. A servicer split across multiple
+            # note-series files (e.g. "Lendistry 2025"/"Lendistry 2024")
+            # naturally produces two separate entries here, one per file, since
+            # each file gets its own run_servicer_reconciliation call with its
+            # own display_label and its own deal.
             #
-            # Read off `results` and nothing else. PORT-01 is computed inside
-            # run_servicer_reconciliation from servicer_inputs_df alone, so
-            # this record cannot carry an audit-derived, reviewer-derived or
-            # correction-derived value no matter what happens above or below
-            # it -- that invariance is the whole point of this summary and is
-            # locked in by test_original_portfolio_summary_invariance.py.
-            port01_result = next((r for r in results if r["id"].split("::")[0] == "PORT-01"), None)
-            if port01_result is not None and port01_result["records"]:
-                portfolio_summary_original_records.append(port01_result["records"][0])
+            # checks.original_portfolio_summary_views takes ONLY the lender's
+            # submitted servicer_inputs_df: it has no parameter for an audited
+            # status map, a verified override, a reviewer decision, a
+            # correction, or a suppression set, so this record cannot carry an
+            # audit-derived value no matter what happens above or below it.
+            # That invariance is the whole point of this summary and is locked
+            # in by test_original_portfolio_summary_invariance.py and
+            # test_original_summary_final_format.py.
+            #
+            # ONE source for both tables, deliberately. The dollars are
+            # asserted equal to PORT-01's own record on every real June file
+            # (test_original_summary_final_format.py), so this is the same
+            # tested figure -- but taking dollars from `results` and counts
+            # from here would be two sources for one table, which is exactly
+            # how two views of one population drift apart.
+            original_views = checks_mod.original_portfolio_summary_views(
+                servicer_inputs_df, servicer_name=display_label,
+            )
+            portfolio_summary_original_records.append(original_views["dollars"])
+            portfolio_summary_original_counts.append(original_views["counts"])
+            portfolio_summary_original_deals.append(deal)
 
             all_results.extend(results)
             servicer_loan_counts[display_label] = len(servicer_inputs_df)
@@ -622,13 +640,19 @@ async def audit(
         # downloadable Portfolio Summary workbooks, entirely independent of the
         # detailed reconciliation workbook above and of each other — both built
         # from the SAME per-servicer records already collected during the loop
-        # (Original from PORT-01's own records; Audited from
+        # (Original from checks.original_portfolio_summary_views, which takes
+        # the lender's submitted frame and nothing else; Audited from
         # audited_portfolio_summary_record, which reuses STAT-01's real
         # calculated_dq via audited_status_by_loan). Neither is re-derived from
         # raw file data here. Each is only generated when at least one
         # servicer's record was actually produced (always true for a normal
         # successful run; guarded purely so an edge case upstream can't produce
         # an empty, meaningless workbook).
+        #
+        # The two workbooks now share a LAYOUT (the stacked-section, per-SOUP-
+        # deal presentation) while keeping entirely separate DATA SOURCES. The
+        # Audited workbook deliberately keeps the older two-sheet format, which
+        # is why generate_portfolio_summary_bytes is still used below.
         #
         # The ORIGINAL Portfolio Summary was removed from the client-facing
         # output on 2026-08-10 and RESTORED on 2026-08-11 as the PROMINENT
@@ -648,7 +672,29 @@ async def audit(
         portfolio_summary_original_filename_value = None
         if portfolio_summary_original_records:
             original_buffer = io.BytesIO()
-            report_mod.generate_portfolio_summary_bytes(portfolio_summary_original_records, original_buffer)
+            # CLIENT-CONFIRMED (2026-08-11): the Original summary is presented
+            # in the SAME format as the Final Audited one -- one sheet, the
+            # COUNT / BALANCE % / BALANCE ($) sections, and a Total per SOUP
+            # deal rather than a single combined figure. Presentation and
+            # aggregation only: group_portfolio_summary_by_deal and
+            # generate_final_portfolio_summary_bytes both consume records that
+            # are already computed and never see a data source, so reusing them
+            # here cannot introduce an audited or reviewed value. The records
+            # themselves come from original_portfolio_summary_views, which is
+            # lender-only by signature.
+            #
+            # The FILENAME is deliberately unchanged (label="Original"), so a
+            # client who has been filing this workbook keeps the same
+            # convention -- only its contents are laid out differently.
+            original_blocks = checks_mod.group_portfolio_summary_by_deal(
+                portfolio_summary_original_records, portfolio_summary_original_counts,
+                portfolio_summary_original_deals,
+            )
+            report_mod.generate_final_portfolio_summary_bytes(
+                original_blocks, original_buffer,
+                cycle_month=portfolio_summary_cycle_month,
+                title="Original Portfolio Summary",
+            )
             portfolio_summary_original_b64 = base64.b64encode(original_buffer.getvalue()).decode("utf-8")
             portfolio_summary_original_filename_value = report_mod.portfolio_summary_filename(
                 portfolio_summary_cycle_month, label="Original"

@@ -2987,6 +2987,58 @@ def verified_portfolio_summary_views(servicer_inputs_df, verified_overrides,
     return {"dollars": dollars, "counts": counts}
 
 
+def original_portfolio_summary_views(servicer_inputs_df, servicer_name=None):
+    """Both reported views for one servicer, from the LENDER'S OWN SUBMISSION
+    and nothing else.
+
+    CLIENT-CONFIRMED (2026-08-11): the Original Portfolio Summary adopts the
+    Final Audited summary's presentation -- three stacked sections, per-SOUP-
+    deal totals, loan counts alongside dollars. That is a PRESENTATION AND
+    AGGREGATION change only: every figure stays exactly what PORT-01 already
+    reports, and stays invariant to everything the audit or a reviewer does.
+
+    Deliberately NOT verified_portfolio_summary_views called with empty
+    arguments. That function is provably equivalent when handed {} and None --
+    confirmed record-for-record against all eight June servicers -- but it
+    ACCEPTS verified_overrides and excluded_gps, and reusing it would reduce
+    this summary's guarantee from "impossible: there is no parameter" to
+    "correct: this one call site passes empty values". The signature IS the
+    guarantee here, exactly as it already is for portfolio_summary_check
+    (whose two signature tests exist for this reason), and one future call
+    site passing a non-empty value is all it would take to break it.
+
+    So, by construction: no verified_overrides, no excluded_gps, no
+    audited_status_by_loan, no reviewer decisions, no correction inputs. The
+    only input is the lender's submitted Servicer Inputs frame.
+
+    Not a new calculation either. Dollars come from the same
+    _build_portfolio_summary_record every layer uses, with the same aging
+    source portfolio_summary_check uses -- the row's own servicer-reported
+    dq_status. Counts come from that same builder over _unit_weight_frame,
+    exactly as the Final Audited summary derives its counts, so the two
+    summaries cannot drift apart in what they classify.
+
+    Closed-at-zero suppression is an AUDIT judgement and is deliberately
+    absent: a loan the audit would suppress still belongs in what the lender
+    submitted, which is what OriginalIgnoresClosedAtZeroTests already requires
+    of PORT-01.
+
+    Returns {"dollars": <record>, "counts": <record>}. "dollars" is equal to
+    portfolio_summary_check's record for the same input -- asserted against
+    the real June files by test_original_summary_final_format.py."""
+    population = consolidate_cycle_postings(servicer_inputs_df)
+    aging_source = lambda gp, row: row.get("dq_status", "")
+
+    dollars = _build_portfolio_summary_record(population, servicer_name, aging_source)
+    weighted = _build_portfolio_summary_record(
+        _unit_weight_frame(population), servicer_name, aging_source
+    )
+    counts = {"Servicer": servicer_name or ""}
+    for category in ["Outstanding"] + _PORTFOLIO_SUMMARY_CATEGORY_ORDER:
+        counts[category] = int(round(weighted[f"{category} ($)"]))
+    return {"dollars": dollars, "counts": counts}
+
+
 # SOUP deal identifiers follow SOUP's own Deal-column convention,
 # "SOUP<year>_<series>" -- produced by
 # file_readers.extract_deal_from_note_series from each SRF's "Note Series:"

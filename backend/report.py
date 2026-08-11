@@ -458,8 +458,12 @@ def _write_final_summary_section(ws, start_row, title, rows, number_format, alig
     return header_row + 1 + len(rows) + 2       # one blank row between sections
 
 
-def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None):
-    """The Final Audited Portfolio Summary workbook.
+FINAL_SUMMARY_DEFAULT_TITLE = "Final Audited Portfolio Summary"
+
+
+def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None,
+                                           title=FINAL_SUMMARY_DEFAULT_TITLE):
+    """The stacked-section Portfolio Summary workbook.
 
     blocks comes from checks.group_portfolio_summary_by_deal -- one entry per
     SOUP deal, in display order, each carrying that deal's totals and its own
@@ -470,18 +474,27 @@ def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None):
     it never touches a figure. Falls back to omitting the period line rather
     than guessing when unavailable.
 
+    title names the report in BOTH the sheet tab and the heading, and is the
+    ONLY thing that varies between the two workbooks that use this layout.
+    CLIENT-CONFIRMED (2026-08-11): the Original Portfolio Summary adopts this
+    presentation, so it passes title="Original Portfolio Summary" while the
+    Final Audited summary keeps the default. Presentation only -- the caller
+    supplies figures that are already computed, and which layer they came from
+    is decided entirely by which records the caller passes in. This function
+    cannot mix them: it never sees a data source.
+
     CLIENT-CONFIRMED (2026-08-10): there is deliberately NO combined total
     across deals. Every figure is passed through untouched; this function only
     lays them out.
     """
     wb = Workbook()
     ws = wb.active
-    ws.title = "Final Audited Portfolio Summary"
+    ws.title = title
     ws.sheet_properties.tabColor = NAVY
 
     # Report heading, so the sheet is self-describing when printed or pasted
     # into a pack -- the filename carries the period but the sheet did not.
-    ws.cell(row=1, column=1, value="Final Audited Portfolio Summary").font = _REPORT_TITLE_FONT
+    ws.cell(row=1, column=1, value=title).font = _REPORT_TITLE_FONT
     period = ""
     if cycle_month is not None:
         try:
