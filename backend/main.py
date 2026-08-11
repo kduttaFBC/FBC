@@ -802,10 +802,18 @@ async def corrections_review(payload: dict):
         # upload order, matching the Audited workbook's row order.
         portfolio_summary_final_records = []
         portfolio_summary_final_counts = []
+        portfolio_summary_final_deals = []
         final_cycle_months = set()
         for servicer, entry in correction_state.items():
             try:
-                _, _, _, servicer_inputs_df, _ = file_readers.read_servicer_file(
+                # The 5th return value is this file's own SOUP deal, parsed
+                # from its "Note Series:" cell by
+                # file_readers.extract_deal_from_note_series -- the same value
+                # POP-01 already scopes on. Captured here (it used to be
+                # discarded) so the Final Audited Portfolio Summary can total
+                # per SOUP deal. Nothing is inferred from the filename and no
+                # servicer name is hardcoded.
+                _, _, _, servicer_inputs_df, deal = file_readers.read_servicer_file(
                     entry["original_bytes"], filename=entry.get("original_filename"),
                 )
             except Exception:
@@ -826,6 +834,7 @@ async def corrections_review(payload: dict):
             )
             portfolio_summary_final_records.append(views["dollars"])
             portfolio_summary_final_counts.append(views["counts"])
+            portfolio_summary_final_deals.append(deal)
             if entry.get("cycle_month") is not None:
                 final_cycle_months.add(entry["cycle_month"])
 
@@ -834,16 +843,18 @@ async def corrections_review(payload: dict):
         if portfolio_summary_final_records:
             final_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
             final_buffer = io.BytesIO()
-            # Total row computed from the per-servicer records: counts and
-            # dollars summed, percentages RECOMPUTED from aggregate dollars --
-            # never averaged across servicers.
-            final_total = checks_mod.portfolio_summary_totals(
-                portfolio_summary_final_records, portfolio_summary_final_counts
-            )
-            report_mod.generate_final_portfolio_summary_bytes(
+            # CLIENT-CONFIRMED (2026-08-10): one Total PER SOUP DEAL, each
+            # followed by its own servicers -- never a single figure combining
+            # deals, since a 2024-deal and a 2025-deal servicer belong to
+            # different securitizations. Percentages are recomputed against
+            # each deal's own Outstanding, so every deal reads 100.00%.
+            # A servicer whose SRF declares no usable Note Series lands in an
+            # explicit "Unassigned Total" rather than being dropped.
+            final_blocks = checks_mod.group_portfolio_summary_by_deal(
                 portfolio_summary_final_records, portfolio_summary_final_counts,
-                final_total, final_buffer,
+                portfolio_summary_final_deals,
             )
+            report_mod.generate_final_portfolio_summary_bytes(final_blocks, final_buffer)
             portfolio_summary_final_b64 = base64.b64encode(final_buffer.getvalue()).decode("utf-8")
             # Underscored: the label is interpolated straight into the
             # filename, so "Final Audited" would yield

@@ -408,13 +408,22 @@ def _write_final_summary_section(ws, start_row, title, rows, number_format, alig
                                 horizontal="left" if col == 1 else "right",
                                 wrap_text=True)
 
-    for offset, (label, values) in enumerate(rows):
+    # rows is [(label, values, is_total)]. A section now carries one total row
+    # PER SOUP DEAL, each followed by that deal's servicers, so "total" can no
+    # longer be inferred from position -- the caller marks it.
+    shade = 0
+    for offset, (label, values, is_total) in enumerate(rows):
         r = header_row + 1 + offset
-        is_total = offset == 0
+        if is_total:
+            shade = 0                                   # restart banding per deal block
+            fill = _TOTAL_FILL
+        else:
+            fill = ALT_FILL if shade % 2 else WHITE_FILL
+            shade += 1
         label_cell = ws.cell(row=r, column=1, value=label)
         label_cell.border = BORDER
         label_cell.alignment = Alignment(vertical="center", horizontal="left")
-        label_cell.fill = _TOTAL_FILL if is_total else (ALT_FILL if offset % 2 else WHITE_FILL)
+        label_cell.fill = fill
         if is_total:
             label_cell.font = _TOTAL_FONT
         for col, value in enumerate(values, start=2):
@@ -422,41 +431,53 @@ def _write_final_summary_section(ws, start_row, title, rows, number_format, alig
             c.border = BORDER
             c.number_format = number_format
             c.alignment = Alignment(vertical="center", horizontal=align)
-            c.fill = _TOTAL_FILL if is_total else (ALT_FILL if offset % 2 else WHITE_FILL)
+            c.fill = fill
             if is_total:
                 c.font = _TOTAL_FONT
     return header_row + 1 + len(rows) + 2       # one blank row between sections
 
 
-def generate_final_portfolio_summary_bytes(dollar_records, count_records, total, buffer):
+def generate_final_portfolio_summary_bytes(blocks, buffer):
     """The Final Audited Portfolio Summary workbook.
 
-    dollar_records / count_records are per-servicer records in upload order;
-    total is checks.portfolio_summary_totals' {"dollars", "counts"}. Every
-    figure is passed through untouched -- this function only lays them out.
+    blocks comes from checks.group_portfolio_summary_by_deal -- one entry per
+    SOUP deal, in display order, each carrying that deal's totals and its own
+    servicers. Every section renders every block: the deal's Total row, then
+    its servicers in upload order.
+
+    CLIENT-CONFIRMED (2026-08-10): there is deliberately NO combined total
+    across deals. Every figure is passed through untouched; this function only
+    lays them out.
     """
     wb = Workbook()
     ws = wb.active
     ws.title = "Final Audited Portfolio Summary"
     ws.sheet_properties.tabColor = NAVY
 
-    count_rows = [(total["counts"].get("Servicer", "Total"),
-                   [int(total["counts"].get(c, 0) or 0) for c in FINAL_SUMMARY_CATEGORIES])]
-    count_rows += [(r.get("Servicer", ""),
-                    [int(r.get(c, 0) or 0) for c in FINAL_SUMMARY_CATEGORIES])
-                   for r in count_records]
-
-    pct_rows = [(total["dollars"].get("Servicer", "Total"),
-                 [total["dollars"].get(f"{c} (%)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])]
-    pct_rows += [(r.get("Servicer", ""),
-                  [r.get(f"{c} (%)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])
-                 for r in dollar_records]
-
-    dollar_rows = [(total["dollars"].get("Servicer", "Total"),
-                    [total["dollars"].get(f"{c} ($)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])]
-    dollar_rows += [(r.get("Servicer", ""),
-                     [r.get(f"{c} ($)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])
-                    for r in dollar_records]
+    count_rows, pct_rows, dollar_rows = [], [], []
+    for block in blocks:
+        totals = block["totals"]
+        label = totals["counts"].get("Servicer", block["label"])
+        count_rows.append((label,
+                           [int(totals["counts"].get(c, 0) or 0)
+                            for c in FINAL_SUMMARY_CATEGORIES], True))
+        pct_rows.append((label,
+                         [totals["dollars"].get(f"{c} (%)", 0.0)
+                          for c in FINAL_SUMMARY_CATEGORIES], True))
+        dollar_rows.append((label,
+                            [totals["dollars"].get(f"{c} ($)", 0.0)
+                             for c in FINAL_SUMMARY_CATEGORIES], True))
+        for record in block["counts"]:
+            count_rows.append((record.get("Servicer", ""),
+                               [int(record.get(c, 0) or 0)
+                                for c in FINAL_SUMMARY_CATEGORIES], False))
+        for record in block["dollars"]:
+            pct_rows.append((record.get("Servicer", ""),
+                             [record.get(f"{c} (%)", 0.0)
+                              for c in FINAL_SUMMARY_CATEGORIES], False))
+            dollar_rows.append((record.get("Servicer", ""),
+                                [record.get(f"{c} ($)", 0.0)
+                                 for c in FINAL_SUMMARY_CATEGORIES], False))
 
     row = 1
     # Percentages are already scaled (84.33 means 84.33%), so a literal "%"

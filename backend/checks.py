@@ -20,6 +20,8 @@ Each check returns a dict:
 """
 
 import math
+import re
+
 import pandas as pd
 from file_readers import normalize_id_series as _norm_id
 from file_readers import MEMO_LENDER_ALIASES
@@ -2964,6 +2966,103 @@ def verified_portfolio_summary_views(servicer_inputs_df, verified_overrides,
     for category in ["Outstanding"] + _PORTFOLIO_SUMMARY_CATEGORY_ORDER:
         counts[category] = int(round(weighted[f"{category} ($)"]))
     return {"dollars": dollars, "counts": counts}
+
+
+# SOUP deal identifiers follow SOUP's own Deal-column convention,
+# "SOUP<year>_<series>" -- produced by
+# file_readers.extract_deal_from_note_series from each SRF's "Note Series:"
+# cell (e.g. "2025 FBC-1" -> "SOUP2025_1") and already used to scope POP-01.
+# Verified against all eight June files: every servicer's declared deal is
+# present in SOUP for that servicer.
+_DEAL_YEAR_PATTERN = re.compile(r"^SOUP(\d{4})_(\d+)$")
+
+# CLIENT-CONFIRMED (2026-08-10): a servicer whose SRF declares no usable Note
+# Series is grouped HERE rather than dropped or guessed at. A missing deal is
+# a source-data problem and must stay visible in the report.
+UNASSIGNED_DEAL_LABEL = "Unassigned Total"
+
+
+def _deal_year_and_series(deal):
+    """(year, series) as ints, or None when the identifier is missing or
+    malformed. Deliberately strict: no filename inference, no servicer-name
+    lookup, no guessing at a year."""
+    match = _DEAL_YEAR_PATTERN.match(str(deal or "").strip())
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _deal_total_label(deal, all_deals):
+    """Display label for one deal's Total row.
+
+    "SOUP2024_1" -> "2024 SOUP Deal Total". The raw identifier stays internal.
+
+    If two deals ever share a year (e.g. SOUP2024_1 alongside SOUP2024_2) the
+    year alone stops identifying the group, so the full identifier is shown
+    instead -- ambiguity surfaces rather than two deals silently reading as
+    the same label."""
+    parsed = _deal_year_and_series(deal)
+    if parsed is None:
+        return UNASSIGNED_DEAL_LABEL
+    year = parsed[0]
+    same_year = [d for d in all_deals
+                 if (_deal_year_and_series(d) or (None,))[0] == year]
+    if len(same_year) > 1:
+        return f"{str(deal).strip()} Total"
+    return f"{year} SOUP Deal Total"
+
+
+def _deal_sort_key(deal):
+    """Deals ascend by year then series; an unassigned group sorts LAST so a
+    source-data problem never displaces real reporting."""
+    parsed = _deal_year_and_series(deal)
+    return (1, 9999, 9999) if parsed is None else (0, parsed[0], parsed[1])
+
+
+def group_portfolio_summary_by_deal(dollar_records, count_records, deals):
+    """CLIENT-CONFIRMED (2026-08-10): Totals are reported PER SOUP DEAL. There
+    is deliberately NO combined total across deals -- a 2024-deal servicer and
+    a 2025-deal servicer belong to different securitizations and their
+    balances are not meaningfully additive.
+
+    dollar_records / count_records / deals are parallel lists, one entry per
+    servicer in upload order; deals[i] is that servicer's SOUP deal identifier
+    from file_readers.extract_deal_from_note_series, or None when its SRF
+    declared none.
+
+    Returns blocks in display order (2024, then 2025, then any unassigned):
+
+        [{"deal": "SOUP2024_1", "label": "2024 SOUP Deal Total",
+          "totals": {"dollars": {...}, "counts": {...}},
+          "dollars": [<servicer records>], "counts": [<servicer records>]}]
+
+    Each block's totals come from portfolio_summary_totals over THAT block's
+    servicers only, so every percentage is recomputed against that deal's own
+    Outstanding -- which is why each deal reads Outstanding = 100.00%.
+    Servicers keep upload order within their block.
+
+    A GROUPING AND AGGREGATION CHANGE ONLY. No category rule, no
+    classification, no population construction and no per-servicer figure is
+    touched: the same records that were previously summed into one total are
+    now summed into two."""
+    grouped = {}
+    for index, deal in enumerate(deals):
+        key = str(deal).strip() if deal is not None and str(deal).strip() else None
+        grouped.setdefault(key, []).append(index)
+
+    ordered_keys = sorted(grouped, key=_deal_sort_key)
+    blocks = []
+    for key in ordered_keys:
+        indices = grouped[key]
+        block_dollars = [dollar_records[i] for i in indices]
+        block_counts = [count_records[i] for i in indices]
+        label = _deal_total_label(key, ordered_keys)
+        blocks.append({
+            "deal": key,
+            "label": label,
+            "totals": portfolio_summary_totals(block_dollars, block_counts, label=label),
+            "dollars": block_dollars,
+            "counts": block_counts,
+        })
+    return blocks
 
 
 def portfolio_summary_totals(dollar_records, count_records, label="Total"):
