@@ -351,6 +351,129 @@ def generate_portfolio_summary_bytes(records, buffer):
     buffer.seek(0)
 
 
+# ---------------------------------------------------------------------------
+# FINAL AUDITED Portfolio Summary — CLIENT-CONFIRMED (2026-08-10): ONE
+# worksheet carrying THREE STACKED SECTIONS over the same standardized
+# categories and the same verified loan population:
+#
+#     COUNT        integer loan counts
+#     BALANCE %    category dollars / Outstanding dollars
+#     BALANCE ($)  the already-tested verified dollar values
+#
+# Deliberately a SEPARATE writer from generate_portfolio_summary_bytes, which
+# keeps producing the two-sheet Audited workbook unchanged. Nothing here
+# computes anything: every value arrives already calculated from the single
+# verified population (checks.verified_portfolio_summary_views and
+# checks.portfolio_summary_totals). Formatting must never alter a value.
+# ---------------------------------------------------------------------------
+
+FINAL_SUMMARY_SECTIONS = ("COUNT", "BALANCE %", "BALANCE ($)")
+
+# The confirmed category order. PORTFOLIO_SUMMARY_CATEGORIES ALREADY leads
+# with "Outstanding" (unlike checks._PORTFOLIO_SUMMARY_CATEGORY_ORDER, which
+# does not) -- prepending it again duplicated the Outstanding column, caught by
+# the header test. Aliased rather than redefined so the two Portfolio Summary
+# workbooks cannot drift apart on category order.
+FINAL_SUMMARY_CATEGORIES = list(PORTFOLIO_SUMMARY_CATEGORIES)
+
+_TOTAL_FILL = PatternFill("solid", fgColor="DCE6F1")
+_TOTAL_FONT = Font(bold=True, size=11)
+_SECTION_FONT = Font(color=WHITE, bold=True, size=12)
+
+
+def _write_final_summary_section(ws, start_row, title, rows, number_format, align):
+    """Writes one stacked section: a title band, a header row, the Total row
+    (FIRST, emphasised), then one row per servicer in upload order.
+
+    rows is [(label, [value per category])] with the Total already first --
+    ordering is the caller's decision, not re-derived here. Returns the next
+    free row."""
+    width = len(FINAL_SUMMARY_CATEGORIES) + 1
+
+    ws.cell(row=start_row, column=1, value=title).font = _SECTION_FONT
+    for col in range(1, width + 1):
+        c = ws.cell(row=start_row, column=col)
+        c.fill = HEADER_FILL
+        c.border = BORDER
+        if col > 1:
+            c.value = None
+
+    header_row = start_row + 1
+    for col, name in enumerate(["Servicer"] + FINAL_SUMMARY_CATEGORIES, start=1):
+        c = ws.cell(row=header_row, column=col, value=name)
+        c.fill = HEADER_FILL
+        c.font = HEADER_FONT
+        c.border = BORDER
+        c.alignment = Alignment(vertical="center",
+                                horizontal="left" if col == 1 else "right",
+                                wrap_text=True)
+
+    for offset, (label, values) in enumerate(rows):
+        r = header_row + 1 + offset
+        is_total = offset == 0
+        label_cell = ws.cell(row=r, column=1, value=label)
+        label_cell.border = BORDER
+        label_cell.alignment = Alignment(vertical="center", horizontal="left")
+        label_cell.fill = _TOTAL_FILL if is_total else (ALT_FILL if offset % 2 else WHITE_FILL)
+        if is_total:
+            label_cell.font = _TOTAL_FONT
+        for col, value in enumerate(values, start=2):
+            c = ws.cell(row=r, column=col, value=value)
+            c.border = BORDER
+            c.number_format = number_format
+            c.alignment = Alignment(vertical="center", horizontal=align)
+            c.fill = _TOTAL_FILL if is_total else (ALT_FILL if offset % 2 else WHITE_FILL)
+            if is_total:
+                c.font = _TOTAL_FONT
+    return header_row + 1 + len(rows) + 2       # one blank row between sections
+
+
+def generate_final_portfolio_summary_bytes(dollar_records, count_records, total, buffer):
+    """The Final Audited Portfolio Summary workbook.
+
+    dollar_records / count_records are per-servicer records in upload order;
+    total is checks.portfolio_summary_totals' {"dollars", "counts"}. Every
+    figure is passed through untouched -- this function only lays them out.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Final Audited Portfolio Summary"
+    ws.sheet_properties.tabColor = NAVY
+
+    count_rows = [(total["counts"].get("Servicer", "Total"),
+                   [int(total["counts"].get(c, 0) or 0) for c in FINAL_SUMMARY_CATEGORIES])]
+    count_rows += [(r.get("Servicer", ""),
+                    [int(r.get(c, 0) or 0) for c in FINAL_SUMMARY_CATEGORIES])
+                   for r in count_records]
+
+    pct_rows = [(total["dollars"].get("Servicer", "Total"),
+                 [total["dollars"].get(f"{c} (%)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])]
+    pct_rows += [(r.get("Servicer", ""),
+                  [r.get(f"{c} (%)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])
+                 for r in dollar_records]
+
+    dollar_rows = [(total["dollars"].get("Servicer", "Total"),
+                    [total["dollars"].get(f"{c} ($)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])]
+    dollar_rows += [(r.get("Servicer", ""),
+                     [r.get(f"{c} ($)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])
+                    for r in dollar_records]
+
+    row = 1
+    # Percentages are already scaled (84.33 means 84.33%), so a literal "%"
+    # suffix -- Excel's native 0.00% format would multiply by 100 again.
+    row = _write_final_summary_section(ws, row, "COUNT", count_rows, "#,##0", "right")
+    row = _write_final_summary_section(ws, row, "BALANCE %", pct_rows, '#,##0.00"%"', "right")
+    row = _write_final_summary_section(ws, row, "BALANCE ($)", dollar_rows,
+                                       '"$"#,##0.00', "right")
+
+    ws.column_dimensions["A"].width = 30
+    for i in range(2, len(FINAL_SUMMARY_CATEGORIES) + 2):
+        ws.column_dimensions[get_column_letter(i)].width = 16
+    ws.freeze_panes = "B1"
+
+    wb.save(buffer)
+
+
 def portfolio_summary_filename(cycle_month, label):
     """cycle_month, when available, is the audit's actual reporting period
     (a pandas Timestamp from STAT-01's internal correction data, e.g.

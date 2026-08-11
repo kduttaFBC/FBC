@@ -2896,6 +2896,112 @@ def _apply_verified_overrides(si_grouped, verified_overrides):
     return out
 
 
+def _unit_weight_frame(si_grouped):
+    """A COPY of the consolidated frame with every balance replaced by a unit
+    weight, so the SAME builder that sums dollars sums COUNTS instead.
+
+    Every Portfolio Summary category is a pure membership test followed by a
+    sum, so weighting each loan 1.0 turns each dollar total into the number of
+    loans in that category -- with no second classification engine and no
+    change to _build_portfolio_summary_record. The eligibility gate, the
+    Outstanding exclusion, _classify_delinquency_bucket, the Not Making
+    Payment rule and the Deferred/Bankruptcy/Foreclosure chain are all reused
+    verbatim, so counts and dollars cannot drift apart in what they classify.
+
+    The (beginning == 0 AND ending == 0) eligibility gate is PRESERVED by
+    weighting only the loans that pass it -- an ineligible loan keeps 0/0 and
+    is skipped by the builder exactly as it is for dollars. Weighting every
+    row unconditionally would silently re-admit loans the client confirmed
+    must be excluded before any categorisation.
+
+    Never mutates the input."""
+    out = si_grouped.copy()
+    beginning = pd.to_numeric(out.get("beginning_balance"), errors="coerce").fillna(0.0)
+    ending = pd.to_numeric(out.get("ending_balance"), errors="coerce").fillna(0.0)
+    eligible = ~((beginning == 0) & (ending == 0))
+    out["beginning_balance"] = eligible.astype(float)
+    out["ending_balance"] = eligible.astype(float)
+    return out
+
+
+def _verified_population(servicer_inputs_df, verified_overrides, excluded_gps=None):
+    """THE verified loan population, built ONCE:
+
+        original lender data + verified_overrides + closed-at-zero suppression
+
+    CLIENT-CONFIRMED (2026-08-10): every reported view -- Count, Balance % and
+    Balance ($) -- must be derived from this one frame. Three independently
+    constructed populations is precisely the failure mode this exists to
+    prevent."""
+    si_grouped = _apply_verified_overrides(
+        consolidate_cycle_postings(servicer_inputs_df), verified_overrides
+    )
+    if excluded_gps:
+        excluded = {str(g).strip() for g in excluded_gps}
+        si_grouped = si_grouped[~si_grouped.index.astype(str).str.strip().isin(excluded)]
+    return si_grouped
+
+
+def verified_portfolio_summary_views(servicer_inputs_df, verified_overrides,
+                                     servicer_name=None, excluded_gps=None):
+    """Both reported views for one servicer, from ONE verified population.
+
+    Returns {"dollars": <record>, "counts": <record>} where "dollars" is
+    byte-identical to what verified_portfolio_summary_record returns (that
+    function now delegates here, so there is one construction path, not two)
+    and "counts" carries integer loan counts under the same category keys.
+
+    The percentages live on the dollars record and are unchanged: pct() there
+    divides by Outstanding and returns 0.0 when Outstanding is zero."""
+    population = _verified_population(servicer_inputs_df, verified_overrides, excluded_gps)
+    aging_source = lambda gp, row: row.get("dq_status", "")
+
+    dollars = _build_portfolio_summary_record(population, servicer_name, aging_source)
+    weighted = _build_portfolio_summary_record(
+        _unit_weight_frame(population), servicer_name, aging_source
+    )
+    counts = {"Servicer": servicer_name or ""}
+    for category in ["Outstanding"] + _PORTFOLIO_SUMMARY_CATEGORY_ORDER:
+        counts[category] = int(round(weighted[f"{category} ($)"]))
+    return {"dollars": dollars, "counts": counts}
+
+
+def portfolio_summary_totals(dollar_records, count_records, label="Total"):
+    """The Total row across servicers.
+
+    Counts and dollars are SUMMED -- each servicer's population is disjoint,
+    so summation is exact. Categories still overlap with each other, so the
+    Total row does not reconcile internally any more than a servicer row does.
+
+    Percentages are RECOMPUTED from the aggregate dollars, never averaged.
+    CLIENT-CONFIRMED (2026-08-10): averaging servicer percentages weights a
+    23-loan servicer equally with a 1,234-loan one. Measured on the June set,
+    that error reaches 0.91 points on Current and 0.83 on Not Making Payment.
+
+    Zero aggregate Outstanding follows the same convention _build_portfolio_
+    summary_record uses for a servicer: 0.00% everywhere, including
+    Outstanding itself."""
+    categories = ["Outstanding"] + _PORTFOLIO_SUMMARY_CATEGORY_ORDER
+    dollars = {c: round(sum(r.get(f"{c} ($)", 0.0) or 0.0 for r in dollar_records), 2)
+               for c in categories}
+    counts = {c: sum(int(r.get(c, 0) or 0) for r in count_records) for c in categories}
+
+    outstanding = dollars["Outstanding"]
+    total_dollars = {"Servicer": label}
+    for c in categories:
+        total_dollars[f"{c} ($)"] = dollars[c]
+        if not outstanding:
+            total_dollars[f"{c} (%)"] = 0.0
+        elif c == "Outstanding":
+            total_dollars["Outstanding (%)"] = 100.0
+        else:
+            total_dollars[f"{c} (%)"] = round(dollars[c] / outstanding * 100, 2)
+
+    total_counts = {"Servicer": label}
+    total_counts.update(counts)
+    return {"dollars": total_dollars, "counts": total_counts}
+
+
 def verified_portfolio_summary_record(servicer_inputs_df, verified_overrides,
                                       servicer_name=None, excluded_gps=None):
     """CLIENT-CONFIRMED (2026-08-10): the FINAL AUDITED Portfolio Summary
@@ -2928,15 +3034,9 @@ def verified_portfolio_summary_record(servicer_inputs_df, verified_overrides,
     cannot delete rows, it is the only mechanism that reproduces it.
 
     Returns the raw record dict directly, not wrapped in _result()."""
-    si_grouped = _apply_verified_overrides(
-        consolidate_cycle_postings(servicer_inputs_df), verified_overrides
-    )
-    if excluded_gps:
-        excluded = {str(g).strip() for g in excluded_gps}
-        si_grouped = si_grouped[~si_grouped.index.astype(str).str.strip().isin(excluded)]
-    return _build_portfolio_summary_record(
-        si_grouped, servicer_name, lambda gp, row: row.get("dq_status", "")
-    )
+    return verified_portfolio_summary_views(
+        servicer_inputs_df, verified_overrides, servicer_name, excluded_gps
+    )["dollars"]
 
 
 # ---------------------------------------------------------------------------
