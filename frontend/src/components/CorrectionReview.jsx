@@ -329,6 +329,37 @@ export default function CorrectionReview({ recommendations, sessionId }) {
               </button>
             </div>
           ))}
+          {/* The FINAL AUDITED Portfolio Summary — the third layer, available
+              only after Manual Review. Built from the same verified values as
+              the corrected workbooks above: original lender data + the
+              reviewer's approved corrections + closed-at-zero suppression.
+              Carries one row per uploaded servicer, including servicers with
+              no corrections. Distinct from the Original Portfolio Summary
+              (what the lender reported, on the results screen) and the
+              Audited Portfolio Summary (what the audit calculated, downloaded
+              from the results screen before review). */}
+          {result.portfolio_summary_final_b64 && (
+            <div className="map-row" style={{ gridTemplateColumns: '1.4fr 1fr', marginTop: 10 }}>
+              <div className="field-name">
+                Final Audited Portfolio Summary
+                <div className="hint" style={{ marginTop: 2 }}>
+                  All servicers, built from your verified review decisions
+                </div>
+              </div>
+              <button
+                className="btn btn-teal"
+                onClick={() =>
+                  downloadBase64File(
+                    result.portfolio_summary_final_b64,
+                    result.portfolio_summary_final_filename ||
+                      'Portfolio_Summary_Final_Audited.xlsx'
+                  )
+                }
+              >
+                Download Final Audited Portfolio Summary
+              </button>
+            </div>
+          )}
           {(result.corrections_not_applied || []).length > 0 && (
             <div style={{ marginTop: 10 }}>
               <strong>Not applied</strong>
