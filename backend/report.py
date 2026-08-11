@@ -379,15 +379,25 @@ FINAL_SUMMARY_CATEGORIES = list(PORTFOLIO_SUMMARY_CATEGORIES)
 _TOTAL_FILL = PatternFill("solid", fgColor="DCE6F1")
 _TOTAL_FONT = Font(bold=True, size=11)
 _SECTION_FONT = Font(color=WHITE, bold=True, size=12)
+_REPORT_TITLE_FONT = Font(bold=True, size=14)
+_REPORT_SUBTITLE_FONT = Font(size=11)
+
+# The longest category name ("Not Making Payment") wraps to two lines at the
+# 16-wide category columns. openpyxl writes no row height, which leaves Excel
+# to auto-fit -- reliable in most cases but not guaranteed, and a clipped
+# header is exactly what this report cannot afford. Set explicitly so the
+# second line always displays. Two lines at the default ~15pt, plus padding.
+_HEADER_ROW_HEIGHT = 32
 
 
 def _write_final_summary_section(ws, start_row, title, rows, number_format, align):
-    """Writes one stacked section: a title band, a header row, the Total row
-    (FIRST, emphasised), then one row per servicer in upload order.
+    """Writes one stacked section: a title band, a header row, then one deal
+    block after another -- each block being that deal's Total row followed by
+    its servicers, separated by a blank row.
 
-    rows is [(label, [value per category])] with the Total already first --
-    ordering is the caller's decision, not re-derived here. Returns the next
-    free row."""
+    rows is [(label, values, is_total)] in final display order, or
+    (None, None, None) for a blank separator. Ordering is the caller's
+    decision, not re-derived here. Returns the next free row."""
     width = len(FINAL_SUMMARY_CATEGORIES) + 1
 
     ws.cell(row=start_row, column=1, value=title).font = _SECTION_FONT
@@ -408,13 +418,30 @@ def _write_final_summary_section(ws, start_row, title, rows, number_format, alig
                                 horizontal="left" if col == 1 else "right",
                                 wrap_text=True)
 
-    for offset, (label, values) in enumerate(rows):
+    ws.row_dimensions[header_row].height = _HEADER_ROW_HEIGHT
+
+    # rows is [(label, values, is_total)]. A section now carries one total row
+    # PER SOUP DEAL, each followed by that deal's servicers, so "total" can no
+    # longer be inferred from position -- the caller marks it. A
+    # (None, None, None) entry is a blank separator between deal blocks: it
+    # consumes a row and is deliberately left completely unstyled, so the two
+    # deals read as distinct blocks rather than one continuous list.
+    shade = 0
+    for offset, (label, values, is_total) in enumerate(rows):
         r = header_row + 1 + offset
-        is_total = offset == 0
+        if label is None:
+            shade = 0
+            continue
+        if is_total:
+            shade = 0                                   # restart banding per deal block
+            fill = _TOTAL_FILL
+        else:
+            fill = ALT_FILL if shade % 2 else WHITE_FILL
+            shade += 1
         label_cell = ws.cell(row=r, column=1, value=label)
         label_cell.border = BORDER
         label_cell.alignment = Alignment(vertical="center", horizontal="left")
-        label_cell.fill = _TOTAL_FILL if is_total else (ALT_FILL if offset % 2 else WHITE_FILL)
+        label_cell.fill = fill
         if is_total:
             label_cell.font = _TOTAL_FONT
         for col, value in enumerate(values, start=2):
@@ -422,43 +449,78 @@ def _write_final_summary_section(ws, start_row, title, rows, number_format, alig
             c.border = BORDER
             c.number_format = number_format
             c.alignment = Alignment(vertical="center", horizontal=align)
-            c.fill = _TOTAL_FILL if is_total else (ALT_FILL if offset % 2 else WHITE_FILL)
+            c.fill = fill
             if is_total:
                 c.font = _TOTAL_FONT
     return header_row + 1 + len(rows) + 2       # one blank row between sections
 
 
-def generate_final_portfolio_summary_bytes(dollar_records, count_records, total, buffer):
+def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None):
     """The Final Audited Portfolio Summary workbook.
 
-    dollar_records / count_records are per-servicer records in upload order;
-    total is checks.portfolio_summary_totals' {"dollars", "counts"}. Every
-    figure is passed through untouched -- this function only lays them out.
+    blocks comes from checks.group_portfolio_summary_by_deal -- one entry per
+    SOUP deal, in display order, each carrying that deal's totals and its own
+    servicers. Every section renders every block: the deal's Total row, then
+    its servicers in upload order, with a blank row between blocks.
+
+    cycle_month is the audit's reporting period, used ONLY for the heading --
+    it never touches a figure. Falls back to omitting the period line rather
+    than guessing when unavailable.
+
+    CLIENT-CONFIRMED (2026-08-10): there is deliberately NO combined total
+    across deals. Every figure is passed through untouched; this function only
+    lays them out.
     """
     wb = Workbook()
     ws = wb.active
     ws.title = "Final Audited Portfolio Summary"
     ws.sheet_properties.tabColor = NAVY
 
-    count_rows = [(total["counts"].get("Servicer", "Total"),
-                   [int(total["counts"].get(c, 0) or 0) for c in FINAL_SUMMARY_CATEGORIES])]
-    count_rows += [(r.get("Servicer", ""),
-                    [int(r.get(c, 0) or 0) for c in FINAL_SUMMARY_CATEGORIES])
-                   for r in count_records]
+    # Report heading, so the sheet is self-describing when printed or pasted
+    # into a pack -- the filename carries the period but the sheet did not.
+    ws.cell(row=1, column=1, value="Final Audited Portfolio Summary").font = _REPORT_TITLE_FONT
+    period = ""
+    if cycle_month is not None:
+        try:
+            period = cycle_month.strftime("%B %Y")
+        except AttributeError:
+            period = str(cycle_month)
+    if period:
+        ws.cell(row=2, column=1,
+                value=f"Reporting Period: {period}").font = _REPORT_SUBTITLE_FONT
 
-    pct_rows = [(total["dollars"].get("Servicer", "Total"),
-                 [total["dollars"].get(f"{c} (%)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])]
-    pct_rows += [(r.get("Servicer", ""),
-                  [r.get(f"{c} (%)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])
-                 for r in dollar_records]
+    count_rows, pct_rows, dollar_rows = [], [], []
+    for index, block in enumerate(blocks):
+        if index:
+            # One blank row between deal blocks so 2024 and 2025 read as
+            # distinct blocks rather than one continuous list.
+            for rows in (count_rows, pct_rows, dollar_rows):
+                rows.append((None, None, None))
+        totals = block["totals"]
+        label = totals["counts"].get("Servicer", block["label"])
+        count_rows.append((label,
+                           [int(totals["counts"].get(c, 0) or 0)
+                            for c in FINAL_SUMMARY_CATEGORIES], True))
+        pct_rows.append((label,
+                         [totals["dollars"].get(f"{c} (%)", 0.0)
+                          for c in FINAL_SUMMARY_CATEGORIES], True))
+        dollar_rows.append((label,
+                            [totals["dollars"].get(f"{c} ($)", 0.0)
+                             for c in FINAL_SUMMARY_CATEGORIES], True))
+        for record in block["counts"]:
+            count_rows.append((record.get("Servicer", ""),
+                               [int(record.get(c, 0) or 0)
+                                for c in FINAL_SUMMARY_CATEGORIES], False))
+        for record in block["dollars"]:
+            pct_rows.append((record.get("Servicer", ""),
+                             [record.get(f"{c} (%)", 0.0)
+                              for c in FINAL_SUMMARY_CATEGORIES], False))
+            dollar_rows.append((record.get("Servicer", ""),
+                                [record.get(f"{c} ($)", 0.0)
+                                 for c in FINAL_SUMMARY_CATEGORIES], False))
 
-    dollar_rows = [(total["dollars"].get("Servicer", "Total"),
-                    [total["dollars"].get(f"{c} ($)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])]
-    dollar_rows += [(r.get("Servicer", ""),
-                     [r.get(f"{c} ($)", 0.0) for c in FINAL_SUMMARY_CATEGORIES])
-                    for r in dollar_records]
-
-    row = 1
+    # Sections start below the two heading lines plus a blank spacer.
+    row = 4
     # Percentages are already scaled (84.33 means 84.33%), so a literal "%"
     # suffix -- Excel's native 0.00% format would multiply by 100 again.
     row = _write_final_summary_section(ws, row, "COUNT", count_rows, "#,##0", "right")

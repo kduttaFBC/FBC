@@ -235,15 +235,19 @@ class TotalRowTests(unittest.TestCase):
 class WorkbookLayoutTests(unittest.TestCase):
 
     def setUp(self):
+        # Two servicers in ONE deal, so the existing layout assertions below
+        # keep describing a single block. Multi-deal layout is covered by
+        # DealGroupedTotalsTests.
         self.a = checks.verified_portfolio_summary_views(SAMPLE, {}, "Bank A")
         self.b = checks.verified_portfolio_summary_views(
             _srf([("9", "ACTIVE", "CURRENT", 1000.0, 1000.0, 100.0)]), {}, "Bank B")
-        self.total = checks.portfolio_summary_totals(
-            [self.a["dollars"], self.b["dollars"]], [self.a["counts"], self.b["counts"]])
-        buf = io.BytesIO()
-        report.generate_final_portfolio_summary_bytes(
+        self.blocks = checks.group_portfolio_summary_by_deal(
             [self.a["dollars"], self.b["dollars"]],
-            [self.a["counts"], self.b["counts"]], self.total, buf)
+            [self.a["counts"], self.b["counts"]],
+            ["SOUP2024_1", "SOUP2024_1"])
+        self.total = self.blocks[0]["totals"]
+        buf = io.BytesIO()
+        report.generate_final_portfolio_summary_bytes(self.blocks, buf)
         self.wb = load_workbook(io.BytesIO(buf.getvalue()))
         self.ws = self.wb.active
         self.col_a = [self.ws.cell(row=r, column=1).value for r in range(1, self.ws.max_row + 1)]
@@ -261,7 +265,9 @@ class WorkbookLayoutTests(unittest.TestCase):
             i = self.col_a.index(section)
             with self.subTest(section=section):
                 self.assertEqual(self.col_a[i + 1], "Servicer")   # header row
-                self.assertEqual(self.col_a[i + 2], "Total")      # Total first
+                # Totals are per SOUP deal and carry the deal's label, not a
+                # bare "Total" -- these two servicers share SOUP2024_1.
+                self.assertEqual(self.col_a[i + 2], "2024 SOUP Deal Total")
                 self.assertEqual(self.col_a[i + 3], "Bank A")     # then upload order
                 self.assertEqual(self.col_a[i + 4], "Bank B")
 
@@ -301,6 +307,237 @@ class WorkbookLayoutTests(unittest.TestCase):
         header = self.ws.cell(row=i + 1, column=1)
         self.assertIn(report.NAVY, str(header.fill.fgColor.rgb))
         self.assertTrue(header.font.bold)
+
+
+class DealGroupedTotalsTests(unittest.TestCase):
+    """CLIENT-CONFIRMED (2026-08-10): Totals are reported PER SOUP DEAL. A
+    2024-deal servicer and a 2025-deal servicer belong to different
+    securitizations, so there is deliberately NO combined total."""
+
+    def _blocks(self, deals):
+        views = [checks.verified_portfolio_summary_views(
+            _srf([(str(i), "ACTIVE", "CURRENT", 1000.0 * (i + 1), 1000.0 * (i + 1), 5.0)]),
+            {}, f"Bank {i}") for i in range(len(deals))]
+        return checks.group_portfolio_summary_by_deal(
+            [v["dollars"] for v in views], [v["counts"] for v in views], deals), views
+
+    def test_the_deal_pattern_parses_the_real_identifiers(self):
+        self.assertEqual(checks._deal_year_and_series("SOUP2024_1"), (2024, 1))
+        self.assertEqual(checks._deal_year_and_series("SOUP2025_1"), (2025, 1))
+
+    def test_malformed_or_blank_deals_do_not_parse(self):
+        for bad in ("", None, "SOUP2024", "SOUP20241", "2024 FBC-1", "GARBAGE"):
+            with self.subTest(deal=bad):
+                self.assertIsNone(checks._deal_year_and_series(bad))
+
+    def test_labels_are_the_confirmed_display_strings(self):
+        deals = ["SOUP2024_1", "SOUP2025_1"]
+        self.assertEqual(checks._deal_total_label("SOUP2024_1", deals), "2024 SOUP Deal Total")
+        self.assertEqual(checks._deal_total_label("SOUP2025_1", deals), "2025 SOUP Deal Total")
+
+    def test_2024_sorts_before_2025_and_unassigned_sorts_last(self):
+        blocks, _ = self._blocks(["SOUP2025_1", None, "SOUP2024_1"])
+        self.assertEqual([b["label"] for b in blocks],
+                         ["2024 SOUP Deal Total", "2025 SOUP Deal Total",
+                          checks.UNASSIGNED_DEAL_LABEL])
+
+    def test_servicers_land_in_their_declared_deal_in_upload_order(self):
+        blocks, _ = self._blocks(["SOUP2025_1", "SOUP2024_1", "SOUP2024_1", "SOUP2025_1"])
+        by_label = {b["label"]: [r["Servicer"] for r in b["counts"]] for b in blocks}
+        self.assertEqual(by_label["2024 SOUP Deal Total"], ["Bank 1", "Bank 2"])
+        self.assertEqual(by_label["2025 SOUP Deal Total"], ["Bank 0", "Bank 3"])
+
+    def test_a_missing_deal_is_surfaced_not_dropped(self):
+        blocks, _ = self._blocks(["SOUP2024_1", None])
+        unassigned = next(b for b in blocks if b["label"] == checks.UNASSIGNED_DEAL_LABEL)
+        self.assertEqual([r["Servicer"] for r in unassigned["counts"]], ["Bank 1"])
+        self.assertEqual(sum(len(b["counts"]) for b in blocks), 2)   # nothing lost
+
+    def test_each_deal_outstanding_is_independently_100_percent(self):
+        blocks, _ = self._blocks(["SOUP2024_1", "SOUP2025_1", "SOUP2024_1"])
+        for block in blocks:
+            with self.subTest(deal=block["deal"]):
+                self.assertEqual(block["totals"]["dollars"]["Outstanding (%)"], 100.0)
+
+    def test_each_deal_total_sums_only_its_own_servicers(self):
+        blocks, views = self._blocks(["SOUP2024_1", "SOUP2025_1", "SOUP2024_1"])
+        by_deal = {b["deal"]: b for b in blocks}
+        expected_2024 = round(views[0]["dollars"]["Outstanding ($)"]
+                              + views[2]["dollars"]["Outstanding ($)"], 2)
+        self.assertAlmostEqual(by_deal["SOUP2024_1"]["totals"]["dollars"]["Outstanding ($)"],
+                               expected_2024, places=2)
+        self.assertAlmostEqual(by_deal["SOUP2025_1"]["totals"]["dollars"]["Outstanding ($)"],
+                               views[1]["dollars"]["Outstanding ($)"], places=2)
+        self.assertEqual(by_deal["SOUP2024_1"]["totals"]["counts"]["Outstanding"], 2)
+        self.assertEqual(by_deal["SOUP2025_1"]["totals"]["counts"]["Outstanding"], 1)
+
+    def test_deal_percentages_are_recomputed_not_averaged(self):
+        blocks, views = self._blocks(["SOUP2024_1", "SOUP2024_1"])
+        totals = blocks[0]["totals"]["dollars"]
+        outstanding = totals["Outstanding ($)"]
+        for category in checks._PORTFOLIO_SUMMARY_CATEGORY_ORDER:
+            with self.subTest(category=category):
+                self.assertAlmostEqual(
+                    totals[f"{category} (%)"],
+                    round(totals[f"{category} ($)"] / outstanding * 100, 2), places=2)
+
+    def test_no_combined_total_across_deals_is_produced(self):
+        blocks, _ = self._blocks(["SOUP2024_1", "SOUP2025_1"])
+        labels = [b["label"] for b in blocks]
+        self.assertNotIn("Total", labels)
+        self.assertEqual(len(blocks), 2)
+
+    def test_a_shared_year_falls_back_to_the_full_identifier(self):
+        # Ambiguity surfaces rather than two deals reading as one label.
+        deals = ["SOUP2024_1", "SOUP2024_2"]
+        self.assertEqual(checks._deal_total_label("SOUP2024_1", deals), "SOUP2024_1 Total")
+        self.assertEqual(checks._deal_total_label("SOUP2024_2", deals), "SOUP2024_2 Total")
+
+    def test_per_servicer_records_are_untouched_by_grouping(self):
+        blocks, views = self._blocks(["SOUP2024_1", "SOUP2025_1"])
+        emitted = [r for b in blocks for r in b["dollars"]]
+        self.assertEqual(sorted(r["Servicer"] for r in emitted), ["Bank 0", "Bank 1"])
+        for view in views:
+            self.assertIn(view["dollars"], emitted)
+
+
+class DealGroupedWorkbookTests(unittest.TestCase):
+    """The workbook renders every deal block in every section."""
+
+    def setUp(self):
+        views = [checks.verified_portfolio_summary_views(
+            _srf([(str(i), "ACTIVE", "CURRENT", 1000.0, 1000.0, 5.0)]), {}, f"Bank {i}")
+            for i in range(3)]
+        blocks = checks.group_portfolio_summary_by_deal(
+            [v["dollars"] for v in views], [v["counts"] for v in views],
+            ["SOUP2025_1", "SOUP2024_1", "SOUP2024_1"])
+        buf = io.BytesIO()
+        report.generate_final_portfolio_summary_bytes(blocks, buf)
+        self.ws = load_workbook(io.BytesIO(buf.getvalue())).active
+        self.col_a = [self.ws.cell(row=r, column=1).value
+                      for r in range(1, self.ws.max_row + 1)]
+
+    def _section_labels(self, section):
+        """Labels of one section's body, in order, blank separators included
+        as None -- read positionally from the section title rather than at
+        hardcoded offsets, so adding a spacer row cannot silently break this."""
+        i = self.col_a.index(section)
+        labels, blanks = [], 0
+        for value in self.col_a[i + 2:]:
+            if value in report.FINAL_SUMMARY_SECTIONS:
+                break
+            if value is None:
+                blanks += 1
+                if blanks > 1:          # two blanks = end of section
+                    break
+                labels.append(None)
+                continue
+            blanks = 0
+            labels.append(value)
+        while labels and labels[-1] is None:
+            labels.pop()
+        return labels
+
+    def test_every_section_shows_2024_block_then_2025_block(self):
+        for section in report.FINAL_SUMMARY_SECTIONS:
+            with self.subTest(section=section):
+                self.assertEqual(
+                    self._section_labels(section),
+                    ["2024 SOUP Deal Total", "Bank 1", "Bank 2",
+                     None,                                  # the block separator
+                     "2025 SOUP Deal Total", "Bank 0"])
+
+    def test_one_blank_row_separates_the_deal_blocks_in_every_section(self):
+        for section in report.FINAL_SUMMARY_SECTIONS:
+            with self.subTest(section=section):
+                labels = self._section_labels(section)
+                self.assertEqual(labels.count(None), 1)
+                self.assertEqual(labels.index(None), 3)     # after the 2024 block
+
+    def test_the_separator_row_is_completely_unstyled(self):
+        i = self.col_a.index("COUNT")
+        separator = i + 2 + 3 + 1        # title, header, 3 body rows -> sheet row
+        for col in range(1, len(CATEGORIES) + 2):
+            cell = self.ws.cell(row=separator, column=col)
+            with self.subTest(col=col):
+                self.assertIsNone(cell.value)
+
+    def test_each_deal_reads_100_percent_outstanding_in_the_workbook(self):
+        i = self.col_a.index("BALANCE %")
+        totals = [r for r in range(i + 3, i + 3 + len(self._section_labels("BALANCE %")))
+                  if str(self.ws.cell(row=r, column=1).value or "").endswith("Deal Total")]
+        self.assertEqual(len(totals), 2)
+        for row in totals:
+            with self.subTest(row=row):
+                self.assertEqual(self.ws.cell(row=row, column=2).value, 100.0)
+
+    def test_no_row_is_labelled_just_total(self):
+        self.assertNotIn("Total", self.col_a)
+
+
+class ReportHeadingAndHeaderDisplayTests(unittest.TestCase):
+    """Formatting only -- no figure is affected by anything asserted here."""
+
+    def _build(self, cycle_month=None):
+        views = [checks.verified_portfolio_summary_views(SAMPLE, {}, "Bank A")]
+        blocks = checks.group_portfolio_summary_by_deal(
+            [views[0]["dollars"]], [views[0]["counts"]], ["SOUP2024_1"])
+        buf = io.BytesIO()
+        report.generate_final_portfolio_summary_bytes(blocks, buf, cycle_month=cycle_month)
+        return load_workbook(io.BytesIO(buf.getvalue())).active
+
+    def test_the_heading_names_the_report_and_the_period(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        self.assertEqual(ws.cell(row=1, column=1).value, "Final Audited Portfolio Summary")
+        self.assertEqual(ws.cell(row=2, column=1).value, "Reporting Period: June 2026")
+
+    def test_the_heading_is_visually_emphasised(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        self.assertTrue(ws.cell(row=1, column=1).font.bold)
+        self.assertGreater(ws.cell(row=1, column=1).font.size, 11)
+
+    def test_a_missing_cycle_month_omits_the_period_rather_than_guessing(self):
+        ws = self._build(None)
+        self.assertEqual(ws.cell(row=1, column=1).value, "Final Audited Portfolio Summary")
+        self.assertIsNone(ws.cell(row=2, column=1).value)
+
+    def test_the_first_section_starts_below_the_heading(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        self.assertIsNone(ws.cell(row=3, column=1).value)      # spacer
+        self.assertEqual(ws.cell(row=4, column=1).value, "COUNT")
+
+    def test_header_rows_have_an_explicit_height_so_wrapped_names_display(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+        for section in report.FINAL_SUMMARY_SECTIONS:
+            header_row = col_a.index(section) + 2      # 0-based index -> sheet row + 1
+            with self.subTest(section=section):
+                self.assertEqual(ws.cell(row=header_row, column=1).value, "Servicer")
+                self.assertIsNotNone(ws.row_dimensions[header_row].height)
+                self.assertGreaterEqual(ws.row_dimensions[header_row].height, 30)
+
+    def test_category_names_are_written_in_full_and_wrap(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+        header_row = col_a.index("COUNT") + 2
+        written = [ws.cell(row=header_row, column=c).value
+                   for c in range(2, len(CATEGORIES) + 2)]
+        self.assertEqual(written, CATEGORIES)              # no truncation, no abbreviation
+        self.assertIn("Not Making Payment", written)
+        for c in range(2, len(CATEGORIES) + 2):
+            self.assertTrue(ws.cell(row=header_row, column=c).alignment.wrap_text)
+
+    def test_column_a_freeze_is_unchanged(self):
+        self.assertEqual(self._build(pd.Timestamp("2026-06-01")).freeze_panes, "B1")
+
+    def test_foreclosure_and_liquidation_are_kept_even_when_zero(self):
+        ws = self._build(pd.Timestamp("2026-06-01"))
+        col_a = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+        header_row = col_a.index("COUNT") + 2
+        written = [ws.cell(row=header_row, column=c).value
+                   for c in range(2, len(CATEGORIES) + 2)]
+        self.assertIn("Foreclosure", written)
+        self.assertIn("Liquidation", written)
 
 
 class ProtectedLogicUnchangedTests(unittest.TestCase):
