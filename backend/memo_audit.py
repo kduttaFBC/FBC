@@ -218,6 +218,14 @@ def classify_memo_rows(memo_df, population_ids):
         else _column(df, "Lender Loan ID").map(normalize_memo_loan_id)
 
     in_population = gp_sba.isin(population) | gp_lender.isin(population)
+    # CLIENT-CONFIRMED (2026-08-10): a row the SBA-Loan-ID -> Lender-Loan-Number
+    # fallback attributed to a real loan is JOINED, not lookup-failed. Purely
+    # additive -- rows the existing probes already matched are unaffected, and
+    # a row left unresolved (unmatched, ambiguous or conflicting) keeps its
+    # existing classification. resolve_memo_attribution is what populates this
+    # column; when it has not been run the classification is exactly as before.
+    if "resolved_gp" in df.columns:
+        in_population = in_population | df["resolved_gp"].notna()
 
     df["memo_row_class"] = ROW_CLASS_JOINED
     df.loc[phantom, "memo_row_class"] = ROW_CLASS_PHANTOM
