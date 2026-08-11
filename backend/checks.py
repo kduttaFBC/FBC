@@ -1176,6 +1176,13 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
         id_match = id_match | (memo_df["gp_sba"] == gp)
     if "gp_lender" in memo_df.columns:
         id_match = id_match | (memo_df["gp_lender"] == gp)
+    # CLIENT-CONFIRMED (2026-08-10): a memo row attributed to THIS loan by
+    # file_readers.resolve_memo_attribution -- the SBA-Loan-ID -> Lender-Loan-
+    # Number fallback -- belongs to it. Purely additive: a row the two probes
+    # above already matched has resolved_gp equal to gp anyway, and a row left
+    # unresolved contributes nothing.
+    if "resolved_gp" in memo_df.columns:
+        id_match = id_match | (memo_df["resolved_gp"] == gp)
 
     if not id_match.any():
         # No memo entry exists for this loan at all. A FACT, not a defect --
@@ -1204,6 +1211,18 @@ def _lookup_deferral(memo_df, gp, servicer_key, cycle_month, soup_status=None):
             lender_match = lender_values.apply(
                 lambda s: pd.notna(s) and (_norm_servicer(s) in servicer_norm or servicer_norm in _norm_servicer(s))
             )
+
+    # CLIENT-CONFIRMED (2026-08-10): for a row attributed by the SBA-Loan-ID ->
+    # Lender-Loan-Number fallback, THE MATCHED LOAN DETERMINES THE SERVICER --
+    # the memo's own Lender cell is not consulted. That cell is blank on every
+    # row this fallback resolves (the workbook's INDEX/MATCH returned #N/A),
+    # which is exactly why inferring the servicer from the memo cannot work.
+    # Additive: it can only admit rows the loan index already tied to this
+    # servicer, never reject one the alias table accepted.
+    if "resolved_servicer" in memo_df.columns and servicer_key:
+        resolved_here = (memo_df["resolved_servicer"].astype("string").str.strip().str.lower()
+                         == str(servicer_key).strip().lower())
+        lender_match = lender_match | resolved_here
 
     if not (id_match & lender_match).any():
         # This loan DOES have memo entries under this GP number, but none

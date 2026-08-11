@@ -301,6 +301,20 @@ async def audit(
             del memo_bytes
             gc.collect()
 
+            # CLIENT-CONFIRMED (2026-08-10): attribute each memo row to a loan
+            # BEFORE any check or coverage classification runs, so STAT-01 and
+            # MEMO-01 agree on which loan a row belongs to. Primary is the
+            # existing SBA Loan ID -> SBA GP Number match; the only fallback is
+            # SBA Loan ID -> Lender Loan Number, exact and unique, with the
+            # matched loan supplying the servicer. Ambiguous or conflicting
+            # rows are left unattributed rather than guessed at.
+            #
+            # Attribution only -- no data-quality rule is touched here, so a
+            # row that becomes attributable keeps every defect it had.
+            memo_df = file_readers.resolve_memo_attribution(
+                memo_df, file_readers.build_memo_loan_index(soup_df),
+            )
+
         all_results = []
         servicer_loan_counts = {}
         recommendations = []

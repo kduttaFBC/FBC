@@ -592,6 +592,134 @@ def normalize_memo_loan_id(value):
     return digits or None
 
 
+# Columns appended by resolve_memo_attribution. Kept together so callers can
+# test for the contract in one place rather than probing individual names.
+MEMO_ATTRIBUTION_COLUMNS = ("resolved_gp", "resolved_servicer",
+                            "attribution_method", "attribution_issue")
+
+ATTRIBUTION_BY_SBA_GP = "sba_gp"
+ATTRIBUTION_BY_SBA_LENDER_LOAN_NUMBER = "sba_lender_loan_number"
+ATTRIBUTION_ISSUE_AMBIGUOUS = "ambiguous"
+ATTRIBUTION_ISSUE_CONFLICT = "conflict"
+
+
+def build_memo_loan_index(soup_df):
+    """Builds the loan-identity index the memo attribution fallback needs:
+
+        {"gp_to_servicer": {gp: servicer},
+         "lender_loan_number_to_gps": {lender_loan_number: {(gp, servicer)}}}
+
+    Both keys are normalized with normalize_memo_loan_id so the two sides of
+    every comparison are represented identically -- Excel numeric vs string,
+    whitespace and a trailing '.0'. Nothing else is normalized: this is an
+    EXACT identifier index, never a fuzzy one.
+
+    A Lender Loan Number mapping to more than one loan is preserved as a set
+    rather than collapsed, so the caller can refuse to attribute rather than
+    pick one."""
+    index = {"gp_to_servicer": {}, "lender_loan_number_to_gps": {}}
+    if soup_df is None or soup_df.empty or "SBA GP Number" not in soup_df.columns:
+        return index
+
+    blank = [None] * len(soup_df)
+    gps = soup_df["SBA GP Number"].tolist()
+    llns = (soup_df["Lender Loan Number"].tolist()
+            if "Lender Loan Number" in soup_df.columns else blank)
+    servicers = (soup_df["Servicer"].tolist()
+                 if "Servicer" in soup_df.columns else blank)
+
+    for raw_gp, raw_lln, raw_servicer in zip(gps, llns, servicers):
+        gp = normalize_memo_loan_id(raw_gp)
+        if gp is None:
+            continue
+        servicer = "" if raw_servicer is None else str(raw_servicer).strip()
+        if servicer.lower() == "nan":
+            servicer = ""
+        index["gp_to_servicer"].setdefault(gp, servicer)
+        lln = normalize_memo_loan_id(raw_lln)
+        if lln:
+            index["lender_loan_number_to_gps"].setdefault(lln, set()).add((gp, servicer))
+    return index
+
+
+def resolve_memo_attribution(memo_df, loan_index):
+    """CLIENT-CONFIRMED (2026-08-10): attributes each Servicer Memo row to a
+    loan, using EXACT identifier matching only.
+
+        1. PRIMARY   memo SBA Loan ID -> SOUP SBA GP Number
+        2. FALLBACK  memo SBA Loan ID -> SOUP Lender Loan Number
+
+    The fallback runs ONLY when the primary finds nothing, and only when it
+    resolves to exactly ONE loan. It exists because the delivered memo carries
+    rows whose SBA Loan ID field holds the servicer's own loan number rather
+    than the SBA GP Number -- six such rows in the June drop, across three
+    loans.
+
+    Deliberately NOT implemented at this time: Lender Loan ID -> Lender Loan
+    Number, Lender Loan ID -> SBA GP Number, or any other probe. The existing
+    Lender-Loan-ID behaviour elsewhere is left exactly as it was.
+
+    THE MATCHED LOAN DETERMINES THE SERVICER. The memo's own Lender cell is
+    never consulted here -- it is blank on every row this fallback resolves,
+    which is precisely why inferring from it cannot work.
+
+    Refuses to attribute, rather than guessing, when:
+      * the fallback value matches more than one loan  -> "ambiguous"
+      * primary and fallback would resolve to DIFFERENT loans -> "conflict"
+
+    Returns a COPY with MEMO_ATTRIBUTION_COLUMNS appended. resolved_gp is None
+    for any row left unresolved. No fuzzy matching, no borrower-name matching,
+    no servicer guessing.
+
+    ATTRIBUTION ONLY. Nothing here reads or writes a data-quality flag: a row
+    that becomes attributable keeps every defect it had."""
+    df = memo_df.copy() if memo_df is not None else memo_df
+    if df is None or df.empty:
+        return df
+    gp_to_servicer = (loan_index or {}).get("gp_to_servicer") or {}
+    lln_to_gps = (loan_index or {}).get("lender_loan_number_to_gps") or {}
+
+    resolved_gp, resolved_servicer, method, issue = [], [], [], []
+    for sba in (df["gp_sba"] if "gp_sba" in df.columns else [None] * len(df)):
+        key = str(sba).strip() if sba is not None and str(sba).strip() else None
+        primary = key if key in gp_to_servicer else None
+        candidates = lln_to_gps.get(key, set()) if key else set()
+
+        if primary is not None:
+            # Primary wins. A fallback pointing somewhere else is a CONFLICT
+            # worth surfacing, but the primary match still stands -- the
+            # confirmed rule is that the SBA GP match is authoritative.
+            others = {gp for gp, _ in candidates if gp != primary}
+            resolved_gp.append(primary)
+            resolved_servicer.append(gp_to_servicer.get(primary, ""))
+            method.append(ATTRIBUTION_BY_SBA_GP)
+            issue.append(ATTRIBUTION_ISSUE_CONFLICT if others else "")
+            continue
+
+        if len(candidates) == 1:
+            gp, servicer = next(iter(candidates))
+            resolved_gp.append(gp)
+            resolved_servicer.append(servicer or gp_to_servicer.get(gp, ""))
+            method.append(ATTRIBUTION_BY_SBA_LENDER_LOAN_NUMBER)
+            issue.append("")
+        elif len(candidates) > 1:
+            resolved_gp.append(None)
+            resolved_servicer.append("")
+            method.append("")
+            issue.append(ATTRIBUTION_ISSUE_AMBIGUOUS)
+        else:
+            resolved_gp.append(None)
+            resolved_servicer.append("")
+            method.append("")
+            issue.append("")
+
+    df["resolved_gp"] = resolved_gp
+    df["resolved_servicer"] = resolved_servicer
+    df["attribution_method"] = method
+    df["attribution_issue"] = issue
+    return df
+
+
 def read_service_memo(file_bytes):
     """Returns the Servicer Memo Summary as a DataFrame: one row per
     deferral/modification memo entry, across all servicers and all report
