@@ -23,12 +23,29 @@ MEASURED ON THE REAL JUNE FIXTURES (8 servicers, 126 recommendations):
   53 positive-payment rows   -> frontend ratio EXACTLY equals the backend's
   20 zero-payment-with-fee   -> divergent in kind, max ratio 0.000758, so every
                                 one renders as "0.00 units" at two decimals
-   0 negative-payment rows   -> structurally impossible on the review page
+   0 negative-payment rows   -> none in the June fixtures; July has them, and
+                                they now DO reach the page (see below)
    0 zero/absent-scheduled   -> would render blank
 
-THE THREE THINGS KEEPING THIS SAFE, none of which is a guard on paymentUnits:
-  1. reversal rows are excluded from candidacy by corrections.py for an
-     unrelated reason;
+UPDATED 2026-08-12. Reversal rows now reach the review page. The old
+eligibility-layer `continue` in corrections.py did not merely block
+auto-correction of a reversal-driven delinquency -- it deleted the loan from
+Human Review entirely, so no reviewer ever saw the mismatch (confirmed on
+Lendistry 2025, July 2026, loan 5951029110). That routing was corrected: the
+recommendation is now emitted with review_required=True and
+REVIEW_REASON_REVERSAL. The rule that a reversal is never AUTOMATICALLY
+correctable is unchanged.
+
+This file's original warning was that such a row would display a wrong figure,
+because the frontend ratio adds the servicing fee and the backend's reversal
+branch deliberately excludes it. That warning was acted on rather than
+inherited: `paymentUnits()` now returns null when `reversalEquivalents` is set,
+so no BR-002 ratio is rendered for a reversal row at all, and the real
+deficiency arithmetic is shown in its place. Pinned below.
+
+THE THREE THINGS KEEPING THIS SAFE:
+  1. reversal rows are suppressed from paymentUnits by an explicit guard --
+     this is now a real guard on paymentUnits, not an accident of eligibility;
   2. servicing fees happen to be ~0.05% of scheduled payments in this
      portfolio;
   3. manual discipline keeps the two numerators aligned.
@@ -69,12 +86,20 @@ def _payment_units_source():
     return match.group(1) if match else None
 
 
-def frontend_payment_units(payment_received, servicing_fee, scheduled_payment):
+def frontend_payment_units(payment_received, servicing_fee, scheduled_payment,
+                           reversal_equivalents=None):
     """Faithful Python transcription of CorrectionReview.jsx paymentUnits().
 
     Mirrors the JS semantics deliberately, including `if (!sched) return null`
     (0, NaN, None and '' are all falsy in JS) and `|| 0` coalescing. If the JS
-    changes, PaymentUnitsSourceFingerprintTests fails and points here."""
+    changes, PaymentUnitsSourceFingerprintTests fails and points here.
+
+    reversal_equivalents mirrors the 2026-08-12 guard: the JS returns null
+    before computing anything when `rec.reversalEquivalents != null`, so a
+    reversal row renders no ratio. Defaults to None (not a reversal), which is
+    every pre-existing call site's case and leaves their behaviour unchanged."""
+    if reversal_equivalents is not None:
+        return None
     try:
         sched = float(scheduled_payment) if scheduled_payment is not None else float("nan")
     except (TypeError, ValueError):
@@ -108,6 +133,24 @@ class PaymentUnitsSourceFingerprintTests(unittest.TestCase):
 
     def test_a_falsy_scheduled_payment_still_short_circuits(self):
         self.assertRegex(_payment_units_source(), r"if\s*\(!sched\)\s*return null")
+
+    def test_a_reversal_row_short_circuits_before_any_arithmetic(self):
+        # The guard added 2026-08-12, when reversal rows started reaching the
+        # review page. It must come BEFORE the ratio is computed, so no reversal
+        # row can ever render a BR-002 figure that did not drive its result.
+        body = _payment_units_source()
+        self.assertRegex(body, r"if\s*\(rec\.reversalEquivalents\s*!=\s*null\)\s*return null")
+        self.assertLess(body.index("reversalEquivalents"), body.index("return adjusted / sched"),
+                        "the reversal guard must precede the ratio calculation")
+
+    def test_the_reversal_arithmetic_is_rendered_in_its_place(self):
+        # Suppressing the wrong figure is only half of it — the reviewer still
+        # needs the numbers the calculated value actually came from.
+        src = _jsx_source()
+        self.assertIn("function reversalEvidence(rec)", src)
+        self.assertIn("reversalEvidence(r)", src)
+        self.assertIn("Math.abs(received)", src)   # scheduled + |negative amount|
+        self.assertIn("sched * 0.8", src)          # measured in 80%-of-scheduled units
 
     def test_the_display_is_two_decimal_places(self):
         # The precision at which any divergence becomes visible to a reviewer.
@@ -218,8 +261,10 @@ class DocumentedDivergenceNegativePaymentTests(unittest.TestCase):
     negative payment plus a fee could otherwise sum to a positive figure and
     silently bypass the reversal path altogether'. The frontend would add it.
 
-    This can only matter if such a row ever reaches the review page, which the
-    eligibility layer currently prevents. Both halves are pinned."""
+    Such rows DO now reach the review page (routing corrected 2026-08-12), so
+    the divergence is no longer prevented by their absence — it is prevented by
+    paymentUnits' explicit reversal guard, which renders no ratio for them at
+    all. Both halves are pinned."""
 
     def test_the_backend_excludes_the_fee_from_the_reversal_branch(self):
         no_fee, equiv_no_fee = checks._apply_payment_transition(2, -202.15, 212.37,
@@ -236,20 +281,34 @@ class DocumentedDivergenceNegativePaymentTests(unittest.TestCase):
         self.assertGreater(new_missed, 2)
 
     def test_the_frontend_would_have_shown_a_positive_figure(self):
-        # Exactly the outcome the backend's guard exists to prevent.
+        # Exactly the outcome the paymentUnits guard exists to prevent: a
+        # reversal that the ratio, fee included, renders as a POSITIVE figure.
+        # This is the unguarded arithmetic, which is why the guard is required.
         self.assertGreater(frontend_payment_units(-10.0, 5000.0, 500.0), 0.0)
 
-    def test_reversal_rows_are_excluded_from_candidacy(self):
-        # The structural reason no reviewer can see this divergence today. If
-        # this exclusion is ever relaxed, the frontend display becomes wrong for
-        # those rows and this test is the warning.
+    def test_the_guard_means_a_reversal_row_renders_no_figure_at_all(self):
+        # Same inputs as above, now carrying the reversal flag the backend sends.
+        self.assertIsNone(frontend_payment_units(-10.0, 5000.0, 500.0,
+                                                 reversal_equivalents=1))
+
+    def test_reversal_rows_reach_review_flagged_rather_than_being_deleted(self):
+        # SUPERSEDES test_reversal_rows_are_excluded_from_candidacy (2026-08-12).
+        # The old contract asserted a reversal loan must never become a
+        # candidate. That was over-broad: it removed the mismatch from Human
+        # Review entirely instead of merely blocking auto-correction. The
+        # never-automatic half of the rule is asserted separately below.
         eligible = corrections.build_eligible_corrections([{
             "gp": "1", "reasons": ["DELINQUENCY STATUS MISMATCH"], "dq_match": False,
             "calculated_dq": "60 DAYS", "srf_dq": "CURRENT", "srf_status": "ACTIVE",
             "reversal_equivalents": 2,          # a reversal
             "excel_rows": [10], "sheet_name": "Servicer Inputs", "header_excel_row": 9,
         }])
-        self.assertEqual(eligible, [], "a reversal loan must never become a candidate")
+        self.assertEqual(len(eligible), 1, "the reviewer must be able to see this mismatch")
+        self.assertEqual(eligible[0]["field"], "Delinquency Status")
+        self.assertTrue(eligible[0]["review_required"])
+        self.assertEqual(eligible[0]["review_reason"], corrections.REVIEW_REASON_REVERSAL)
+        self.assertEqual(eligible[0]["reversal_equivalents"], 2,
+                         "carried through so the review page can suppress the BR-002 ratio")
 
 
 class MissingOrZeroScheduledPaymentTests(unittest.TestCase):
@@ -325,10 +384,29 @@ class RealPortfolioParityTests(unittest.TestCase):
                 positive.append(r)
         return positive, zero_fee, negative
 
-    def test_no_reversal_row_reaches_the_review_page(self):
+    def test_every_reversal_row_that_reaches_the_page_is_flagged_and_suppressed(self):
+        # SUPERSEDES test_no_reversal_row_reaches_the_review_page (2026-08-12).
+        # Reversal rows are no longer kept off the page; what must hold now is
+        # that each one is flagged for review and renders NO BR-002 ratio.
         _positive, _zero_fee, negative = self._split()
-        self.assertEqual(negative, [],
-                         "a negative-payment row on screen would display a wrong figure")
+        for r in negative:
+            with self.subTest(gp=r["gp"]):
+                self.assertIsNotNone(r["reversalEquivalents"],
+                                     "a negative-payment row must carry the reversal flag")
+                self.assertIn(corrections.REVIEW_REASON_REVERSAL, r["reviewFlag"] or "")
+                self.assertIsNone(
+                    frontend_payment_units(float(r["paymentReceived"]),
+                                           float(r.get("servicingFee") or 0),
+                                           float(r["scheduledPayment"]),
+                                           reversal_equivalents=r["reversalEquivalents"]),
+                    "a reversal row must display no payment-units figure")
+
+    def test_only_reversal_rows_carry_the_reversal_flag(self):
+        # The converse: the guard must not swallow ordinary rows' figures.
+        positive, zero_fee, _n = self._split()
+        for r in positive + zero_fee:
+            with self.subTest(gp=r["gp"]):
+                self.assertIsNone(r["reversalEquivalents"])
 
     def test_every_positive_row_displays_the_backend_ratio_exactly(self):
         positive, _z, _n = self._split()
@@ -354,8 +432,11 @@ class RealPortfolioParityTests(unittest.TestCase):
                                  "this divergence visible to the reviewer")
 
     def test_the_portfolio_shape_this_file_was_measured_against(self):
-        positive, zero_fee, negative = self._split()
-        self.assertEqual(len(negative), 0)
+        positive, zero_fee, _negative = self._split()
+        # The negative-row count is deliberately NOT asserted here anymore: it
+        # was 0 in the June fixtures only because reversal rows were being
+        # dropped, and it is a real, varying portfolio figure now. The shape
+        # that still matters is that positive and zero-fee rows both exist.
         self.assertGreater(len(positive), 0)
         self.assertGreater(len(zero_fee), 0)
         largest = max(float(r["servicingFee"]) / float(r["scheduledPayment"])

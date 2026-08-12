@@ -52,10 +52,37 @@ function domainFor(field) {
 // Payment. Servicing Fee is part of the numerator — showing Payment Received
 // alone would contradict the application's own calculation.
 function paymentUnits(rec) {
+  // A REVERSAL row is not judged by this ratio. The backend's reversal branch
+  // (checks._apply_payment_transition) measures a deficiency of
+  // scheduled + |negative amount| in 80%-of-scheduled units and DELIBERATELY
+  // excludes the servicing fee — checks.py records why: a small negative
+  // payment plus a fee could otherwise sum to a positive figure and bypass the
+  // reversal path entirely. Rendering (received + fee) / scheduled here would
+  // show the reviewer a number that played no part in the calculated value
+  // (e.g. loan 5951029110: −$10.92 + $10.60 fee / $313.16 renders "-0.00
+  // units" beside a DELINQUENT result). Reversal rows show the real deficiency
+  // arithmetic instead — see reversalEvidence below.
+  if (rec.reversalEquivalents != null) return null
   const sched = Number(rec.scheduledPayment)
   if (!sched) return null
   const adjusted = Number(rec.paymentReceived || 0) + Number(rec.servicingFee || 0)
   return adjusted / sched
+}
+
+// The reversal arithmetic that DID drive the calculated value, transcribed from
+// checks._apply_payment_transition's client-confirmed (2026-08-04, second
+// revision) formula. Shown in place of the BR-002 ratio for reversal rows so
+// the reviewer sees the figures the result actually came from.
+function reversalEvidence(rec) {
+  if (rec.reversalEquivalents == null) return null
+  const sched = Number(rec.scheduledPayment)
+  const received = Number(rec.paymentReceived || 0)
+  const n = Number(rec.reversalEquivalents)
+  return {
+    deficiency: sched + Math.abs(received),
+    thresholdUnit: sched * 0.8,
+    equivalents: n,
+  }
 }
 
 // The deferral-evidence contract, computed ONCE in checks.py (STAT-01) and
@@ -179,6 +206,7 @@ export default function CorrectionReview({ recommendations, sessionId }) {
           {recs.map((r) => {
             const d = decisionOf(r.id)
             const units = paymentUnits(r)
+            const reversal = reversalEvidence(r)
             return (
               <React.Fragment key={r.id}>
                 <tr>
@@ -191,11 +219,29 @@ export default function CorrectionReview({ recommendations, sessionId }) {
                   <td style={{ fontFamily: 'monospace' }}>{r.prior == null ? '—' : String(r.prior)}</td>
                   <td style={{ fontFamily: 'monospace' }}>{String(r.calculated)}</td>
                   <td className="hint">
-                    Received {money(r.paymentReceived)} + Fee {money(r.servicingFee)} / Sched{' '}
-                    {money(r.scheduledPayment)}
-                    {units != null && (
+                    {reversal ? (
                       <>
-                        {' '}= <strong>{units.toFixed(2)} units</strong>
+                        <strong>Reversal</strong> — net Received {money(r.paymentReceived)} / Sched{' '}
+                        {money(r.scheduledPayment)}
+                        <div>
+                          Deficiency {money(reversal.deficiency)} / {money(reversal.thresholdUnit)}{' '}
+                          (80% of sched) ={' '}
+                          <strong>
+                            {reversal.equivalents} payment
+                            {reversal.equivalents === 1 ? '' : 's'} removed
+                          </strong>
+                        </div>
+                        <div>Fee {money(r.servicingFee)} — excluded from this calculation</div>
+                      </>
+                    ) : (
+                      <>
+                        Received {money(r.paymentReceived)} + Fee {money(r.servicingFee)} / Sched{' '}
+                        {money(r.scheduledPayment)}
+                        {units != null && (
+                          <>
+                            {' '}= <strong>{units.toFixed(2)} units</strong>
+                          </>
+                        )}
                       </>
                     )}
                     <div>Balance {money(r.balance)}</div>

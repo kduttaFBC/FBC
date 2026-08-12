@@ -113,6 +113,32 @@ REVIEW_REASON_RESUME_CONTRADICTION = (
     "Requires explicit reviewer approval before anything is written."
 )
 
+# SUPERSEDED 2026-08-12 (the routing, NOT the rule). The reversal rule itself is
+# unchanged and still CLIENT-CONFIRMED (2026-08-03): a Delinquency Status driven
+# by a negative Payment Received is never automatically correctable. What changed
+# is how that is enforced. It used to be an eligibility-layer `continue`, which
+# did not merely block auto-correction -- it removed the loan from the
+# recommendation list, the session candidate set and therefore Human Review
+# entirely, so no reviewer could see the mismatch at all. Confirmed on Lendistry
+# 2025, July 2026, loan 5951029110: STAT-01 flagged DELINQUENCY STATUS MISMATCH
+# (reported 60 DAYS, calculated DELINQUENT off a consolidated net payment of
+# -$10.92) and the recommendation was silently dropped.
+#
+# It is now routed the way every other must-be-judged case in this module is
+# routed: review_required=True with the defect named, so the reviewer sees it and
+# decides. Nothing is auto-applied -- _apply_one_correction's reviewer_approved
+# gate is unchanged and still governs every write.
+REVIEW_REASON_REVERSAL = (
+    "This delinquency figure was driven by a REVERSAL — the consolidated net "
+    "Payment Received for this cycle is negative. It is calculated by the "
+    "client-confirmed deficiency formula (scheduled + |negative amount|, "
+    "measured in 80%-of-scheduled units), which deliberately excludes the "
+    "servicing fee, so the BR-002 payment-units ratio shown for ordinary "
+    "recommendations does not apply here and is not displayed. A reversal is "
+    "never automatically correctable: requires explicit reviewer approval "
+    "before anything is written."
+)
+
 # SUPERSEDED 2026-08-08 (same day, later clarification). An earlier version of
 # this module carried _NEVER_WRITABLE_LOAN_STATUS = (LIQUIDATION, FORECLOSURE,
 # REO), refusing those values unconditionally at three layers. That conflated
@@ -518,8 +544,13 @@ def build_eligible_corrections(correction_data):
         # (deliberately vaguer) calculated_dq than NEG-01 shows, which would
         # violate the "the two checks must never diverge" principle this
         # whole shared-calculation design exists to protect.
-        if c.get("reversal_equivalents") is not None:
-            continue
+        #
+        # ROUTING CORRECTED 2026-08-12 (see REVIEW_REASON_REVERSAL): "requires
+        # manual review" is now implemented as review_required on the
+        # Delinquency Status recommendation, not as a `continue` that deleted
+        # the loan from Human Review altogether. The scope of the block is
+        # unchanged for LOAN STATUS — see the guard below the DQ branch.
+        _reversal = c.get("reversal_equivalents") is not None
 
         gp = c.get("gp")
         excel_rows, skipped_row_refs = _clean_excel_rows(c.get("excel_rows"))
@@ -555,6 +586,15 @@ def build_eligible_corrections(correction_data):
                 "payment_received": c.get("payment_received"),
                 "scheduled_payment": c.get("scheduled_payment"),
                 "servicing_fee": c.get("servicing_fee"),
+                # Passed through so the review page can tell a reversal row from
+                # an ordinary one. The review page's BR-002 payment-units ratio
+                # ((received + fee) / scheduled) is NOT the arithmetic that
+                # produced calculated_dq for these rows -- the reversal branch of
+                # checks._apply_payment_transition excludes the fee by design --
+                # so this is the flag that suppresses that figure rather than
+                # showing a reviewer a number that did not drive the result.
+                # Display/branching only; never an input to eligibility.
+                "reversal_equivalents": c.get("reversal_equivalents"),
                 # The shared deferral-evidence contract (checks.
                 # DEFERRAL_EVIDENCE_STATUSES). Passed through verbatim and
                 # NEVER recomputed here: STAT-01 is the only place that
@@ -589,16 +629,35 @@ def build_eligible_corrections(correction_data):
             # figure was calculated by the same normal ladder as every other
             # loan, and the servicer's reported DQ played no part in it.
             _terminal = _is_collection_status(c.get("srf_status"))
+            # Accumulated rather than an if/elif chain: a loan can carry more
+            # than one of these at once (a reversal on a loan the servicer also
+            # reports as FORECLOSURE), and a reviewer must see every reason it
+            # needs judging, not just the first. With exactly one reason present
+            # the joined string is that reason verbatim, so the single-reason
+            # cases keep the exact text they have always had.
+            _review_reasons = []
+            if _cross_domain:
+                _review_reasons.append(REVIEW_REASON_CROSS_DOMAIN)
+            if _terminal:
+                _review_reasons.append(REVIEW_REASON_TERMINAL_STATUS)
+            if _reversal:
+                _review_reasons.append(REVIEW_REASON_REVERSAL)
             _emit(
                 "Delinquency Status",
                 str(c["calculated_dq"]).strip().upper(),
                 "STAT-01 deterministic calculation",
-                review_required=_cross_domain or _terminal,
-                review_reason=(
-                    REVIEW_REASON_CROSS_DOMAIN if _cross_domain
-                    else REVIEW_REASON_TERMINAL_STATUS if _terminal else None
-                ),
+                review_required=bool(_review_reasons),
+                review_reason=" ".join(_review_reasons) or None,
             )
+
+        # A reversal blocks the LOAN STATUS branches below exactly as the old
+        # eligibility-layer `continue` did — that half of the 2026-08-03 rule is
+        # deliberately unchanged. Only the Delinquency Status recommendation
+        # above is newly routed to review; nothing here is widened. Placed after
+        # the DQ branch and before the three Loan Status branches so the scope of
+        # the block is visible in one line rather than repeated three times.
+        if _reversal:
+            continue
 
         # --- Loan Status -> DEFERRED (confirmed Full P&I only, v1) --------------
         # expected_loan_status_raw == "DEFERRED" only ever gets set by a
@@ -804,6 +863,11 @@ def build_recommendations(stat01_result, servicer):
             "paymentReceived": e.get("payment_received"),
             "scheduledPayment": e.get("scheduled_payment"),
             "servicingFee": e.get("servicing_fee"),
+            # Non-null ONLY on a reversal row (the count of scheduled-payment
+            # equivalents the negative amount represents). The review page reads
+            # this to suppress its BR-002 payment-units ratio, which is not the
+            # arithmetic that produced `calculated` for these rows.
+            "reversalEquivalents": e.get("reversal_equivalents"),
             "balance": e.get("balance"),
             "reviewFlag": e.get("review_reason") if e.get("review_required") else None,
             "rule": e.get("eligibility_rule"),
