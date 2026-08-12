@@ -489,6 +489,40 @@ def _write_subtotal_row(ws, row_count):
         cell.font = Font(bold=True)
 
 
+def _excel_gp_value(gp):
+    """The SBA GP Number as Excel should STORE it: a number when the
+    identifier is purely numeric, otherwise the string unchanged.
+
+    CLIENT-CONFIRMED (2026-08-11): the summary row's loan count is
+    SUBTOTAL(2, A9:A...), and SUBTOTAL(2) is COUNT -- it counts NUMBERS and
+    silently ignores text. Writing the GP as a string made that cell read 0 for
+    every filter state, including no filter. The client's own reference
+    workbook stores these as numbers, and its printed report shows the filtered
+    count (17 of 1,436 when they last saved it), so this is a figure they
+    publish rather than an internal detail.
+
+    THE IDENTIFIER IS PRESERVED EXACTLY. Conversion happens only when
+    str(int(text)) == text, so a value with a leading zero, a non-digit, or any
+    other shape that would not round-trip is written as text unchanged. All
+    1,774 June GPs are 10 digits with no leading zero and round-trip exactly;
+    the largest is 9,981,659,001, far inside float64's exact-integer range
+    (2^53), so no precision is lost.
+
+    Deliberately applied HERE, at the Excel write, and nowhere else. The row
+    dicts keep the canonical string, so GP normalization
+    (checks._norm_id), audit matching, correction logic, CONT-01 and all three
+    Portfolio Summaries are untouched -- none of them reads this workbook."""
+    text = str(gp).strip()
+    if not text:
+        return None
+    try:
+        if str(int(text)) == text:
+            return int(text)
+    except (TypeError, ValueError):
+        pass
+    return text
+
+
 def _write_loan_sheet(ws, report):
     _write_metadata(ws, report)
     rows = report["rows"]
@@ -505,6 +539,8 @@ def _write_loan_sheet(ws, report):
             value = row.get(name)
             if isinstance(value, float) and pd.isna(value):
                 value = None
+            if name == "SBA GP Number":
+                value = _excel_gp_value(value)
             cell = ws.cell(row=r, column=index, value=value)
             number_format = _NUMBER_FORMATS.get(name)
             if number_format:
