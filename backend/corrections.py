@@ -164,6 +164,64 @@ REVIEW_REASON_REVERSAL_OFFSET = (
     "before anything is written."
 )
 
+# CLIENT-CONFIRMED (2026-08-12). BANKRUPTCY is valid for a reporting period when
+# the CURRENT period's Bankruptcy Date column contains a date. Before this,
+# a servicer reporting ACTIVE against a prior SOUP BANKRUPTCY produced a
+# LOAN STATUS MISMATCH that matched none of the three Loan Status branches below
+# and whose expected value (BANKRUPTCY) is deliberately absent from
+# _PROPOSABLE_LOAN_STATUS -- so no recommendation existed, the loan never
+# reached Human Review for that field, and no reviewer could act on it.
+# Confirmed on Lendistry 2025, July 2026, loans 7126119101, 5917099105,
+# 6288639102, 6649779105 and 6666709108.
+#
+# The gate is the CURRENT period's Bankruptcy Date, never soup_status: the client
+# was explicit that prior SOUP BANKRUPTCY alone must not support the proposal.
+# That is also exactly why _PROPOSABLE_LOAN_STATUS stays unchanged -- it is
+# shared with the terminal-contradiction branch, which proposes
+# expected_loan_status_effective (a SOUP carry-forward when no override applies),
+# so widening it would let BANKRUPTCY be proposed off prior SOUP alone. The
+# marker on the candidate is what carries the evidence to the write gate instead.
+REVIEW_REASON_BANKRUPTCY_CURRENT_PERIOD = (
+    "The servicer reports a non-BANKRUPTCY Loan Status, but this reporting "
+    "period's own Bankruptcy Date column is populated and the loan still carries "
+    "a positive Ending Balance. Under the client-confirmed rule, a populated "
+    "current-period Bankruptcy Date supports BANKRUPTCY for this period; prior "
+    "SOUP status alone does not and played no part in this recommendation. "
+    "Requires explicit reviewer approval before anything is written."
+)
+
+# CLIENT-CONFIRMED (2026-08-12): flag-and-propose, explicitly NOT suppress. A
+# Liquidation Date alongside a POSITIVE Ending Balance does not trigger the
+# client's zero-balance exception (that exception is keyed on Ending Balance =
+# $0), so the Bankruptcy Date still stands and the recommendation is still made.
+# But the row then carries three mutually inconsistent current-period signals --
+# a non-BANKRUPTCY reported status, a bankruptcy date, and a liquidation date on
+# a live balance -- and the client's instruction is that the reviewer sees that
+# contradiction prominently rather than having it silently resolved either way.
+# Suppressing the recommendation instead would put the loan straight back into
+# the invisible state this whole change exists to end.
+REVIEW_REASON_BANKRUPTCY_LIQUIDATION_CONTRADICTION = (
+    "CONTRADICTORY CURRENT-PERIOD EVIDENCE: this period also reports a "
+    "Liquidation Date, yet the Ending Balance is greater than $0 and the "
+    "reported Loan Status is neither LIQUIDATION nor PAID-IN-FULL. The client's "
+    "zero-balance exception does NOT apply here (it requires an Ending Balance "
+    "of $0), so the Bankruptcy Date still supports BANKRUPTCY -- but the "
+    "liquidation date and the live balance cannot both be right. Weigh both "
+    "before approving."
+)
+
+# CLIENT-CONFIRMED (2026-08-12): the marker-based write gate. Set on a candidate
+# ONLY by the current-period Bankruptcy Date branch, and the ONLY thing that lets
+# validate_approved_value accept BANKRUPTCY as a value this application
+# generated. Keyed on the marker rather than on the value so that BANKRUPTCY
+# remains ungeneratable everywhere else in this module -- adding it to
+# _PROPOSABLE_LOAN_STATUS would have widened all three other branches at once.
+#
+# Deliberately NOT trusted from client input: generate_reviewed_workbook reads it
+# off the SERVER-SIDE candidate held in the session, never off the decision
+# payload, so a caller cannot mint the marker to unlock a BANKRUPTCY write.
+CURRENT_PERIOD_EVIDENCE_MARKER = "current_period_bankruptcy_date"
+
 # SUPERSEDED 2026-08-08 (same day, later clarification). An earlier version of
 # this module carried _NEVER_WRITABLE_LOAN_STATUS = (LIQUIDATION, FORECLOSURE,
 # REO), refusing those values unconditionally at three layers. That conflated
@@ -321,6 +379,28 @@ def _is_terminal_loan_status(status_value):
     return any(k in s for k in _LOAN_STATUS_TERMINAL_KEYWORDS)
 
 
+def _is_bankruptcy_status(status_value):
+    """True when the servicer already reports the loan as BANKRUPTCY. Used only
+    to stop the current-period Bankruptcy Date branch from proposing a value
+    identical to the one already reported."""
+    return "BANKRUPTCY" in str(status_value or "").strip().upper()
+
+
+def _is_positive_balance(balance_value):
+    """True when Ending Balance is greater than $0 at CENT precision -- the
+    precision every figure in this application is reported and compared at, so a
+    balance that is zero to the cent is zero here even with floating-point
+    residue behind it.
+
+    A missing or unparseable balance is NOT positive. That is deliberate: this
+    guards a Loan Status proposal, and 'we could not read the balance' must never
+    be treated as 'the loan has money outstanding'."""
+    try:
+        return round(float(balance_value), 2) > 0.00
+    except (TypeError, ValueError):
+        return False
+
+
 # Loan Status values a reviewer may SELECT as an approved value. A value that
 # is actually a Delinquency Status is still rejected as cross-domain.
 # WIDENED 2026-08-08. Sourced from the SRF template's own "Reference Tables"
@@ -342,11 +422,16 @@ _PERMITTED_LOAN_STATUS = {
 }
 
 
-def validate_approved_value(field, value, substituted=True):
+def validate_approved_value(field, value, substituted=True, evidence_marker=None):
     """The approved-value domain restriction. A reviewer's substituted value
     must come only from the target field's own domain, so a substitution can
     never reintroduce a cross-domain value (the exact defect that flags a
     recommendation for review in the first place) or turn a loan terminal.
+
+    evidence_marker is the CANDIDATE's server-side marker (see
+    CURRENT_PERIOD_EVIDENCE_MARKER), never a client-supplied field. It widens the
+    GENERATED Loan Status domain by exactly one value, for exactly the
+    recommendation path that established the evidence for it.
 
     Returns (True, normalized_value) if the value is writable for this field,
     else (False, reason)."""
@@ -366,6 +451,18 @@ def validate_approved_value(field, value, substituted=True):
             # come from the narrow generated domain -- this is the layer that
             # keeps the application from ever proposing a terminal collection
             # status off its own bat.
+            # CLIENT-CONFIRMED (2026-08-12): the marker-based exception, checked
+            # BEFORE the general domain so BANKRUPTCY can be written through the
+            # current-period Bankruptcy Date path and nowhere else. Keyed on the
+            # marker AND the value together: the marker does not unlock the whole
+            # Loan Status domain, and BANKRUPTCY stays ungeneratable without it.
+            #
+            # This is why _PROPOSABLE_LOAN_STATUS was not widened. That set is
+            # shared with the terminal-contradiction branch, whose proposal is a
+            # SOUP carry-forward -- adding BANKRUPTCY there would have let it be
+            # generated from prior SOUP alone, which the client ruled out.
+            if evidence_marker == CURRENT_PERIOD_EVIDENCE_MARKER and v == "BANKRUPTCY":
+                return True, "BANKRUPTCY"
             canonical = _canonical_proposable_loan_status(v)
             if canonical is None:
                 return False, (
@@ -590,8 +687,19 @@ def build_eligible_corrections(correction_data):
         gp = c.get("gp")
         excel_rows, skipped_row_refs = _clean_excel_rows(c.get("excel_rows"))
 
+        # Which fields this loan has already had a recommendation emitted for.
+        # _recommendation_id is (servicer, gp, field), so two recommendations for
+        # the same loan/field would share one id and generate_reviewed_workbook's
+        # `by_id` dict would silently keep only the last -- a reviewer's decision
+        # applying to a recommendation they were not shown. The Loan Status
+        # branches below are ordered by precedence, and this is what makes the
+        # first match win instead of the last.
+        _emitted_fields = set()
+
         def _emit(field, corrected_value, eligibility_rule,
-                  review_required=False, review_reason=None):
+                  review_required=False, review_reason=None,
+                  evidence_marker=None):
+            _emitted_fields.add(field)
             eligible.append({
                 "gp": gp,
                 "excel_rows": excel_rows,
@@ -663,6 +771,19 @@ def build_eligible_corrections(correction_data):
                 "prior_loan_status": c.get("soup_status"),
                 "balance": c.get("ending_balance"),
                 "posting_count": c.get("posting_count"),
+                # CLIENT-CONFIRMED (2026-08-12): the current-period evidence
+                # marker. None on every recommendation except one produced by the
+                # Bankruptcy Date branch below. This is what validate_approved_
+                # value checks to allow BANKRUPTCY as a generated value, so it is
+                # a WRITE GATE, not display -- see CURRENT_PERIOD_EVIDENCE_MARKER.
+                "evidence_marker": evidence_marker,
+                # Read-only current-period evidence, passed straight through from
+                # STAT-01. Display only on the review page; the eligibility
+                # decision was already made below and is never re-derived from
+                # these on the client side.
+                "bankruptcy_date": c.get("bankruptcy_date"),
+                "paid_in_full_date": c.get("paid_in_full_date"),
+                "liquidation_date": c.get("liquidation_date"),
             })
 
         # --- Delinquency Status -------------------------------------------------
@@ -845,6 +966,88 @@ def build_eligible_corrections(correction_data):
                 review_reason=REVIEW_REASON_RESUME_CONTRADICTION,
             )
 
+        # --- Loan Status: BANKRUPTCY supported by a current-period Bankruptcy
+        # --- Date (2026-08-12) ------------------------------------------------
+        # SEPARATE from the three branches above, all of which are untouched.
+        # Scoped to one situation: the servicer reports something other than
+        # BANKRUPTCY, and THIS reporting period's own Bankruptcy Date column is
+        # populated on a loan that still has money outstanding.
+        #
+        # Reached only after the `if _reversal: continue` above, so reversal
+        # precedence is preserved for free rather than restated here -- a
+        # reversal-driven loan gets its Delinquency Status routed to review and
+        # no Loan Status recommendation at all, exactly as before.
+        #
+        # Cannot collide with the three branches above. The "-> DEFERRED" branch
+        # requires expected_loan_status_raw == "DEFERRED" (null on these loans);
+        # the terminal branch requires _is_collection_status(srf_status), which is
+        # excluded here by construction (rule 3 below rejects LIQUIDATION, and a
+        # FORECLOSURE/REO loan is left to that branch and its own SOUP-derived
+        # proposal); the resume branch requires deferral_phase == "resume" and a
+        # DEFERRED reported status.
+        #
+        # The four gates, in the client's own terms:
+        #   1. This period's Bankruptcy Date CONTAINS a date. A presence test on
+        #      the raw cell, decided once in checks.py -- never a date parse, since
+        #      the column is genuinely mixed-typed in real files.
+        #   2. Ending Balance > $0, at cent precision (the precision every figure
+        #      in this application is compared at).
+        #   3. THE ZERO-BALANCE EXCEPTION. Preserved as the client stated it: when
+        #      the balance is $0 because the loan is PAID IN FULL or LIQUIDATION,
+        #      the Bankruptcy Date is ignored for this rule. Gate 2 already
+        #      excludes every $0 balance, so this is the belt-and-braces half --
+        #      it also refuses a PAID-IN-FULL / LIQUIDATION loan that reports a
+        #      POSITIVE balance, which gate 2 would otherwise let through and
+        #      which must never be re-proposed as BANKRUPTCY. Checked against the
+        #      reported status AND the Paid-In-Full Date column, since either one
+        #      alone is enough to say the loan is finished.
+        #   4. The servicer does not already say BANKRUPTCY. Without this the
+        #      module would propose a value identical to the reported one for
+        #      every consistent bankruptcy loan in the file.
+        #
+        # soup_status is deliberately absent from every gate. The client was
+        # explicit that prior SOUP BANKRUPTCY must not on its own support this
+        # proposal, so it is not merely insufficient here -- it is not consulted.
+        # A loan whose SOUP history says BANKRUPTCY but whose current Bankruptcy
+        # Date is blank produces no recommendation from this branch.
+        #
+        # ALWAYS review_required -- a recommendation, never an automatic write.
+        _bankruptcy_dated = bool(c.get("bankruptcy_date_populated"))
+        _balance_outstanding = _is_positive_balance(c.get("ending_balance"))
+        _finished_loan = (
+            bool(c.get("paid_in_full_date_populated"))
+            or _is_terminal_loan_status(c.get("srf_status"))
+        )
+        if (
+            "LOAN STATUS MISMATCH" in reasons
+            # LAST of the four Loan Status branches, so any of the three above
+            # takes precedence. A confirmed full-P&I deferral with a stray
+            # Bankruptcy Date is the real overlap: both branches' gates can hold
+            # at once, and without this the loan would carry two contradictory
+            # Loan Status recommendations sharing one id.
+            and "Loan Status" not in _emitted_fields
+            and _bankruptcy_dated
+            and _balance_outstanding
+            and not _finished_loan
+            and not _is_bankruptcy_status(c.get("srf_status"))
+        ):
+            # Flag-and-propose, never suppress (see
+            # REVIEW_REASON_BANKRUPTCY_LIQUIDATION_CONTRADICTION). Accumulated the
+            # same way the Delinquency Status reasons are, so a loan carrying both
+            # facts shows both; with only the first present the joined string is
+            # that reason verbatim.
+            _bk_reasons = [REVIEW_REASON_BANKRUPTCY_CURRENT_PERIOD]
+            if bool(c.get("liquidation_date_populated")):
+                _bk_reasons.append(REVIEW_REASON_BANKRUPTCY_LIQUIDATION_CONTRADICTION)
+            _emit(
+                "Loan Status",
+                "BANKRUPTCY",
+                "Current-period Bankruptcy Date populated with a positive Ending Balance",
+                review_required=True,
+                review_reason=" ".join(_bk_reasons),
+                evidence_marker=CURRENT_PERIOD_EVIDENCE_MARKER,
+            )
+
     return eligible
 
 
@@ -943,6 +1146,18 @@ def build_recommendations(stat01_result, servicer):
             "memoSecuritizationAction": e.get("securitization_action"),
             "servicerLoanStatus": e.get("servicer_loan_status"),
             "priorLoanStatus": e.get("prior_loan_status"),
+            # CLIENT-CONFIRMED (2026-08-12): current-period terminal-event
+            # evidence, carried so the review page can show the reviewer the
+            # Bankruptcy Date this recommendation rests on -- and, for a
+            # contradicted row, the Liquidation Date and positive balance beside
+            # it. Display only; the eligibility decision was made server-side and
+            # the review page never re-derives it. The evidence_marker itself is
+            # deliberately NOT exposed: it is a write gate read off the session
+            # candidate, and echoing it to the client would invite it back as
+            # client input.
+            "bankruptcyDate": e.get("bankruptcy_date"),
+            "paidInFullDate": e.get("paid_in_full_date"),
+            "liquidationDate": e.get("liquidation_date"),
         })
 
     return recommendations, candidates, skipped
@@ -1322,7 +1537,13 @@ def generate_reviewed_workbook(
         # reviewer may substitute, but only from the field's own domain.
         substituted = d.get("approved_value") not in (None, "")
         approved_input = d.get("approved_value") if substituted else calculated
-        ok, result = validate_approved_value(field, approved_input, substituted=substituted)
+        # evidence_marker comes off the SERVER-SIDE candidate (main.py stashes
+        # these in the session), never off `d` — a caller cannot mint the marker
+        # in a decision payload to unlock a BANKRUPTCY write.
+        ok, result = validate_approved_value(
+            field, approved_input, substituted=substituted,
+            evidence_marker=cand.get("evidence_marker"),
+        )
         if not ok:
             # A substitution outside the field's domain is refused here — it
             # can never reintroduce a cross-domain value or a terminal status.

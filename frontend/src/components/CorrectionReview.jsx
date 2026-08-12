@@ -118,6 +118,31 @@ function dash(value) {
   return value === null || value === undefined || value === '' ? '—' : String(value)
 }
 
+// CLIENT-CONFIRMED (2026-08-12): the current-period evidence behind a BANKRUPTCY
+// Loan Status recommendation. Rendered only when there is something to show, so
+// no existing recommendation's evidence cell changes.
+//
+// The client asked specifically that a Liquidation Date sitting against a
+// POSITIVE Ending Balance be surfaced PROMINENTLY as contradictory: it does not
+// suppress the recommendation (the zero-balance exception is keyed on a $0
+// balance), but the reviewer must not have to infer the conflict from two
+// separate cells. That pairing is what `contradiction` marks.
+function currentPeriodEvidence(rec) {
+  const bankruptcy = rec.bankruptcyDate
+  const liquidation = rec.liquidationDate
+  const paidInFull = rec.paidInFullDate
+  if (!bankruptcy && !liquidation && !paidInFull) return null
+  const balance = Number(rec.balance)
+  return {
+    bankruptcy,
+    liquidation,
+    paidInFull,
+    // Both halves required: a liquidation date alone is not a contradiction, and
+    // a positive balance alone certainly isn't.
+    contradiction: Boolean(liquidation) && Number.isFinite(balance) && balance > 0,
+  }
+}
+
 export default function CorrectionReview({ recommendations, sessionId }) {
   const recs = recommendations || []
   const [decisions, setDecisions] = useState({}) // id -> {decision, approved_value, note, notify}
@@ -207,6 +232,7 @@ export default function CorrectionReview({ recommendations, sessionId }) {
             const d = decisionOf(r.id)
             const units = paymentUnits(r)
             const reversal = reversalEvidence(r)
+            const currentPeriod = currentPeriodEvidence(r)
             return (
               <React.Fragment key={r.id}>
                 <tr>
@@ -310,6 +336,24 @@ export default function CorrectionReview({ recommendations, sessionId }) {
                     />
                   </td>
                 </tr>
+                {currentPeriod && (
+                  <tr>
+                    <td colSpan={10} className="hint">
+                      <strong>Current-period evidence:</strong>{' '}
+                      Bankruptcy Date {dash(currentPeriod.bankruptcy)} · Paid-In-Full Date{' '}
+                      {dash(currentPeriod.paidInFull)} · Liquidation Date{' '}
+                      {dash(currentPeriod.liquidation)} · Ending Balance {money(r.balance)}
+                      {currentPeriod.contradiction && (
+                        <div style={{ color: 'var(--amber, #BA7517)', fontWeight: 600, marginTop: 4 }}>
+                          ⚠ CONTRADICTORY: a Liquidation Date of {currentPeriod.liquidation} is
+                          reported against an Ending Balance of {money(r.balance)} (greater than
+                          $0), with a reported Loan Status of {dash(r.servicerLoanStatus)}. The
+                          zero-balance exception does not apply — weigh both before approving.
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                )}
                 {hasDeferralEvidence(r) && (
                   <tr>
                     <td colSpan={10} className="hint">
