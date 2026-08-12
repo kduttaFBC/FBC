@@ -139,6 +139,31 @@ REVIEW_REASON_REVERSAL = (
     "before anything is written."
 )
 
+# CLIENT-CONFIRMED (2026-08-12). The offsetting-reversal half of the same
+# 2026-08-03 rule. REVIEW_REASON_REVERSAL above is keyed on
+# reversal_equivalents, which is only ever set when the CONSOLIDATED payment is
+# negative. A reversal exactly cancelled by an offsetting positive posting nets
+# to $0.00 and was therefore treated as an ordinary no-payment cycle: eligible
+# for auto-correction, with no reversal reason shown to anyone. Measured on the
+# real June 2026 fixtures: 33 recommendations, every one a clean +X/-X pair.
+#
+# Deliberately its OWN text rather than reusing REVIEW_REASON_REVERSAL, because
+# the two are not the same fact and the reviewer must not be told something
+# untrue: the net here is $0.00, not negative, and the deficiency formula did
+# NOT run — the ordinary no-payment branch produced this figure. Keeping the
+# texts separate also leaves every existing single-reason reversal string
+# byte-identical.
+REVIEW_REASON_REVERSAL_OFFSET = (
+    "This cycle contains one or more REVERSED (negative) Payment Received "
+    "postings that are offset by positive postings to a consolidated net of "
+    "exactly $0.00. The delinquency figure was calculated by the ordinary "
+    "no-payment branch — the reversal deficiency formula did not run — but a "
+    "reversal cancelled out by an offsetting posting is still a reversal, and "
+    "the client-confirmed rule is that reversal-driven delinquency figures are "
+    "never automatically correctable: requires explicit reviewer approval "
+    "before anything is written."
+)
+
 # SUPERSEDED 2026-08-08 (same day, later clarification). An earlier version of
 # this module carried _NEVER_WRITABLE_LOAN_STATUS = (LIQUIDATION, FORECLOSURE,
 # REO), refusing those values unconditionally at three layers. That conflated
@@ -550,7 +575,17 @@ def build_eligible_corrections(correction_data):
         # Delinquency Status recommendation, not as a `continue` that deleted
         # the loan from Human Review altogether. The scope of the block is
         # unchanged for LOAN STATUS — see the guard below the DQ branch.
-        _reversal = c.get("reversal_equivalents") is not None
+        # WIDENED 2026-08-12 (see REVIEW_REASON_REVERSAL_OFFSET): the rule's
+        # SCOPE is unchanged — reversal-driven delinquency figures require
+        # human review — but the test for "is this a reversal" no longer relies
+        # on the consolidated net being negative, which a +X/-X pair defeats.
+        # The two facts stay separate so the right reason can be stated and so
+        # only a genuine net-negative reversal suppresses the BR-002 ratio.
+        _reversal_net_negative = c.get("reversal_equivalents") is not None
+        _reversal_offset = (
+            bool(c.get("offsetting_zero_net_reversal")) and not _reversal_net_negative
+        )
+        _reversal = _reversal_net_negative or _reversal_offset
 
         gp = c.get("gp")
         excel_rows, skipped_row_refs = _clean_excel_rows(c.get("excel_rows"))
@@ -595,6 +630,19 @@ def build_eligible_corrections(correction_data):
                 # showing a reviewer a number that did not drive the result.
                 # Display/branching only; never an input to eligibility.
                 "reversal_equivalents": c.get("reversal_equivalents"),
+                # The offsetting-reversal companion. Deliberately the COMPUTED
+                # _reversal_offset, not the raw fact: the two reversal kinds are
+                # mutually exclusive, and this must agree with which review
+                # reason was actually stated. Display/branching only, never an
+                # input to eligibility.
+                #
+                # Note what this does NOT do: it does not suppress the review
+                # page's BR-002 ratio the way reversal_equivalents does. For an
+                # offsetting reversal the net IS $0.00 and the ordinary
+                # no-payment branch DID produce the figure, so the ratio is the
+                # arithmetic that ran and stays on screen. This flag only adds
+                # the fact that reversed postings are hidden inside that $0.00.
+                "offsetting_zero_net_reversal": _reversal_offset,
                 # The shared deferral-evidence contract (checks.
                 # DEFERRAL_EVIDENCE_STATUSES). Passed through verbatim and
                 # NEVER recomputed here: STAT-01 is the only place that
@@ -640,8 +688,14 @@ def build_eligible_corrections(correction_data):
                 _review_reasons.append(REVIEW_REASON_CROSS_DOMAIN)
             if _terminal:
                 _review_reasons.append(REVIEW_REASON_TERMINAL_STATUS)
-            if _reversal:
+            # Mutually exclusive by construction: a loan is either a
+            # net-negative reversal (the deficiency formula ran) or an
+            # offsetting zero-net one (it did not). Never both, so an existing
+            # net-negative reversal keeps its exact original wording.
+            if _reversal_net_negative:
                 _review_reasons.append(REVIEW_REASON_REVERSAL)
+            elif _reversal_offset:
+                _review_reasons.append(REVIEW_REASON_REVERSAL_OFFSET)
             _emit(
                 "Delinquency Status",
                 str(c["calculated_dq"]).strip().upper(),
@@ -653,7 +707,11 @@ def build_eligible_corrections(correction_data):
         # A reversal blocks the LOAN STATUS branches below exactly as the old
         # eligibility-layer `continue` did — that half of the 2026-08-03 rule is
         # deliberately unchanged. Only the Delinquency Status recommendation
-        # above is newly routed to review; nothing here is widened. Placed after
+        # above is newly routed to review; nothing here is widened. An
+        # offsetting zero-net reversal (2026-08-12) reaches this block on the
+        # same footing as a net-negative one: the whole point of that change is
+        # that the two are the same kind of case, so treating them differently
+        # HERE would reintroduce the hole one layer down. Placed after
         # the DQ branch and before the three Loan Status branches so the scope of
         # the block is visible in one line rather than repeated three times.
         if _reversal:
@@ -868,6 +926,10 @@ def build_recommendations(stat01_result, servicer):
             # this to suppress its BR-002 payment-units ratio, which is not the
             # arithmetic that produced `calculated` for these rows.
             "reversalEquivalents": e.get("reversal_equivalents"),
+            # True ONLY on an offsetting zero-net reversal. The review page reads
+            # this to say so beside the $0.00, which would otherwise be
+            # indistinguishable from a genuine no-payment cycle.
+            "offsettingZeroNetReversal": bool(e.get("offsetting_zero_net_reversal")),
             "balance": e.get("balance"),
             "reviewFlag": e.get("review_reason") if e.get("review_required") else None,
             "rule": e.get("eligibility_rule"),

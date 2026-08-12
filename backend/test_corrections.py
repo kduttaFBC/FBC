@@ -1416,3 +1416,163 @@ class ReversalDrivenDelinquencyReachesHumanReviewTests(unittest.TestCase):
         flag = recs[0]["reviewFlag"]
         self.assertIn(corrections.REVIEW_REASON_TERMINAL_STATUS, flag)
         self.assertIn(corrections.REVIEW_REASON_REVERSAL, flag)
+
+
+class OffsettingZeroNetReversalProducerTests(unittest.TestCase):
+    """checks.py half: the raw facts that identify a reversal cancelled out by
+    an offsetting positive posting.
+
+    reversal_equivalents only ever fires on a NEGATIVE consolidated payment, so
+    a clean +X/-X pair nets to $0.00 and reads as an ordinary no-payment cycle:
+    same net, same ladder movement, no reversal marker anywhere. Measured on the
+    real June 2026 fixtures: 33 recommendations, every one such a pair."""
+
+    def _row(self, payments, **over):
+        df = pd.DataFrame([
+            {"SBA GP Number": "1", "Loan Status": "ACTIVE", "Delinquency Status": "CURRENT",
+             "Payment Received": p, "Scheduled Payment": 500.0,
+             "Loan Payment Instance": i + 1,
+             "Last Payment Instance?": "Y" if i == len(payments) - 1 else "N"}
+            for i, p in enumerate(payments)
+        ])
+        for k, v in over.items():
+            df[k] = v
+        return checks.consolidate_cycle_postings(df).loc["1"]
+
+    def test_an_offsetting_pair_is_detected(self):
+        row = self._row([201.47, -201.47])
+        self.assertTrue(row["has_negative_posting"])
+        self.assertEqual(round(float(row["received"]), 2), 0.00)
+        self.assertTrue(checks._is_offsetting_zero_net_reversal(row))
+
+    def test_a_genuine_no_payment_cycle_is_not_a_reversal(self):
+        # The distinction that keeps 7126119101 / 5917099105 / 6288639102 /
+        # 6666709108 (June, one $0.00 posting each, no negative) out of scope.
+        row = self._row([0.0])
+        self.assertFalse(row["has_negative_posting"])
+        self.assertFalse(checks._is_offsetting_zero_net_reversal(row))
+
+    def test_several_postings_offsetting_to_zero_are_detected(self):
+        # The real shape of Lendistry 6010139100.
+        row = self._row([1263.51, -1263.51, 1214.03, -1214.03])
+        self.assertTrue(checks._is_offsetting_zero_net_reversal(row))
+
+    def test_a_net_negative_reversal_is_not_an_offsetting_one(self):
+        # Net is negative, so reversal_equivalents fires and the deficiency
+        # formula runs — a different case, handled by REVIEW_REASON_REVERSAL.
+        row = self._row([201.47, -401.47])
+        self.assertTrue(row["has_negative_posting"])
+        self.assertLess(float(row["received"]), 0)
+        self.assertFalse(checks._is_offsetting_zero_net_reversal(row))
+
+    def test_a_net_positive_cycle_containing_a_reversal_is_out_of_scope(self):
+        # Deliberately narrow: only an EXACT $0.00 net qualifies.
+        row = self._row([500.0, -100.0])
+        self.assertTrue(row["has_negative_posting"])
+        self.assertFalse(checks._is_offsetting_zero_net_reversal(row))
+
+    def test_floating_point_residue_still_counts_as_zero(self):
+        # Judged at cent precision, the precision everything here is compared at.
+        row = self._row([0.1, 0.2, -0.30000000000000004])
+        self.assertTrue(checks._is_offsetting_zero_net_reversal(row))
+
+    def test_the_facts_do_not_move_the_delinquency_calculation(self):
+        # The producer is raw facts only. A $0.00 net is one more miss whether
+        # it got there by paying nothing or by an offset pair — identical.
+        plain, _ = checks._apply_payment_transition(0, 0.0, 500.0)
+        offset, _ = checks._apply_payment_transition(0, 0.0, 500.0, servicing_fee=None)
+        self.assertEqual(plain, offset)
+        self.assertEqual(plain, 1)
+
+
+class OffsettingZeroNetReversalRoutedToReviewTests(unittest.TestCase):
+    """corrections.py half: an offsetting zero-net reversal reaches Human
+    Review with its OWN reason, and is never auto-correctable.
+
+    Modelled on Lendistry 2025 loan 6649779105 (June 2026): two postings
+    offsetting to $0.00, prior 30 DAYS, servicer reporting 90 DAYS, audit
+    calculating 60 DAYS."""
+
+    GP = "6649779105"
+
+    def _recs(self, **over):
+        base = dict(calculated_dq="60 DAYS", srf_dq="90 DAYS", prior_dq="30 DAYS",
+                    payment_received=0.0, scheduled_payment=121.32,
+                    offsetting_zero_net_reversal=True, posting_count=2)
+        base.update(over)
+        entry = _correction_data_entry(self.GP, [4, 5], **base)
+        return _recommend([entry])[0]
+
+    def test_it_reaches_human_review(self):
+        recs = self._recs()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["gp"], self.GP)
+        self.assertEqual(recs[0]["reported"], "90 DAYS")
+        self.assertEqual(recs[0]["calculated"], "60 DAYS")
+
+    def test_it_carries_the_offsetting_reason_not_the_net_negative_one(self):
+        # The two texts must not be conflated: the net here is $0.00, not
+        # negative, and the deficiency formula did not run. Telling the reviewer
+        # otherwise would be untrue.
+        flag = self._recs()[0]["reviewFlag"]
+        self.assertEqual(flag, corrections.REVIEW_REASON_REVERSAL_OFFSET)
+        self.assertNotIn(corrections.REVIEW_REASON_REVERSAL, flag)
+        self.assertIn("$0.00", flag)
+
+    def test_the_review_page_is_told_it_is_an_offsetting_reversal(self):
+        rec = self._recs()[0]
+        self.assertTrue(rec["offsettingZeroNetReversal"])
+
+    def test_the_br002_ratio_is_deliberately_still_shown(self):
+        # Unlike a net-negative reversal, the ordinary no-payment branch DID
+        # produce this figure, so the ratio on screen is the arithmetic that ran.
+        rec = self._recs()[0]
+        self.assertIsNone(rec["reversalEquivalents"],
+                          "the deficiency formula did not run for this row")
+
+    def test_a_net_negative_reversal_still_wins_and_keeps_its_own_text(self):
+        # Both facts present: net-negative takes precedence, exact wording kept.
+        rec = self._recs(reversal_equivalents=1, payment_received=-10.92)[0]
+        self.assertEqual(rec["reviewFlag"], corrections.REVIEW_REASON_REVERSAL)
+        self.assertFalse(rec["offsettingZeroNetReversal"])
+        self.assertEqual(rec["reversalEquivalents"], 1)
+
+    def test_loan_status_corrections_stay_blocked_on_an_offsetting_reversal(self):
+        # Same footing as a net-negative reversal — treating them differently
+        # here would reintroduce the hole one layer down.
+        entry = _correction_data_entry(
+            self.GP, [4], reasons=("LOAN STATUS MISMATCH", "DELINQUENCY STATUS MISMATCH"),
+            calculated_dq="60 DAYS", srf_dq="90 DAYS", status_match=False,
+            offsetting_zero_net_reversal=True,
+            expected_loan_status_raw="DEFERRED", deferral_type="full", deferral_phase="start",
+        )
+        recs, _c, _s = _recommend([entry])
+        self.assertEqual([r["field"] for r in recs], ["Delinquency Status"])
+
+    def test_nothing_is_auto_applied(self):
+        file_bytes, excel_rows = _build_workbook_bytes([
+            {"SBA GP Number": self.GP, "Loan Status": "ACTIVE", "Delinquency Status": "90 DAYS",
+             "Beginning Balance": 10000, "Ending Balance": 10000, "Payment Received": 0,
+             "Scheduled Payment": 121.32},
+        ])
+        entry = _correction_data_entry(
+            self.GP, excel_rows, calculated_dq="60 DAYS", srf_dq="90 DAYS",
+            offsetting_zero_net_reversal=True,
+        )
+        recs, candidates, _ = _recommend([entry])
+        outcome = _generate(file_bytes, candidates, [])
+        self.assertEqual(outcome["applied_count"], 0)
+        _wb, ws = _reload(_build_workbook_bytes([
+            {"SBA GP Number": self.GP, "Delinquency Status": "90 DAYS"}])[0])
+        # and an explicit approval DOES write, exactly like any other review item
+        outcome = _generate(file_bytes, candidates, [_approve(recs[0])])
+        self.assertEqual(outcome["applied_count"], 1)
+        _wb, ws = _reload(outcome["file_bytes"])
+        self.assertEqual(_read_cell(ws, excel_rows[0], "Delinquency Status"), "60 DAYS")
+
+    def test_an_ordinary_zero_payment_cycle_is_untouched(self):
+        # The control: no negative posting, no flag, still auto-correctable.
+        recs = self._recs(offsetting_zero_net_reversal=False)
+        self.assertEqual(len(recs), 1)
+        self.assertIsNone(recs[0]["reviewFlag"])
+        self.assertFalse(recs[0]["offsettingZeroNetReversal"])

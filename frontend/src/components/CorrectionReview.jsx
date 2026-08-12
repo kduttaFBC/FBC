@@ -242,6 +242,20 @@ export default function CorrectionReview({ recommendations, sessionId }) {
                             {' '}= <strong>{units.toFixed(2)} units</strong>
                           </>
                         )}
+                        {/* An OFFSETTING reversal keeps the ratio above: its net
+                            really is $0.00 and the ordinary no-payment branch
+                            really did produce the calculated value, so unlike a
+                            net-negative reversal the figure on screen is the
+                            arithmetic that ran. What the $0.00 hides is that
+                            reversed postings are inside it — without this line a
+                            reviewer cannot tell this apart from a loan that
+                            simply paid nothing. */}
+                        {r.offsettingZeroNetReversal && (
+                          <div>
+                            <strong>Includes reversed postings</strong> offset to a net of exactly
+                            $0.00
+                          </div>
+                        )}
                       </>
                     )}
                     <div>Balance {money(r.balance)}</div>

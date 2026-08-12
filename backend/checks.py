@@ -267,6 +267,24 @@ def consolidate_cycle_postings(servicer_inputs_df):
             "loan_status": effective_last.get("Loan Status", ""),
             "dq_status": effective_last.get("Delinquency Status", ""),
             "received": group["Payment Received"].sum(min_count=1) if "Payment Received" in group.columns else None,
+            # Purely ADDITIVE raw fact (2026-08-12): did ANY posting in this
+            # cycle carry a negative Payment Received? `received` above is the
+            # NET across postings and cannot answer this — a +X/-X pair nets to
+            # exactly $0 and is indistinguishable from a genuine no-payment
+            # cycle by the net alone. Recorded here because this is the one
+            # place that already sees every posting for the loan; deriving it
+            # anywhere else would be the independent re-implementation this
+            # shared consolidation exists to prevent.
+            #
+            # NOT an input to any calculation. Nothing in the delinquency
+            # ladder, payment-sufficiency/BR-002, or the reversal deficiency
+            # formula reads it — STAT-01's calculated value is byte-for-byte
+            # unchanged by its presence. It exists so corrections.py can route
+            # eligibility, which is that module's job, not this one's.
+            "has_negative_posting": (
+                bool((pd.to_numeric(group["Payment Received"], errors="coerce") < 0).any())
+                if "Payment Received" in group.columns else False
+            ),
             "servicing_fee": group["Servicing Fee"].sum(min_count=1) if "Servicing Fee" in group.columns else None,
             "principal": group["Principal"].sum(min_count=1) if "Principal" in group.columns else None,
             "net_interest": group["Net Interest"].sum(min_count=1) if "Net Interest" in group.columns else None,
@@ -310,7 +328,8 @@ def consolidate_cycle_postings(servicer_inputs_df):
         })
 
     return pd.DataFrame(rows).set_index("SBA GP Number") if rows else pd.DataFrame(
-        columns=["posting_count", "loan_status", "dq_status", "received", "servicing_fee", "principal", "net_interest",
+        columns=["posting_count", "loan_status", "dq_status", "received", "has_negative_posting",
+                 "servicing_fee", "principal", "net_interest",
                  "scheduled", "scheduled_ambiguous", "scheduled_payment_updated_during_cycle",
                  "scheduled_distinct_values", "beginning_balance",
                  "ending_balance", "interest_from", "interest_to", "lender_loan_number",
@@ -826,6 +845,38 @@ def liquidation_balance_check(servicer_inputs_df, closed_at_zero=None):
 # operationalizes it. A partial payment below 80% IS treated as delinquent;
 # one at or above 80% counts as that installment paid.
 # ---------------------------------------------------------------------------
+
+def _is_offsetting_zero_net_reversal(consolidated_row):
+    """CLIENT-CONFIRMED (2026-08-12). True when a loan's cycle contains at
+    least one NEGATIVE Payment Received posting and those postings offset to a
+    consolidated net of exactly $0.00.
+
+    This is the blind spot in the net-based reversal test. `reversal_equivalents`
+    is only ever set when the CONSOLIDATED payment is negative, so a reversal
+    that is exactly cancelled by an offsetting positive posting reads as an
+    ordinary no-payment cycle: same net ($0), same ladder result (+1 level),
+    no reversal marker. Confirmed on real June 2026 data — 33 recommendations,
+    every one a clean +X/-X pair (e.g. Lendistry 5519029100 [201.47, -201.47],
+    6010139100 [1263.51, -1263.51, 1214.03, -1214.03]).
+
+    The existence of an offsetting positive posting does not make a reversal
+    stop being a reversal, so these must be judged by a human exactly as a
+    net-negative reversal is.
+
+    A RAW FACT, not an eligibility judgment — corrections.py decides what to do
+    with it. Nothing here or anywhere else in this module's calculation logic
+    reads it back: STAT-01's calculated Delinquency Status is unchanged.
+
+    "Exactly $0" is judged at cent precision (the precision every figure in
+    this application is reported and compared at), so a pair that leaves
+    floating-point residue behind still qualifies."""
+    if not bool(consolidated_row.get("has_negative_posting")):
+        return False
+    received = pd.to_numeric(consolidated_row.get("received"), errors="coerce")
+    if pd.isna(received):
+        return False
+    return round(float(received), 2) == 0.00
+
 
 def _status_to_missed_count(status_str):
     """Parses a Delinquency Status label into a missed-payment count."""
@@ -2547,6 +2598,18 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             # reversal was involved), NOT by giving STAT-01 a different
             # calculated_dq than NEG-01 would show for the same loan/cycle.
             "reversal_equivalents": reversal_info["payment_equivalents_removed"] if reversal_info else None,
+            # CLIENT-CONFIRMED (2026-08-12): the offsetting-reversal companion
+            # to reversal_equivalents above. reversal_equivalents answers "did a
+            # NEGATIVE NET payment drive this cycle's figure"; this answers "was
+            # there a reversal at all, even one an offsetting positive posting
+            # cancelled out to exactly $0". The two are deliberately separate
+            # facts, not one merged flag: only the first means the deficiency
+            # formula ran, and corrections.py has to be able to tell them apart
+            # to state the right reason and to leave the BR-002 ratio displayed
+            # for a genuine $0 cycle. Raw facts only — neither is read by any
+            # calculation in this module.
+            "has_negative_posting": bool(row.get("has_negative_posting")),
+            "offsetting_zero_net_reversal": _is_offsetting_zero_net_reversal(row),
             # --- Read-only review evidence (NOT used in any calculation) ---
             # Exposed purely so the correction review page can show, per
             # recommendation, the prior recorded status and the BR-002
