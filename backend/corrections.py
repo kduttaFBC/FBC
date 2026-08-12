@@ -113,6 +113,115 @@ REVIEW_REASON_RESUME_CONTRADICTION = (
     "Requires explicit reviewer approval before anything is written."
 )
 
+# SUPERSEDED 2026-08-12 (the routing, NOT the rule). The reversal rule itself is
+# unchanged and still CLIENT-CONFIRMED (2026-08-03): a Delinquency Status driven
+# by a negative Payment Received is never automatically correctable. What changed
+# is how that is enforced. It used to be an eligibility-layer `continue`, which
+# did not merely block auto-correction -- it removed the loan from the
+# recommendation list, the session candidate set and therefore Human Review
+# entirely, so no reviewer could see the mismatch at all. Confirmed on Lendistry
+# 2025, July 2026, loan 5951029110: STAT-01 flagged DELINQUENCY STATUS MISMATCH
+# (reported 60 DAYS, calculated DELINQUENT off a consolidated net payment of
+# -$10.92) and the recommendation was silently dropped.
+#
+# It is now routed the way every other must-be-judged case in this module is
+# routed: review_required=True with the defect named, so the reviewer sees it and
+# decides. Nothing is auto-applied -- _apply_one_correction's reviewer_approved
+# gate is unchanged and still governs every write.
+REVIEW_REASON_REVERSAL = (
+    "This delinquency figure was driven by a REVERSAL — the consolidated net "
+    "Payment Received for this cycle is negative. It is calculated by the "
+    "client-confirmed deficiency formula (scheduled + |negative amount|, "
+    "measured in 80%-of-scheduled units), which deliberately excludes the "
+    "servicing fee, so the BR-002 payment-units ratio shown for ordinary "
+    "recommendations does not apply here and is not displayed. A reversal is "
+    "never automatically correctable: requires explicit reviewer approval "
+    "before anything is written."
+)
+
+# CLIENT-CONFIRMED (2026-08-12). The offsetting-reversal half of the same
+# 2026-08-03 rule. REVIEW_REASON_REVERSAL above is keyed on
+# reversal_equivalents, which is only ever set when the CONSOLIDATED payment is
+# negative. A reversal exactly cancelled by an offsetting positive posting nets
+# to $0.00 and was therefore treated as an ordinary no-payment cycle: eligible
+# for auto-correction, with no reversal reason shown to anyone. Measured on the
+# real June 2026 fixtures: 33 recommendations, every one a clean +X/-X pair.
+#
+# Deliberately its OWN text rather than reusing REVIEW_REASON_REVERSAL, because
+# the two are not the same fact and the reviewer must not be told something
+# untrue: the net here is $0.00, not negative, and the deficiency formula did
+# NOT run — the ordinary no-payment branch produced this figure. Keeping the
+# texts separate also leaves every existing single-reason reversal string
+# byte-identical.
+REVIEW_REASON_REVERSAL_OFFSET = (
+    "This cycle contains one or more REVERSED (negative) Payment Received "
+    "postings that are offset by positive postings to a consolidated net of "
+    "exactly $0.00. The delinquency figure was calculated by the ordinary "
+    "no-payment branch — the reversal deficiency formula did not run — but a "
+    "reversal cancelled out by an offsetting posting is still a reversal, and "
+    "the client-confirmed rule is that reversal-driven delinquency figures are "
+    "never automatically correctable: requires explicit reviewer approval "
+    "before anything is written."
+)
+
+# CLIENT-CONFIRMED (2026-08-12). BANKRUPTCY is valid for a reporting period when
+# the CURRENT period's Bankruptcy Date column contains a date. Before this,
+# a servicer reporting ACTIVE against a prior SOUP BANKRUPTCY produced a
+# LOAN STATUS MISMATCH that matched none of the three Loan Status branches below
+# and whose expected value (BANKRUPTCY) is deliberately absent from
+# _PROPOSABLE_LOAN_STATUS -- so no recommendation existed, the loan never
+# reached Human Review for that field, and no reviewer could act on it.
+# Confirmed on Lendistry 2025, July 2026, loans 7126119101, 5917099105,
+# 6288639102, 6649779105 and 6666709108.
+#
+# The gate is the CURRENT period's Bankruptcy Date, never soup_status: the client
+# was explicit that prior SOUP BANKRUPTCY alone must not support the proposal.
+# That is also exactly why _PROPOSABLE_LOAN_STATUS stays unchanged -- it is
+# shared with the terminal-contradiction branch, which proposes
+# expected_loan_status_effective (a SOUP carry-forward when no override applies),
+# so widening it would let BANKRUPTCY be proposed off prior SOUP alone. The
+# marker on the candidate is what carries the evidence to the write gate instead.
+REVIEW_REASON_BANKRUPTCY_CURRENT_PERIOD = (
+    "The servicer reports a non-BANKRUPTCY Loan Status, but this reporting "
+    "period's own Bankruptcy Date column is populated and the loan still carries "
+    "a positive Ending Balance. Under the client-confirmed rule, a populated "
+    "current-period Bankruptcy Date supports BANKRUPTCY for this period; prior "
+    "SOUP status alone does not and played no part in this recommendation. "
+    "Requires explicit reviewer approval before anything is written."
+)
+
+# CLIENT-CONFIRMED (2026-08-12): flag-and-propose, explicitly NOT suppress. A
+# Liquidation Date alongside a POSITIVE Ending Balance does not trigger the
+# client's zero-balance exception (that exception is keyed on Ending Balance =
+# $0), so the Bankruptcy Date still stands and the recommendation is still made.
+# But the row then carries three mutually inconsistent current-period signals --
+# a non-BANKRUPTCY reported status, a bankruptcy date, and a liquidation date on
+# a live balance -- and the client's instruction is that the reviewer sees that
+# contradiction prominently rather than having it silently resolved either way.
+# Suppressing the recommendation instead would put the loan straight back into
+# the invisible state this whole change exists to end.
+REVIEW_REASON_BANKRUPTCY_LIQUIDATION_CONTRADICTION = (
+    "CONTRADICTORY CURRENT-PERIOD EVIDENCE: this period also reports a "
+    "Liquidation Date, yet the Ending Balance is greater than $0 and the "
+    "reported Loan Status is neither LIQUIDATION nor PAID-IN-FULL. The client's "
+    "zero-balance exception does NOT apply here (it requires an Ending Balance "
+    "of $0), so the Bankruptcy Date still supports BANKRUPTCY -- but the "
+    "liquidation date and the live balance cannot both be right. Weigh both "
+    "before approving."
+)
+
+# CLIENT-CONFIRMED (2026-08-12): the marker-based write gate. Set on a candidate
+# ONLY by the current-period Bankruptcy Date branch, and the ONLY thing that lets
+# validate_approved_value accept BANKRUPTCY as a value this application
+# generated. Keyed on the marker rather than on the value so that BANKRUPTCY
+# remains ungeneratable everywhere else in this module -- adding it to
+# _PROPOSABLE_LOAN_STATUS would have widened all three other branches at once.
+#
+# Deliberately NOT trusted from client input: generate_reviewed_workbook reads it
+# off the SERVER-SIDE candidate held in the session, never off the decision
+# payload, so a caller cannot mint the marker to unlock a BANKRUPTCY write.
+CURRENT_PERIOD_EVIDENCE_MARKER = "current_period_bankruptcy_date"
+
 # SUPERSEDED 2026-08-08 (same day, later clarification). An earlier version of
 # this module carried _NEVER_WRITABLE_LOAN_STATUS = (LIQUIDATION, FORECLOSURE,
 # REO), refusing those values unconditionally at three layers. That conflated
@@ -270,6 +379,28 @@ def _is_terminal_loan_status(status_value):
     return any(k in s for k in _LOAN_STATUS_TERMINAL_KEYWORDS)
 
 
+def _is_bankruptcy_status(status_value):
+    """True when the servicer already reports the loan as BANKRUPTCY. Used only
+    to stop the current-period Bankruptcy Date branch from proposing a value
+    identical to the one already reported."""
+    return "BANKRUPTCY" in str(status_value or "").strip().upper()
+
+
+def _is_positive_balance(balance_value):
+    """True when Ending Balance is greater than $0 at CENT precision -- the
+    precision every figure in this application is reported and compared at, so a
+    balance that is zero to the cent is zero here even with floating-point
+    residue behind it.
+
+    A missing or unparseable balance is NOT positive. That is deliberate: this
+    guards a Loan Status proposal, and 'we could not read the balance' must never
+    be treated as 'the loan has money outstanding'."""
+    try:
+        return round(float(balance_value), 2) > 0.00
+    except (TypeError, ValueError):
+        return False
+
+
 # Loan Status values a reviewer may SELECT as an approved value. A value that
 # is actually a Delinquency Status is still rejected as cross-domain.
 # WIDENED 2026-08-08. Sourced from the SRF template's own "Reference Tables"
@@ -291,11 +422,16 @@ _PERMITTED_LOAN_STATUS = {
 }
 
 
-def validate_approved_value(field, value, substituted=True):
+def validate_approved_value(field, value, substituted=True, evidence_marker=None):
     """The approved-value domain restriction. A reviewer's substituted value
     must come only from the target field's own domain, so a substitution can
     never reintroduce a cross-domain value (the exact defect that flags a
     recommendation for review in the first place) or turn a loan terminal.
+
+    evidence_marker is the CANDIDATE's server-side marker (see
+    CURRENT_PERIOD_EVIDENCE_MARKER), never a client-supplied field. It widens the
+    GENERATED Loan Status domain by exactly one value, for exactly the
+    recommendation path that established the evidence for it.
 
     Returns (True, normalized_value) if the value is writable for this field,
     else (False, reason)."""
@@ -315,6 +451,18 @@ def validate_approved_value(field, value, substituted=True):
             # come from the narrow generated domain -- this is the layer that
             # keeps the application from ever proposing a terminal collection
             # status off its own bat.
+            # CLIENT-CONFIRMED (2026-08-12): the marker-based exception, checked
+            # BEFORE the general domain so BANKRUPTCY can be written through the
+            # current-period Bankruptcy Date path and nowhere else. Keyed on the
+            # marker AND the value together: the marker does not unlock the whole
+            # Loan Status domain, and BANKRUPTCY stays ungeneratable without it.
+            #
+            # This is why _PROPOSABLE_LOAN_STATUS was not widened. That set is
+            # shared with the terminal-contradiction branch, whose proposal is a
+            # SOUP carry-forward -- adding BANKRUPTCY there would have let it be
+            # generated from prior SOUP alone, which the client ruled out.
+            if evidence_marker == CURRENT_PERIOD_EVIDENCE_MARKER and v == "BANKRUPTCY":
+                return True, "BANKRUPTCY"
             canonical = _canonical_proposable_loan_status(v)
             if canonical is None:
                 return False, (
@@ -518,14 +666,40 @@ def build_eligible_corrections(correction_data):
         # (deliberately vaguer) calculated_dq than NEG-01 shows, which would
         # violate the "the two checks must never diverge" principle this
         # whole shared-calculation design exists to protect.
-        if c.get("reversal_equivalents") is not None:
-            continue
+        #
+        # ROUTING CORRECTED 2026-08-12 (see REVIEW_REASON_REVERSAL): "requires
+        # manual review" is now implemented as review_required on the
+        # Delinquency Status recommendation, not as a `continue` that deleted
+        # the loan from Human Review altogether. The scope of the block is
+        # unchanged for LOAN STATUS — see the guard below the DQ branch.
+        # WIDENED 2026-08-12 (see REVIEW_REASON_REVERSAL_OFFSET): the rule's
+        # SCOPE is unchanged — reversal-driven delinquency figures require
+        # human review — but the test for "is this a reversal" no longer relies
+        # on the consolidated net being negative, which a +X/-X pair defeats.
+        # The two facts stay separate so the right reason can be stated and so
+        # only a genuine net-negative reversal suppresses the BR-002 ratio.
+        _reversal_net_negative = c.get("reversal_equivalents") is not None
+        _reversal_offset = (
+            bool(c.get("offsetting_zero_net_reversal")) and not _reversal_net_negative
+        )
+        _reversal = _reversal_net_negative or _reversal_offset
 
         gp = c.get("gp")
         excel_rows, skipped_row_refs = _clean_excel_rows(c.get("excel_rows"))
 
+        # Which fields this loan has already had a recommendation emitted for.
+        # _recommendation_id is (servicer, gp, field), so two recommendations for
+        # the same loan/field would share one id and generate_reviewed_workbook's
+        # `by_id` dict would silently keep only the last -- a reviewer's decision
+        # applying to a recommendation they were not shown. The Loan Status
+        # branches below are ordered by precedence, and this is what makes the
+        # first match win instead of the last.
+        _emitted_fields = set()
+
         def _emit(field, corrected_value, eligibility_rule,
-                  review_required=False, review_reason=None):
+                  review_required=False, review_reason=None,
+                  evidence_marker=None):
+            _emitted_fields.add(field)
             eligible.append({
                 "gp": gp,
                 "excel_rows": excel_rows,
@@ -555,6 +729,28 @@ def build_eligible_corrections(correction_data):
                 "payment_received": c.get("payment_received"),
                 "scheduled_payment": c.get("scheduled_payment"),
                 "servicing_fee": c.get("servicing_fee"),
+                # Passed through so the review page can tell a reversal row from
+                # an ordinary one. The review page's BR-002 payment-units ratio
+                # ((received + fee) / scheduled) is NOT the arithmetic that
+                # produced calculated_dq for these rows -- the reversal branch of
+                # checks._apply_payment_transition excludes the fee by design --
+                # so this is the flag that suppresses that figure rather than
+                # showing a reviewer a number that did not drive the result.
+                # Display/branching only; never an input to eligibility.
+                "reversal_equivalents": c.get("reversal_equivalents"),
+                # The offsetting-reversal companion. Deliberately the COMPUTED
+                # _reversal_offset, not the raw fact: the two reversal kinds are
+                # mutually exclusive, and this must agree with which review
+                # reason was actually stated. Display/branching only, never an
+                # input to eligibility.
+                #
+                # Note what this does NOT do: it does not suppress the review
+                # page's BR-002 ratio the way reversal_equivalents does. For an
+                # offsetting reversal the net IS $0.00 and the ordinary
+                # no-payment branch DID produce the figure, so the ratio is the
+                # arithmetic that ran and stays on screen. This flag only adds
+                # the fact that reversed postings are hidden inside that $0.00.
+                "offsetting_zero_net_reversal": _reversal_offset,
                 # The shared deferral-evidence contract (checks.
                 # DEFERRAL_EVIDENCE_STATUSES). Passed through verbatim and
                 # NEVER recomputed here: STAT-01 is the only place that
@@ -575,6 +771,19 @@ def build_eligible_corrections(correction_data):
                 "prior_loan_status": c.get("soup_status"),
                 "balance": c.get("ending_balance"),
                 "posting_count": c.get("posting_count"),
+                # CLIENT-CONFIRMED (2026-08-12): the current-period evidence
+                # marker. None on every recommendation except one produced by the
+                # Bankruptcy Date branch below. This is what validate_approved_
+                # value checks to allow BANKRUPTCY as a generated value, so it is
+                # a WRITE GATE, not display -- see CURRENT_PERIOD_EVIDENCE_MARKER.
+                "evidence_marker": evidence_marker,
+                # Read-only current-period evidence, passed straight through from
+                # STAT-01. Display only on the review page; the eligibility
+                # decision was already made below and is never re-derived from
+                # these on the client side.
+                "bankruptcy_date": c.get("bankruptcy_date"),
+                "paid_in_full_date": c.get("paid_in_full_date"),
+                "liquidation_date": c.get("liquidation_date"),
             })
 
         # --- Delinquency Status -------------------------------------------------
@@ -589,16 +798,45 @@ def build_eligible_corrections(correction_data):
             # figure was calculated by the same normal ladder as every other
             # loan, and the servicer's reported DQ played no part in it.
             _terminal = _is_collection_status(c.get("srf_status"))
+            # Accumulated rather than an if/elif chain: a loan can carry more
+            # than one of these at once (a reversal on a loan the servicer also
+            # reports as FORECLOSURE), and a reviewer must see every reason it
+            # needs judging, not just the first. With exactly one reason present
+            # the joined string is that reason verbatim, so the single-reason
+            # cases keep the exact text they have always had.
+            _review_reasons = []
+            if _cross_domain:
+                _review_reasons.append(REVIEW_REASON_CROSS_DOMAIN)
+            if _terminal:
+                _review_reasons.append(REVIEW_REASON_TERMINAL_STATUS)
+            # Mutually exclusive by construction: a loan is either a
+            # net-negative reversal (the deficiency formula ran) or an
+            # offsetting zero-net one (it did not). Never both, so an existing
+            # net-negative reversal keeps its exact original wording.
+            if _reversal_net_negative:
+                _review_reasons.append(REVIEW_REASON_REVERSAL)
+            elif _reversal_offset:
+                _review_reasons.append(REVIEW_REASON_REVERSAL_OFFSET)
             _emit(
                 "Delinquency Status",
                 str(c["calculated_dq"]).strip().upper(),
                 "STAT-01 deterministic calculation",
-                review_required=_cross_domain or _terminal,
-                review_reason=(
-                    REVIEW_REASON_CROSS_DOMAIN if _cross_domain
-                    else REVIEW_REASON_TERMINAL_STATUS if _terminal else None
-                ),
+                review_required=bool(_review_reasons),
+                review_reason=" ".join(_review_reasons) or None,
             )
+
+        # A reversal blocks the LOAN STATUS branches below exactly as the old
+        # eligibility-layer `continue` did — that half of the 2026-08-03 rule is
+        # deliberately unchanged. Only the Delinquency Status recommendation
+        # above is newly routed to review; nothing here is widened. An
+        # offsetting zero-net reversal (2026-08-12) reaches this block on the
+        # same footing as a net-negative one: the whole point of that change is
+        # that the two are the same kind of case, so treating them differently
+        # HERE would reintroduce the hole one layer down. Placed after
+        # the DQ branch and before the three Loan Status branches so the scope of
+        # the block is visible in one line rather than repeated three times.
+        if _reversal:
+            continue
 
         # --- Loan Status -> DEFERRED (confirmed Full P&I only, v1) --------------
         # expected_loan_status_raw == "DEFERRED" only ever gets set by a
@@ -728,6 +966,88 @@ def build_eligible_corrections(correction_data):
                 review_reason=REVIEW_REASON_RESUME_CONTRADICTION,
             )
 
+        # --- Loan Status: BANKRUPTCY supported by a current-period Bankruptcy
+        # --- Date (2026-08-12) ------------------------------------------------
+        # SEPARATE from the three branches above, all of which are untouched.
+        # Scoped to one situation: the servicer reports something other than
+        # BANKRUPTCY, and THIS reporting period's own Bankruptcy Date column is
+        # populated on a loan that still has money outstanding.
+        #
+        # Reached only after the `if _reversal: continue` above, so reversal
+        # precedence is preserved for free rather than restated here -- a
+        # reversal-driven loan gets its Delinquency Status routed to review and
+        # no Loan Status recommendation at all, exactly as before.
+        #
+        # Cannot collide with the three branches above. The "-> DEFERRED" branch
+        # requires expected_loan_status_raw == "DEFERRED" (null on these loans);
+        # the terminal branch requires _is_collection_status(srf_status), which is
+        # excluded here by construction (rule 3 below rejects LIQUIDATION, and a
+        # FORECLOSURE/REO loan is left to that branch and its own SOUP-derived
+        # proposal); the resume branch requires deferral_phase == "resume" and a
+        # DEFERRED reported status.
+        #
+        # The four gates, in the client's own terms:
+        #   1. This period's Bankruptcy Date CONTAINS a date. A presence test on
+        #      the raw cell, decided once in checks.py -- never a date parse, since
+        #      the column is genuinely mixed-typed in real files.
+        #   2. Ending Balance > $0, at cent precision (the precision every figure
+        #      in this application is compared at).
+        #   3. THE ZERO-BALANCE EXCEPTION. Preserved as the client stated it: when
+        #      the balance is $0 because the loan is PAID IN FULL or LIQUIDATION,
+        #      the Bankruptcy Date is ignored for this rule. Gate 2 already
+        #      excludes every $0 balance, so this is the belt-and-braces half --
+        #      it also refuses a PAID-IN-FULL / LIQUIDATION loan that reports a
+        #      POSITIVE balance, which gate 2 would otherwise let through and
+        #      which must never be re-proposed as BANKRUPTCY. Checked against the
+        #      reported status AND the Paid-In-Full Date column, since either one
+        #      alone is enough to say the loan is finished.
+        #   4. The servicer does not already say BANKRUPTCY. Without this the
+        #      module would propose a value identical to the reported one for
+        #      every consistent bankruptcy loan in the file.
+        #
+        # soup_status is deliberately absent from every gate. The client was
+        # explicit that prior SOUP BANKRUPTCY must not on its own support this
+        # proposal, so it is not merely insufficient here -- it is not consulted.
+        # A loan whose SOUP history says BANKRUPTCY but whose current Bankruptcy
+        # Date is blank produces no recommendation from this branch.
+        #
+        # ALWAYS review_required -- a recommendation, never an automatic write.
+        _bankruptcy_dated = bool(c.get("bankruptcy_date_populated"))
+        _balance_outstanding = _is_positive_balance(c.get("ending_balance"))
+        _finished_loan = (
+            bool(c.get("paid_in_full_date_populated"))
+            or _is_terminal_loan_status(c.get("srf_status"))
+        )
+        if (
+            "LOAN STATUS MISMATCH" in reasons
+            # LAST of the four Loan Status branches, so any of the three above
+            # takes precedence. A confirmed full-P&I deferral with a stray
+            # Bankruptcy Date is the real overlap: both branches' gates can hold
+            # at once, and without this the loan would carry two contradictory
+            # Loan Status recommendations sharing one id.
+            and "Loan Status" not in _emitted_fields
+            and _bankruptcy_dated
+            and _balance_outstanding
+            and not _finished_loan
+            and not _is_bankruptcy_status(c.get("srf_status"))
+        ):
+            # Flag-and-propose, never suppress (see
+            # REVIEW_REASON_BANKRUPTCY_LIQUIDATION_CONTRADICTION). Accumulated the
+            # same way the Delinquency Status reasons are, so a loan carrying both
+            # facts shows both; with only the first present the joined string is
+            # that reason verbatim.
+            _bk_reasons = [REVIEW_REASON_BANKRUPTCY_CURRENT_PERIOD]
+            if bool(c.get("liquidation_date_populated")):
+                _bk_reasons.append(REVIEW_REASON_BANKRUPTCY_LIQUIDATION_CONTRADICTION)
+            _emit(
+                "Loan Status",
+                "BANKRUPTCY",
+                "Current-period Bankruptcy Date populated with a positive Ending Balance",
+                review_required=True,
+                review_reason=" ".join(_bk_reasons),
+                evidence_marker=CURRENT_PERIOD_EVIDENCE_MARKER,
+            )
+
     return eligible
 
 
@@ -804,6 +1124,15 @@ def build_recommendations(stat01_result, servicer):
             "paymentReceived": e.get("payment_received"),
             "scheduledPayment": e.get("scheduled_payment"),
             "servicingFee": e.get("servicing_fee"),
+            # Non-null ONLY on a reversal row (the count of scheduled-payment
+            # equivalents the negative amount represents). The review page reads
+            # this to suppress its BR-002 payment-units ratio, which is not the
+            # arithmetic that produced `calculated` for these rows.
+            "reversalEquivalents": e.get("reversal_equivalents"),
+            # True ONLY on an offsetting zero-net reversal. The review page reads
+            # this to say so beside the $0.00, which would otherwise be
+            # indistinguishable from a genuine no-payment cycle.
+            "offsettingZeroNetReversal": bool(e.get("offsetting_zero_net_reversal")),
             "balance": e.get("balance"),
             "reviewFlag": e.get("review_reason") if e.get("review_required") else None,
             "rule": e.get("eligibility_rule"),
@@ -817,6 +1146,18 @@ def build_recommendations(stat01_result, servicer):
             "memoSecuritizationAction": e.get("securitization_action"),
             "servicerLoanStatus": e.get("servicer_loan_status"),
             "priorLoanStatus": e.get("prior_loan_status"),
+            # CLIENT-CONFIRMED (2026-08-12): current-period terminal-event
+            # evidence, carried so the review page can show the reviewer the
+            # Bankruptcy Date this recommendation rests on -- and, for a
+            # contradicted row, the Liquidation Date and positive balance beside
+            # it. Display only; the eligibility decision was made server-side and
+            # the review page never re-derives it. The evidence_marker itself is
+            # deliberately NOT exposed: it is a write gate read off the session
+            # candidate, and echoing it to the client would invite it back as
+            # client input.
+            "bankruptcyDate": e.get("bankruptcy_date"),
+            "paidInFullDate": e.get("paid_in_full_date"),
+            "liquidationDate": e.get("liquidation_date"),
         })
 
     return recommendations, candidates, skipped
@@ -1196,7 +1537,13 @@ def generate_reviewed_workbook(
         # reviewer may substitute, but only from the field's own domain.
         substituted = d.get("approved_value") not in (None, "")
         approved_input = d.get("approved_value") if substituted else calculated
-        ok, result = validate_approved_value(field, approved_input, substituted=substituted)
+        # evidence_marker comes off the SERVER-SIDE candidate (main.py stashes
+        # these in the session), never off `d` — a caller cannot mint the marker
+        # in a decision payload to unlock a BANKRUPTCY write.
+        ok, result = validate_approved_value(
+            field, approved_input, substituted=substituted,
+            evidence_marker=cand.get("evidence_marker"),
+        )
         if not ok:
             # A substitution outside the field's domain is refused here — it
             # can never reintroduce a cross-domain value or a terminal status.

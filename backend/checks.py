@@ -134,6 +134,38 @@ def _is_blank_value(value):
     return pd.isna(value) or str(value).strip() == ""
 
 
+# CLIENT-CONFIRMED (2026-08-12): the current-period terminal-event date columns
+# whose PRESENCE corrections.py routes Loan Status eligibility on. Mapped to the
+# consolidated key each becomes. The SRF template spells Paid-In-Full Date with
+# hyphens; the reader preserves the workbook's own spelling, so these must match
+# it exactly — a typo here yields a silently absent fact, not an error.
+_TERMINAL_EVENT_DATE_COLUMNS = {
+    "Bankruptcy Date": "bankruptcy_date",
+    "Paid-In-Full Date": "paid_in_full_date",
+    "Liquidation Date": "liquidation_date",
+}
+
+
+def _cycle_terminal_event_dates(group):
+    """Returns {"<key>": display_string, "<key>_populated": bool} for each
+    terminal-event date column, judged across EVERY posting in the cycle.
+
+    A PRESENCE test, deliberately not a date parse — see the call site in
+    consolidate_cycle_postings for why. Raw facts only: nothing in this module's
+    calculation logic reads the result back."""
+    out = {}
+    for column, key in _TERMINAL_EVENT_DATE_COLUMNS.items():
+        display = ""
+        if column in group.columns:
+            for value in group[column]:
+                if not _is_blank_value(value):
+                    display = str(value).strip()
+                    break
+        out[key] = display
+        out[f"{key}_populated"] = bool(display)
+    return out
+
+
 def consolidate_cycle_postings(servicer_inputs_df):
     """Returns one consolidated cycle record per SBA GP Number:
       posting_count, loan_status, dq_status (both from the LAST chronological
@@ -267,6 +299,52 @@ def consolidate_cycle_postings(servicer_inputs_df):
             "loan_status": effective_last.get("Loan Status", ""),
             "dq_status": effective_last.get("Delinquency Status", ""),
             "received": group["Payment Received"].sum(min_count=1) if "Payment Received" in group.columns else None,
+            # Purely ADDITIVE raw fact (2026-08-12): did ANY posting in this
+            # cycle carry a negative Payment Received? `received` above is the
+            # NET across postings and cannot answer this — a +X/-X pair nets to
+            # exactly $0 and is indistinguishable from a genuine no-payment
+            # cycle by the net alone. Recorded here because this is the one
+            # place that already sees every posting for the loan; deriving it
+            # anywhere else would be the independent re-implementation this
+            # shared consolidation exists to prevent.
+            #
+            # NOT an input to any calculation. Nothing in the delinquency
+            # ladder, payment-sufficiency/BR-002, or the reversal deficiency
+            # formula reads it — STAT-01's calculated value is byte-for-byte
+            # unchanged by its presence. It exists so corrections.py can route
+            # eligibility, which is that module's job, not this one's.
+            "has_negative_posting": (
+                bool((pd.to_numeric(group["Payment Received"], errors="coerce") < 0).any())
+                if "Payment Received" in group.columns else False
+            ),
+            # CLIENT-CONFIRMED (2026-08-12). Purely ADDITIVE raw facts, the same
+            # kind and for the same reason as has_negative_posting above: the
+            # current cycle's own terminal-event dates, recorded here because
+            # this is the one place that already sees every posting for the loan.
+            #
+            # Carried as (bool populated, display string) pairs rather than as
+            # parsed dates. The columns are genuinely mixed-typed in real files —
+            # Bankruptcy Date arrives as a datetime.date while Liquidation Date
+            # arrives as the string "06/29/2026" — so the client's rule ("the
+            # column CONTAINS a date") is a PRESENCE test. Parsing would invent a
+            # second, stricter rule and would silently drop an unparseable-but-
+            # populated cell, which is the opposite of the intended reading.
+            #
+            # Presence is `any posting in the cycle`, matching has_negative_
+            # posting: a reversal pair or an incomplete final posting can leave
+            # the date on one row and blank on another, and the loan does not
+            # stop having a bankruptcy date because the last row omitted it.
+            # The display string comes from the FIRST posting that actually
+            # carries a value, so the reviewer is shown a real date rather than
+            # whichever row happened to be last.
+            #
+            # NOT inputs to any calculation. Nothing in the delinquency ladder,
+            # payment-sufficiency/BR-002, the reversal deficiency formula, or
+            # expected_loan_status reads them — STAT-01's calculated Loan Status
+            # and Delinquency Status are byte-for-byte unchanged by their
+            # presence. They exist so corrections.py can route eligibility,
+            # which is that module's job, not this one's.
+            **_cycle_terminal_event_dates(group),
             "servicing_fee": group["Servicing Fee"].sum(min_count=1) if "Servicing Fee" in group.columns else None,
             "principal": group["Principal"].sum(min_count=1) if "Principal" in group.columns else None,
             "net_interest": group["Net Interest"].sum(min_count=1) if "Net Interest" in group.columns else None,
@@ -310,7 +388,11 @@ def consolidate_cycle_postings(servicer_inputs_df):
         })
 
     return pd.DataFrame(rows).set_index("SBA GP Number") if rows else pd.DataFrame(
-        columns=["posting_count", "loan_status", "dq_status", "received", "servicing_fee", "principal", "net_interest",
+        columns=["posting_count", "loan_status", "dq_status", "received", "has_negative_posting",
+                 "bankruptcy_date", "bankruptcy_date_populated",
+                 "paid_in_full_date", "paid_in_full_date_populated",
+                 "liquidation_date", "liquidation_date_populated",
+                 "servicing_fee", "principal", "net_interest",
                  "scheduled", "scheduled_ambiguous", "scheduled_payment_updated_during_cycle",
                  "scheduled_distinct_values", "beginning_balance",
                  "ending_balance", "interest_from", "interest_to", "lender_loan_number",
@@ -826,6 +908,38 @@ def liquidation_balance_check(servicer_inputs_df, closed_at_zero=None):
 # operationalizes it. A partial payment below 80% IS treated as delinquent;
 # one at or above 80% counts as that installment paid.
 # ---------------------------------------------------------------------------
+
+def _is_offsetting_zero_net_reversal(consolidated_row):
+    """CLIENT-CONFIRMED (2026-08-12). True when a loan's cycle contains at
+    least one NEGATIVE Payment Received posting and those postings offset to a
+    consolidated net of exactly $0.00.
+
+    This is the blind spot in the net-based reversal test. `reversal_equivalents`
+    is only ever set when the CONSOLIDATED payment is negative, so a reversal
+    that is exactly cancelled by an offsetting positive posting reads as an
+    ordinary no-payment cycle: same net ($0), same ladder result (+1 level),
+    no reversal marker. Confirmed on real June 2026 data — 33 recommendations,
+    every one a clean +X/-X pair (e.g. Lendistry 5519029100 [201.47, -201.47],
+    6010139100 [1263.51, -1263.51, 1214.03, -1214.03]).
+
+    The existence of an offsetting positive posting does not make a reversal
+    stop being a reversal, so these must be judged by a human exactly as a
+    net-negative reversal is.
+
+    A RAW FACT, not an eligibility judgment — corrections.py decides what to do
+    with it. Nothing here or anywhere else in this module's calculation logic
+    reads it back: STAT-01's calculated Delinquency Status is unchanged.
+
+    "Exactly $0" is judged at cent precision (the precision every figure in
+    this application is reported and compared at), so a pair that leaves
+    floating-point residue behind still qualifies."""
+    if not bool(consolidated_row.get("has_negative_posting")):
+        return False
+    received = pd.to_numeric(consolidated_row.get("received"), errors="coerce")
+    if pd.isna(received):
+        return False
+    return round(float(received), 2) == 0.00
+
 
 def _status_to_missed_count(status_str):
     """Parses a Delinquency Status label into a missed-payment count."""
@@ -2547,6 +2661,37 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             # reversal was involved), NOT by giving STAT-01 a different
             # calculated_dq than NEG-01 would show for the same loan/cycle.
             "reversal_equivalents": reversal_info["payment_equivalents_removed"] if reversal_info else None,
+            # CLIENT-CONFIRMED (2026-08-12): the offsetting-reversal companion
+            # to reversal_equivalents above. reversal_equivalents answers "did a
+            # NEGATIVE NET payment drive this cycle's figure"; this answers "was
+            # there a reversal at all, even one an offsetting positive posting
+            # cancelled out to exactly $0". The two are deliberately separate
+            # facts, not one merged flag: only the first means the deficiency
+            # formula ran, and corrections.py has to be able to tell them apart
+            # to state the right reason and to leave the BR-002 ratio displayed
+            # for a genuine $0 cycle. Raw facts only — neither is read by any
+            # calculation in this module.
+            "has_negative_posting": bool(row.get("has_negative_posting")),
+            "offsetting_zero_net_reversal": _is_offsetting_zero_net_reversal(row),
+            # CLIENT-CONFIRMED (2026-08-12): the CURRENT PERIOD's own
+            # terminal-event dates, passed through verbatim from
+            # consolidate_cycle_postings. corrections.py routes Loan Status
+            # eligibility on bankruptcy_date_populated so that a BANKRUPTCY
+            # recommendation rests on this cycle's evidence rather than on
+            # soup_status, which is a carry-forward and is explicitly NOT
+            # sufficient on its own. paid_in_full/liquidation carry the client's
+            # zero-balance exception and the contradictory-evidence flag.
+            #
+            # Raw facts only. expected_loan_status, effective_expected_loan_
+            # status, status_match and every delinquency figure above are
+            # computed without reading any of these, and are unchanged by their
+            # presence. Never feed one back into a calculation here.
+            "bankruptcy_date": row.get("bankruptcy_date") or "",
+            "bankruptcy_date_populated": bool(row.get("bankruptcy_date_populated")),
+            "paid_in_full_date": row.get("paid_in_full_date") or "",
+            "paid_in_full_date_populated": bool(row.get("paid_in_full_date_populated")),
+            "liquidation_date": row.get("liquidation_date") or "",
+            "liquidation_date_populated": bool(row.get("liquidation_date_populated")),
             # --- Read-only review evidence (NOT used in any calculation) ---
             # Exposed purely so the correction review page can show, per
             # recommendation, the prior recorded status and the BR-002
