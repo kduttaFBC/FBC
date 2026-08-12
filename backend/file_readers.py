@@ -414,6 +414,63 @@ def extract_deal_from_note_series(wb):
     return None
 
 
+def extract_note_series_label(wb):
+    """The RAW "► Note Series:" cell text, e.g. "2025 FBC-1".
+
+    extract_deal_from_note_series reads the same cell but converts it to
+    SOUP's Deal-column convention ("SOUP2025_1"), which is what POP-01 and the
+    Portfolio Summary grouping need. The Monthly Servicer Report has to print
+    the note series exactly as the servicer stated it, so this returns the
+    original string instead. Deliberately a SEPARATE function rather than a
+    second return value: extract_deal_from_note_series has three callers and a
+    tested contract, and nothing here should change what "deal" means.
+
+    Returns None when the cell is absent or blank -- callers must surface that
+    as a validation issue rather than inventing a label. Verified against all
+    eight June files: every one states a note series, uniform within each deal
+    ("2024 FBC-1" for the five 2024 servicers, "2025 FBC-1" for the three
+    2025 ones)."""
+    try:
+        sheet = wb.get_sheet_by_name("Servicer Inputs")
+    except Exception:
+        return None
+    for row in sheet.to_python()[:8]:
+        for i, cell in enumerate(row):
+            if cell and "note series" in str(cell).lower() and i + 1 < len(row):
+                raw = row[i + 1]
+                text = str(raw).strip() if raw is not None else ""
+                return text or None
+    return None
+
+
+def read_note_series_label(file_bytes):
+    """extract_note_series_label straight off raw SRF bytes."""
+    try:
+        return extract_note_series_label(_load_workbook(file_bytes))
+    except Exception:
+        return None
+
+
+def read_remittance_date(file_bytes):
+    """The RAW "► Remittance Date:" cell from the Servicer Inputs header block.
+
+    The Monthly Servicer Report prints this as its own Remittance Date. Every
+    June file states 2026-07-23, matching the client's reference workbook
+    exactly. Returns a pandas Timestamp, or None when absent or unparseable --
+    never a guess."""
+    try:
+        wb = _load_workbook(file_bytes)
+        sheet = wb.get_sheet_by_name("Servicer Inputs")
+    except Exception:
+        return None
+    for row in sheet.to_python()[:8]:
+        for i, cell in enumerate(row):
+            if cell and "remittance date" in str(cell).lower() and i + 1 < len(row):
+                value = pd.to_datetime(str(row[i + 1]).strip(), errors="coerce")
+                return None if pd.isna(value) else value
+    return None
+
+
 def normalize_id_series(series):
     """Normalizes an ID column to clean strings — SBA GP Numbers load as
     floats when any row in the column is blank, which turns '1261949109'
