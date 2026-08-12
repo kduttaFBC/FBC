@@ -37,6 +37,7 @@ import file_readers
 import corrections as corrections_mod
 import preflight as preflight_mod
 import memo_audit as memo_audit_mod
+import monthly_servicer_report as msr_mod
 
 
 load_dotenv(override=False)
@@ -911,6 +912,9 @@ async def corrections_review(payload: dict):
         portfolio_summary_final_counts = []
         portfolio_summary_final_deals = []
         final_cycle_months = set()
+        # {deal: [servicer payload, ...]} in upload order, for the Monthly
+        # Servicer Reports -- one workbook per SOUP deal, never combined.
+        msr_servicers_by_deal = {}
         for servicer, entry in correction_state.items():
             try:
                 # The 5th return value is this file's own SOUP deal, parsed
@@ -920,7 +924,7 @@ async def corrections_review(payload: dict):
                 # discarded) so the Final Audited Portfolio Summary can total
                 # per SOUP deal. Nothing is inferred from the filename and no
                 # servicer name is hardcoded.
-                _, _, _, servicer_inputs_df, deal = file_readers.read_servicer_file(
+                soup_key, _, _, servicer_inputs_df, deal = file_readers.read_servicer_file(
                     entry["original_bytes"], filename=entry.get("original_filename"),
                 )
             except Exception:
@@ -944,6 +948,36 @@ async def corrections_review(payload: dict):
             portfolio_summary_final_deals.append(deal)
             if entry.get("cycle_month") is not None:
                 final_cycle_months.add(entry["cycle_month"])
+
+            # CLIENT-CONFIRMED (2026-08-11): the Monthly Servicer Report is a
+            # CONSOLIDATION of this same verified layer -- the lender's own
+            # values plus the overrides that were actually written into the
+            # corrected workbook, minus the closed-at-zero suppressions -- so
+            # it reconciles with the Final Audited Portfolio Summary by
+            # construction rather than by a second derivation. Deliberately
+            # built from verified_overrides rather than by re-reading the
+            # corrected workbook bytes: that artifact is exactly what
+            # preflight.py blocks from re-ingestion (no value cache), so
+            # parsing it back would be fragile in the way that control exists
+            # to prevent.
+            #
+            # servicer_name is the soup_key, which is what the client's
+            # workbook carries in Lender/Servicer Name and what its Remittance
+            # SUMIFS matches on -- never the SRF's own "Servicer:" cell.
+            servicer_issues = []
+            msr_servicers_by_deal.setdefault(deal, []).append({
+                "servicer_name": soup_key,
+                "display_label": servicer,
+                "rows": msr_mod.build_servicer_rows(
+                    servicer_inputs_df, soup_key,
+                    verified_overrides=verified_overrides_by_servicer.get(servicer) or {},
+                    excluded_gps=entry.get("excluded_gps") or [],
+                    issues=servicer_issues,
+                ),
+                "issues": servicer_issues,
+                "note_series": file_readers.read_note_series_label(entry["original_bytes"]),
+                "remittance_date": file_readers.read_remittance_date(entry["original_bytes"]),
+            })
 
         portfolio_summary_final_b64 = None
         portfolio_summary_final_filename_value = None
@@ -977,8 +1011,39 @@ async def corrections_review(payload: dict):
                 final_cycle_month, label="Final_Audited"
             )
 
+        # CLIENT-CONFIRMED (2026-08-11): ONE Monthly Servicer Report per SOUP
+        # deal, 2024 first then 2025, never combined -- a 2024-deal and a
+        # 2025-deal servicer belong to different securitizations. Sorted by
+        # checks._deal_sort_key, the same ordering the Final Audited Portfolio
+        # Summary's deal blocks already use, so the download sequence and the
+        # summary read in the same order.
+        #
+        # Generated ONLY here, after Human Review. There is no path to a
+        # Monthly Servicer Report from /api/audit.
+        monthly_servicer_reports = []
+        msr_validation_issues = []
+        msr_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
+        for deal in sorted(msr_servicers_by_deal, key=checks_mod._deal_sort_key):
+            deal_report = msr_mod.build_deal_report(deal, msr_servicers_by_deal[deal])
+            msr_validation_issues.extend(deal_report["validation_issues"])
+            if not deal_report["rows"]:
+                continue
+            msr_buffer = io.BytesIO()
+            msr_mod.generate_monthly_servicer_report_bytes(deal_report, msr_buffer)
+            monthly_servicer_reports.append({
+                "deal": deal,
+                "note_series": deal_report["note_series"],
+                "loan_count": len(deal_report["rows"]),
+                "servicers": deal_report["remittance_servicers"],
+                "filename": msr_mod.monthly_servicer_report_filename(
+                    deal, deal_report["note_series"], msr_cycle_month),
+                "file_b64": base64.b64encode(msr_buffer.getvalue()).decode("utf-8"),
+            })
+
         return JSONResponse({
             "corrected_workbooks": corrected_workbooks,
+            "monthly_servicer_reports": monthly_servicer_reports,
+            "monthly_servicer_report_validation_issues": msr_validation_issues,
             "portfolio_summary_final_b64": portfolio_summary_final_b64,
             "portfolio_summary_final_filename": portfolio_summary_final_filename_value,
             "summary": {

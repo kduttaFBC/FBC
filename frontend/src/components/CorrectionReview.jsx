@@ -442,6 +442,48 @@ export default function CorrectionReview({ recommendations, sessionId }) {
               (what the lender reported, on the results screen) and the
               Audited Portfolio Summary (what the audit calculated, downloaded
               from the results screen before review). */}
+          {/* Monthly Servicer Reports — one workbook per SOUP deal, 2024 then
+              2025, never combined. Consolidation of the same reviewer-approved
+              data the corrected workbooks carry; no figure is recalculated
+              here. Ordered between the corrected workbooks and the Final
+              Audited Portfolio Summary, matching the client's stated
+              post-review sequence. */}
+          {(result.monthly_servicer_reports || []).map((report) => (
+            <div
+              key={report.deal || report.filename}
+              className="map-row"
+              style={{ gridTemplateColumns: '1.4fr 1fr', marginTop: 10 }}
+            >
+              <div className="field-name">
+                {report.note_series ? `${report.note_series} ` : ''}Monthly Servicer Report
+                <div className="hint" style={{ marginTop: 2 }}>
+                  {report.loan_count} loans · {(report.servicers || []).join(', ')}
+                </div>
+              </div>
+              <button
+                className="btn btn-teal"
+                onClick={() =>
+                  downloadBase64File(
+                    report.file_b64,
+                    report.filename || 'Monthly_Servicer_Report.xlsx'
+                  )
+                }
+              >
+                Download Monthly Servicer Report
+              </button>
+            </div>
+          ))}
+          {(result.monthly_servicer_report_validation_issues || []).length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <strong>Monthly Servicer Report — needs your attention</strong>
+              {result.monthly_servicer_report_validation_issues.map((issue, i) => (
+                <div key={i} className="hint">
+                  {issue.field ? `${issue.field}: ` : ''}
+                  {issue.message}
+                </div>
+              ))}
+            </div>
+          )}
           {result.portfolio_summary_final_b64 && (
             <div className="map-row" style={{ gridTemplateColumns: '1.4fr 1fr', marginTop: 10 }}>
               <div className="field-name">
