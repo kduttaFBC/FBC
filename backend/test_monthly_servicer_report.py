@@ -475,7 +475,8 @@ class SubtotalTests(unittest.TestCase):
     def test_the_last_data_row_is_inside_the_subtotal_range(self):
         ws, report = self._sheet(9)
         last = 8 + len(report["rows"])
-        self.assertEqual(ws.cell(row=last, column=1).value, "9")
+        # GP cells are numeric so SUBTOTAL(2) can count them.
+        self.assertEqual(ws.cell(row=last, column=1).value, 9)
         self.assertIn(f"A9:A{last}", ws["A7"].value)
 
 
@@ -671,9 +672,10 @@ class BoundaryTests(unittest.TestCase):
         self.assertNotIn("import report", source)
 
     def test_the_only_checks_helpers_used_are_the_shared_ones(self):
-        source = inspect.getsource(msr)
+        # Executable lines only -- docstrings name checks._norm_id in prose.
+        code = self._code_only(msr)
         used = {line.split("checks.")[1].split("(")[0]
-                for line in source.splitlines() if "checks." in line and "(" in line}
+                for line in code.splitlines() if "checks." in line and "(" in line}
         self.assertTrue(used <= {"consolidate_cycle_postings", "_apply_verified_overrides",
                                  "_norm_id"}, used)
 
@@ -903,7 +905,7 @@ class UnresolvableConflictTests(unittest.TestCase):
         ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
         self.assertEqual(ws.max_row, 9)
         self.assertIsNone(ws.cell(row=9, column=5).value)          # Net Interest Rate
-        self.assertEqual(ws.cell(row=9, column=1).value, "9")       # everything else present
+        self.assertEqual(ws.cell(row=9, column=1).value, 9)         # everything else present
         self.assertEqual(ws.cell(row=9, column=21).value, "Bank")
 
 
@@ -997,6 +999,144 @@ class RealConflictTests(unittest.TestCase):
     def test_the_conflicted_loan_still_contributes_its_payment(self):
         """Blanking one cell must not remove the loan from the remittance."""
         self.assertGreater(float(self._row()["Total Payment Received"]), 0)
+
+
+class GpNumberIsNumericTests(unittest.TestCase):
+    """SUBTOTAL(2, A9:A...) is COUNT, which counts NUMBERS and ignores text.
+    A text-typed GP made the client's published loan count read 0."""
+
+    def _sheet(self, rows=4):
+        frame = _srf([(str(1000000000 + i), f"L-{i}", "ACTIVE", "CURRENT",
+                       1000.0, 900.0, 100.0) for i in range(1, rows + 1)])
+        report = msr.build_deal_report("SOUP2025_1", [_servicer(frame=frame)])
+        return _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET], report
+
+    def test_every_gp_cell_is_written_as_a_number(self):
+        ws, report = self._sheet()
+        for offset in range(len(report["rows"])):
+            r = 9 + offset
+            with self.subTest(row=r):
+                self.assertEqual(ws.cell(row=r, column=1).data_type, "n")
+                self.assertIsInstance(ws.cell(row=r, column=1).value, int)
+
+    def test_the_identifier_value_is_preserved_exactly(self):
+        ws, report = self._sheet()
+        written = [ws.cell(row=9 + i, column=1).value for i in range(len(report["rows"]))]
+        self.assertEqual([str(v) for v in written],
+                         [r["SBA GP Number"] for r in report["rows"]])
+
+    def test_the_row_dicts_still_carry_the_canonical_string(self):
+        """Only the Excel write coerces. Everything upstream is untouched."""
+        _ws, report = self._sheet()
+        for row in report["rows"]:
+            with self.subTest(gp=row["SBA GP Number"]):
+                self.assertIsInstance(row["SBA GP Number"], str)
+
+    def test_a_non_round_tripping_identifier_stays_text(self):
+        for gp in ("0123456789", "12-345", "ABC123", "1234567890.5", ""):
+            with self.subTest(gp=gp):
+                out = msr._excel_gp_value(gp)
+                if gp == "":
+                    self.assertIsNone(out)
+                else:
+                    self.assertIsInstance(out, str)
+                    self.assertEqual(out, gp)
+
+    def test_a_plain_numeric_identifier_becomes_an_int(self):
+        self.assertEqual(msr._excel_gp_value("5446319102"), 5446319102)
+        self.assertIsInstance(msr._excel_gp_value("5446319102"), int)
+
+    def test_ten_digit_gps_are_exact_in_float64(self):
+        """Excel stores numbers as doubles; 10-digit GPs are far inside the
+        exact-integer range, so no identifier can be silently rounded."""
+        self.assertLess(9999999999, 2 ** 53)
+
+    def test_subtotal_counts_the_full_population(self):
+        """What the defect broke: with text GPs this evaluated to 0."""
+        ws, report = self._sheet(rows=6)
+        numeric = sum(1 for i in range(len(report["rows"]))
+                      if isinstance(ws.cell(row=9 + i, column=1).value, int))
+        self.assertEqual(numeric, 6)
+        self.assertEqual(ws["A7"].value, "=SUBTOTAL(2,A9:A14)")
+
+    def test_subtotal_responds_to_filtering(self):
+        """SUBTOTAL(2) counts only VISIBLE numeric rows. Simulated by hiding
+        rows the way an AutoFilter does -- the client's own saved workbook
+        shows 17 of 1,436 for exactly this reason."""
+        ws, report = self._sheet(rows=6)
+        visible = [9, 10]
+        for r in range(11, 15):
+            ws.row_dimensions[r].hidden = True
+        counted = [r for r in range(9, 15)
+                   if not ws.row_dimensions[r].hidden
+                   and isinstance(ws.cell(row=r, column=1).value, int)]
+        self.assertEqual(counted, visible)
+        self.assertEqual(len(counted), 2)
+        # and the formula still spans the whole population, so clearing the
+        # filter restores the full count
+        self.assertEqual(ws["A7"].value, "=SUBTOTAL(2,A9:A14)")
+
+    def test_the_number_format_suits_a_numeric_identifier(self):
+        ws, _report = self._sheet()
+        self.assertEqual(ws.cell(row=9, column=1).number_format, "0")
+
+    def test_the_coercion_is_confined_to_the_excel_write(self):
+        """The only caller is _write_loan_sheet. checks._norm_id, audit
+        matching, corrections, CONT-01 and the three Portfolio Summaries never
+        see this function -- none of them reads this workbook."""
+        import inspect
+        self.assertIn("_excel_gp_value(", inspect.getsource(msr._write_loan_sheet))
+        callers = [name for name, obj in vars(msr).items()
+                   if callable(obj) and getattr(obj, "__module__", None) == msr.__name__
+                   and name != "_excel_gp_value"
+                   and "_excel_gp_value(" in inspect.getsource(obj)]
+        self.assertEqual(callers, ["_write_loan_sheet"])
+
+    def test_no_other_production_module_references_it(self):
+        import inspect
+        import checks
+        import corrections
+        import file_readers as fr
+        import main
+        import report
+        for module in (checks, corrections, fr, main, report):
+            with self.subTest(module=module.__name__):
+                self.assertNotIn("_excel_gp_value", inspect.getsource(module))
+
+    def test_gp_normalization_itself_is_untouched(self):
+        """checks._norm_id still returns the canonical string it always did."""
+        import checks
+        normalized = checks._norm_id(pd.Series(["5446319102", 5446319102.0, " 5446319102 "]))
+        self.assertEqual(list(normalized), ["5446319102"] * 3)
+
+
+@unittest.skipUnless(REAL, "set FALCONBRIDGE_SOUP_XLSX / _MEMO_XLSX / _SRF_DIR")
+class RealGpNumberIsNumericTests(unittest.TestCase):
+
+    def test_all_june_gp_cells_are_numeric_in_both_reports(self):
+        for deal, report in _june()["reports"].items():
+            ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
+            text_cells = [r for r in range(9, ws.max_row + 1)
+                          if isinstance(ws.cell(row=r, column=1).value, str)]
+            with self.subTest(deal=deal):
+                self.assertEqual(text_cells, [])
+                self.assertEqual(ws.max_row - 8, len(report["rows"]))
+
+    def test_every_june_identifier_round_trips_unchanged(self):
+        for deal, report in _june()["reports"].items():
+            ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
+            written = [str(ws.cell(row=9 + i, column=1).value)
+                       for i in range(len(report["rows"]))]
+            with self.subTest(deal=deal):
+                self.assertEqual(written, [r["SBA GP Number"] for r in report["rows"]])
+
+    def test_the_2025_count_would_read_1436_unfiltered(self):
+        report = _june()["reports"]["SOUP2025_1"]
+        ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
+        numeric = sum(1 for r in range(9, ws.max_row + 1)
+                      if isinstance(ws.cell(row=r, column=1).value, int))
+        self.assertEqual(numeric, CLIENT_2025_ROWS)
+        self.assertEqual(ws["A7"].value, f"=SUBTOTAL(2,A9:A{8 + CLIENT_2025_ROWS})")
 
 
 class ConsolidationRulesUnchangedTests(unittest.TestCase):
