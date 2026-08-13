@@ -1041,6 +1041,18 @@ async def corrections_review(payload: dict):
         #
         # Generated ONLY here, after Human Review. There is no path to a
         # Monthly Servicer Report from /api/audit.
+        #
+        # SCOPE -- CLIENT-CONFIRMED (2026-08-13). This loop is deal-PARTITIONED,
+        # not deal-restricted, and must stay that way: it emits one workbook for
+        # every deal present in the upload, so SOUP 2024 keeps working. What is
+        # scoped is the VALIDATION, not the code -- SOUP 2025 (Community Bank &
+        # Trust 155 + Lendistry 2025 1,234 + Millennium 2025 47 = 1,436 loans,
+        # $2,805,017.89) is the only deal reconciled against a client-supplied
+        # workbook. A 2024 workbook generates but is not client-validated.
+        #
+        # `deal` comes from each SRF's own Note Series cell; no lender name
+        # participates in this routing and none may be added. See
+        # monthly_servicer_report.py's SCOPE section and test_soup2025_scope.py.
         monthly_servicer_reports = []
         msr_validation_issues = list(msr_exception_issues)
         msr_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)

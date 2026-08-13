@@ -48,6 +48,33 @@ population matches the Final Audited population exactly (CLIENT-CONFIRMED
 omitted loan is CB&T GP 4338609104, which is precisely the loan the audit's own
 closed-at-zero rule suppresses.
 
+SCOPE -- CLIENT-CONFIRMED (2026-08-13). READ THIS BEFORE EXTENDING.
+-------------------------------------------------------------------
+This module is DEAL-PARTITIONED, not deal-restricted: it emits one workbook per
+SOUP deal present in the upload, and SOUP 2024 remains fully supported. That
+architecture is deliberate and must not be narrowed.
+
+But the CURRENTLY VALIDATED BUSINESS SCOPE is SOUP 2025 ONLY:
+
+    Community Bank & Trust      155 loans
+    Lendistry 2025            1,234 loans
+    Millennium 2025              47 loans
+    ---------------------------------------
+    Total                     1,436 unique loans
+    Total Payment Received    $2,805,017.89
+
+Do NOT read this module as a universal cross-deal report. SOUP 2025 is the only
+population reconciled against a client-supplied workbook and the only one with
+an acceptance baseline. A SOUP 2024 report generates and is structurally
+correct, but has NOT been client-validated -- so "it produces a 2024 workbook"
+is not the same claim as "the 2024 workbook is right".
+
+Deal membership is resolved from each SRF's own "Note Series:" cell by
+file_readers.extract_deal_from_note_series. No lender name appears anywhere in
+that routing, and none may be introduced: the three names above are the
+OUTCOME for June 2026, never an input. test_soup2025_scope.py pins both halves
+of that -- the validated figures, and the absence of lender names in routing.
+
 BOUNDARIES
 ----------
 Reads from checks/file_readers; writes nothing back. CONT-01 and every other
