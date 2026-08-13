@@ -206,6 +206,13 @@ ISSUE_NOTE_SERIES_CONFLICT = "note_series_conflict"
 ISSUE_REMITTANCE_DATE_UNAVAILABLE = "remittance_date_unavailable"
 ISSUE_REMITTANCE_DATE_CONFLICT = "remittance_date_conflict"
 ISSUE_POSTINGS_DISAGREE = "postings_disagree"
+# D3 (CLIENT-CONFIRMED 2026-08-13). Raised by main.py's per-deal reconciliation,
+# never from this module: the vocabulary lives here so every issue code a
+# reviewer can see is defined in one place, but nothing in build_servicer_rows or
+# build_deal_report emits them and neither function changed. A deal carrying
+# either code produces NO workbook -- never a partial one.
+ISSUE_SERVICER_FAILED = "servicer_failed"
+ISSUE_DEAL_EMPTY = "deal_empty"
 
 
 def _blank(value):

@@ -473,6 +473,41 @@ export default function CorrectionReview({ recommendations, sessionId }) {
               </button>
             </div>
           ))}
+          {/* D3 — per-deal blocked state. A SOUP deal whose expected servicers
+              did not all reach the report produces NO workbook, and says so
+              here as a prominent panel rather than a hint. Rendered per deal:
+              a blocked SOUP 2024 never suppresses a complete SOUP 2025, so this
+              panel can sit beside a successful download above. The corrected
+              workbooks are unaffected and remain downloadable. */}
+          {(result.deals || []).filter((d) => d.status === 'blocked').map((d) => (
+            <div
+              key={`blocked-${d.deal || 'unassigned'}`}
+              className="alert alert-error"
+              style={{ marginTop: 10 }}
+            >
+              <strong>
+                {d.deal || 'Unassigned deal'} — no Monthly Servicer Report produced
+              </strong>
+              <div className="hint" style={{ marginTop: 4 }}>
+                Expected {(d.servicers_expected || []).length} servicer(s):{' '}
+                {(d.servicers_expected || []).join(', ') || '—'}. Reported{' '}
+                {(d.servicers_reported || []).length}:{' '}
+                {(d.servicers_reported || []).join(', ') || 'none'}.
+              </div>
+              {(d.failures || []).map((f, i) => (
+                <div key={i} className="hint" style={{ marginTop: 2 }}>
+                  {f.servicer} — failed at stage <strong>{f.stage}</strong>:{' '}
+                  {f.error_type}: {f.error_detail}
+                  {f.filename ? ` (${f.filename})` : ''}
+                </div>
+              ))}
+              <div className="hint" style={{ marginTop: 4 }}>
+                A partial report is not produced for a blocked deal. Fix the file
+                and re-run the audit; other deals are unaffected and your
+                corrected workbooks above are unchanged.
+              </div>
+            </div>
+          ))}
           {(result.monthly_servicer_report_validation_issues || []).length > 0 && (
             <div style={{ marginTop: 10 }}>
               <strong>Monthly Servicer Report — needs your attention</strong>

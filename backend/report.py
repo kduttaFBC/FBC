@@ -577,8 +577,48 @@ def _terminal_activity_values(counts, dollars):
 FINAL_SUMMARY_DEFAULT_TITLE = "Final Audited Portfolio Summary"
 
 
+_BLOCKED_FONT = Font(bold=True, color="9C0006")
+_BLOCKED_FILL = PatternFill("solid", fgColor="FFC7CE")
+
+# D3 (CLIENT-CONFIRMED 2026-08-13). A blocked SOUP deal is named in every
+# section rather than omitted or zero-filled.
+#
+#   OMITTED would be the exact defect D3 closes -- a deal silently absent is
+#   indistinguishable from a deal that did not exist.
+#   ZERO-FILLED would be worse: $0.00 across a deal's row reads as a real
+#   measurement of an empty portfolio rather than an absence of measurement.
+#
+# So the marker carries the reason in column A and leaves every figure cell
+# EMPTY (None, not 0). A blocked deal's partial servicer rows are not rendered
+# either -- showing some of its servicers would be a degraded summary, the same
+# defect as a partial Monthly Servicer Report.
+_BLOCKED_LABEL_SUFFIX = " — BLOCKED"
+BLOCKED_SECTION_TITLE = "DEALS BLOCKED — NO MONTHLY SERVICER REPORT PRODUCED"
+
+
+def _write_blocked_deal_rows(ws, start_row, blocked_deals, width):
+    """Appends one marker row per blocked deal. Returns the next free row."""
+    row = start_row
+    for entry in blocked_deals or []:
+        deal = entry.get("deal") or "Unassigned"
+        label = f"{deal}{_BLOCKED_LABEL_SUFFIX}: {entry.get('reason') or 'blocked'}"
+        c = ws.cell(row=row, column=1, value=label)
+        c.font = _BLOCKED_FONT
+        c.fill = _BLOCKED_FILL
+        c.border = BORDER
+        c.alignment = Alignment(vertical="center", horizontal="left")
+        for col in range(2, width + 1):
+            b = ws.cell(row=row, column=col)
+            b.value = None                     # never 0 -- see above
+            b.fill = _BLOCKED_FILL
+            b.border = BORDER
+        row += 1
+    return row
+
+
 def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None,
-                                           title=FINAL_SUMMARY_DEFAULT_TITLE):
+                                           title=FINAL_SUMMARY_DEFAULT_TITLE,
+                                           blocked_deals=None):
     """The stacked-section Portfolio Summary workbook.
 
     blocks comes from checks.group_portfolio_summary_by_deal -- one entry per
@@ -664,6 +704,21 @@ def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None,
 
     # Sections start below the two heading lines plus a blank spacer.
     row = 4
+    # D3: blocked deals are named BEFORE any figures, so the caveat precedes the
+    # data rather than trailing it. A reader cannot reach the COUNT section
+    # without passing the statement that a deal produced no report.
+    if blocked_deals:
+        width = len(FINAL_SUMMARY_CATEGORIES) + 1
+        band = ws.cell(row=row, column=1, value=BLOCKED_SECTION_TITLE)
+        band.font = _SECTION_FONT
+        for col in range(1, width + 1):
+            c = ws.cell(row=row, column=col)
+            c.fill = HEADER_FILL
+            c.border = BORDER
+            if col > 1:
+                c.value = None
+        row = _write_blocked_deal_rows(ws, row + 1, blocked_deals, width)
+        row += 1
     # Percentages are already scaled (84.33 means 84.33%), so a literal "%"
     # suffix -- Excel's native 0.00% format would multiply by 100 again.
     row = _write_final_summary_section(ws, row, "COUNT", count_rows, "#,##0", "right")
