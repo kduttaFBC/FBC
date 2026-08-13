@@ -37,6 +37,8 @@ import file_readers
 import corrections as corrections_mod
 import preflight as preflight_mod
 import memo_audit as memo_audit_mod
+import monthly_servicer_report as msr_mod
+import reporting_exceptions
 
 
 load_dotenv(override=False)
@@ -124,6 +126,40 @@ def _flagged_gp_numbers(all_results, max_loans=MAX_FLAGGED_LOANS_FOR_HISTORY):
             if len(gp_numbers) >= max_loans:
                 return gp_numbers
     return gp_numbers
+
+
+def _describe_deal_block(state):
+    """One human-readable sentence naming WHY a SOUP deal is blocked, for the
+    reviewer and for the Final Audited workbook's blocked marker.
+
+    D3 (CLIENT-CONFIRMED 2026-08-13). Every blocked deal must say what went
+    wrong and where -- a blocked deal with no reason is the same silent gap the
+    control exists to close. Reads only the reconciliation state; derives
+    nothing."""
+    deal = state.get("deal") or "unassigned"
+    # D4 takes precedence in the message: when reporting is not ready the deal
+    # was never assessed on its own merits, and telling the reviewer to fix a
+    # servicer file would send them to the wrong thing.
+    readiness = state.get("readiness_block")
+    if readiness:
+        return (f"SOUP deal {deal}: final reporting is blocked until Human Review "
+                f"reaches a reportable disposition for every recommendation "
+                f"({readiness}) — no Monthly Servicer Report was produced")
+    failures = state.get("failures") or []
+    if failures:
+        parts = ", ".join(
+            f"{f.get('servicer')} (stage {f.get('stage')}: "
+            f"{f.get('error_type')}: {f.get('error_detail')})"
+            for f in failures
+        )
+        return (f"SOUP deal {deal}: {len(failures)} servicer(s) failed and no "
+                f"Monthly Servicer Report was produced — {parts}")
+    missing = state.get("servicers_missing") or []
+    if missing:
+        return (f"SOUP deal {deal}: expected servicer(s) {', '.join(missing)} did "
+                f"not reach the report and no Monthly Servicer Report was produced")
+    return (f"SOUP deal {deal}: consolidated to zero rows, so no Monthly "
+            f"Servicer Report was produced")
 
 
 def _resolve_portfolio_summary_cycle_month(cycle_months):
@@ -458,6 +494,22 @@ async def audit(
                 "source_sha256": hashlib.sha256(file_bytes).hexdigest(),
                 "institution": display_label,
                 "cycle_month": (stat01_result or {}).get("_cycle_month"),
+                # CLIENT-CONFIRMED (2026-08-13): this file's own SOUP deal,
+                # carried forward for D3's PER-DEAL reconciliation. Purely
+                # additive, and deliberately the value ALREADY resolved above
+                # by file_readers.read_servicer_file from the SRF's own "Note
+                # Series:" cell -- not a second way of determining deal
+                # membership, and no lender name participates.
+                #
+                # WHY IT MUST BE PERSISTED. The review endpoint re-reads these
+                # bytes to build the reports, and the deal is a RESULT of that
+                # read. So a servicer whose bytes fail to read there has no
+                # knowable deal, and its failure cannot be attributed to a
+                # partition -- which would force one unreadable file to block
+                # every deal, the opposite of the isolation D3 requires.
+                # Recording it here, where the read already succeeded, is what
+                # makes per-deal gating survive a later read failure.
+                "deal": deal,
                 "candidates": candidates,
                 "excluded_gps": [
                     t["SBA GP Number"]
@@ -787,11 +839,10 @@ async def corrections_review(payload: dict):
         reviewed_on = payload.get("reviewed_on")
         decisions = payload.get("decisions") or []
 
-        if not decisions:
-            return JSONResponse(status_code=400, content={
-                "error": "No decisions were submitted. Approve, reject, or return at least one "
-                         "recommendation before recording.",
-            })
+        # NOTE: the "no decisions submitted" check moved BELOW the session load.
+        # D4 (CLIENT-CONFIRMED 2026-08-13) allows one case with zero decisions --
+        # zero candidates, i.e. 0 of 0 -- and whether that holds can only be known
+        # once the session's candidate set is in hand.
 
         # An approval that cannot be attributed is not an audit record. The
         # name is self-declared (no auth) and recorded as unverified, but it
@@ -819,9 +870,25 @@ async def corrections_review(payload: dict):
         # Portfolio Summary needs one row each), so a non-empty
         # correction_state no longer implies anything was reviewable. This
         # keeps the original meaning of the guard exactly.
-        if not any((entry.get("candidates") or []) for entry in correction_state.values()):
+        # D4 (CLIENT-CONFIRMED 2026-08-13): the 400 that used to live here is
+        # RELAXED. Under a completeness model, zero candidates is 0 of 0 -- the
+        # most complete review possible, and reporting-ready -- so a clean month
+        # must be able to produce its Monthly Servicer Report and Final Audited
+        # Portfolio Summary. Refusing it implied a report is only issuable when
+        # the audit found problems.
+        #
+        # The reviewer-name requirement above is deliberately NOT relaxed: an
+        # unattributed sign-off is not an audit record, even of a clean month.
+        _has_candidates = any((entry.get("candidates") or [])
+                              for entry in correction_state.values())
+        if not decisions and _has_candidates:
+            # Recommendations exist and none was decided. Submission requires at
+            # least one decision -- a reviewer may submit a PARTIAL review (that is
+            # explicitly allowed and produces corrected workbooks), but an empty
+            # one records nothing and is refused as before.
             return JSONResponse(status_code=400, content={
-                "error": "This audit produced no reviewable corrections.",
+                "error": "No decisions were submitted. Approve, reject, or return at least one "
+                         "recommendation before recording.",
             })
 
         # Route each decision to the servicer that owns its recommendation id.
@@ -842,6 +909,7 @@ async def corrections_review(payload: dict):
         corrected_workbooks = []
         corrections_not_applied = []
         applied_total = rejected_total = returned_total = 0
+        approved_not_applied_total = 0
         # {servicer: {(gp, field): approved_value}} -- the VERIFIED layer, the
         # single source both post-review artifacts are built from.
         verified_overrides_by_servicer = {}
@@ -865,6 +933,7 @@ async def corrections_review(payload: dict):
             applied_total += outcome["applied_count"]
             rejected_total += outcome["rejected_count"]
             returned_total += outcome["returned_count"]
+            approved_not_applied_total += outcome.get("approved_not_applied_count", 0)
             unknown_ids.extend(outcome.get("unknown_ids") or [])
 
             for not_applied in outcome.get("corrections_not_applied") or []:
@@ -890,6 +959,118 @@ async def corrections_review(payload: dict):
                     "reason": outcome["skip_reason"],
                 })
 
+        # ---- D4: review completeness and reporting readiness ----------------
+        # CLIENT-CONFIRMED (2026-08-13). TWO SEPARATE CONDITIONS, and they can
+        # legitimately disagree:
+        #
+        #   REVIEW COMPLETENESS   every candidate has a reviewer decision.
+        #                         pending == 0.
+        #   REPORTING READINESS   every candidate reached a disposition that
+        #                         PERMITS FINAL REPORTING. non_reportable == 0.
+        #
+        # Disposition -> reportable?
+        #   approved AND applied   yes   the approved value is in the workbook
+        #   rejected               yes   the submitted value remains authoritative
+        #   returned to servicer   NO    reviewer flagged the value as questionable
+        #                                and expects a resubmission; the MSR would
+        #                                otherwise report a flagged value as final
+        #   approved, not applied  NO    the decision did not take effect, so the
+        #                                workbook does not contain what was approved
+        #   pending                NO    not reviewed
+        #   unknown id             --    counts toward neither, ever
+        #
+        # reporting_ready implies review_complete, never the reverse. The state
+        # that only exists because these are separate -- complete but NOT ready --
+        # is the real June workflow: everything decided, one returned.
+        #
+        # D4 GATES FINAL REPORTING, NOT THE RECORDING OF REVIEW WORK. Corrected
+        # workbooks and their Correction Logs are PER-DECISION artifacts, are
+        # generated above, and are returned regardless of either condition. A
+        # reviewer may deliberately submit a partial review; that is accepted,
+        # recorded and downloadable. Only the two POPULATION-level reports are
+        # withheld.
+        #
+        # WHY THIS SITS HERE and not before the loop above: approved_not_applied
+        # is an OUTCOME of the write attempt, not a property of the payload, so
+        # readiness is unknowable until the workbooks have been generated. Since
+        # those are never gated they are generated either way, so nothing is
+        # produced wastefully -- and this still precedes every line of report work.
+        #
+        # SERVER-CALCULATED ONLY. pending is derived from the session's own
+        # candidate set minus the ids actually decided, so a client cannot
+        # under-report it by omitting undecided items -- which is exactly what the
+        # review page does today. Nothing in the payload can assert either flag.
+        _all_candidate_ids = {
+            cand["id"]
+            for entry in correction_state.values()
+            for cand in (entry.get("candidates") or [])
+        }
+        # An UNRECOGNISED decision string is not a decision. corrections.py logs it
+        # and refuses to write ("Unrecognised decision ... — not applied"), but it
+        # increments no disposition counter -- so counting it as decided would leave
+        # it in NO bucket, making reportable + non_reportable < total and letting a
+        # payload of {"decision": "banana"} pass the readiness gate while nothing
+        # was written for that recommendation. It counts as PENDING instead, which
+        # blocks. The vocabulary is read from corrections.VALID_DECISIONS rather
+        # than restated here, so the two cannot drift.
+        _decided_ids = {
+            d.get("id") for d in decisions
+            if d.get("id") in _all_candidate_ids
+            and str(d.get("decision") or "").strip().lower() in corrections_mod.VALID_DECISIONS
+        }
+        _pending_total = len(_all_candidate_ids - _decided_ids)
+        _reportable_total = applied_total + rejected_total
+        _non_reportable_total = returned_total + approved_not_applied_total + _pending_total
+        _review_complete = _pending_total == 0
+        _reporting_ready = _non_reportable_total == 0
+
+        _blocking_reasons = []
+        if _pending_total:
+            _blocking_reasons.append("pending")
+        if returned_total:
+            _blocking_reasons.append("returned")
+        if approved_not_applied_total:
+            _blocking_reasons.append("approved_not_applied")
+
+        # The pending items themselves, so the review page can point at them
+        # rather than making the reviewer hunt. Only pending is enumerable here:
+        # returned and approved-not-applied are already itemised in the
+        # Correction Log and corrections_not_applied respectively.
+        _pending_items = [
+            {"servicer": servicer, "gp": cand.get("gp"), "field": cand.get("field"),
+             "recommendation_id": cand["id"]}
+            for servicer, entry in correction_state.items()
+            for cand in (entry.get("candidates") or [])
+            if cand["id"] not in _decided_ids
+        ]
+
+        review_completeness = {
+            "total": len(_all_candidate_ids),
+            "approved_applied": applied_total,
+            "approved_not_applied": approved_not_applied_total,
+            "rejected": rejected_total,
+            "returned": returned_total,
+            "pending": _pending_total,
+            "unknown": len([i for i in unknown_ids if i is not None]),
+            # NOTE ON THE DENOMINATOR. `total` is the CANDIDATE set -- exactly what
+            # the reviewer was shown. corrections_skipped items (eligible for
+            # correction but with no valid posting row to write to) are excluded
+            # STRUCTURALLY, not by subtraction: build_recommendations never puts
+            # them in `candidates`, so they cannot enter this count. Including
+            # them would make the gate unsatisfiable, since a decision on them
+            # could never be applied. They are already reported to the reviewer by
+            # /api/audit's own corrections_skipped field and are not duplicated
+            # here.
+            "review_complete": _review_complete,
+        }
+        reporting_readiness = {
+            "reportable": _reportable_total,
+            "non_reportable": _non_reportable_total,
+            "reporting_ready": _reporting_ready,
+            "blocking_reasons": _blocking_reasons,
+            "blocking_items": _pending_items,
+        }
+
         # ---- Final Audited Portfolio Summary --------------------------------
         # CLIENT-CONFIRMED (2026-08-10): the third layer, generated ONLY here,
         # only after Manual Review, from
@@ -911,43 +1092,340 @@ async def corrections_review(payload: dict):
         portfolio_summary_final_counts = []
         portfolio_summary_final_deals = []
         final_cycle_months = set()
+        # {deal: [servicer payload, ...]} in upload order, for the Monthly
+        # Servicer Reports -- one workbook per SOUP deal, never combined.
+        msr_servicers_by_deal = {}
+        # CLIENT-CONFIRMED (2026-08-12): the Reporting Exception Register.
+        # Loaded once per run and keyed on (reporting period, deal, loan,
+        # field). Every rejected register entry is surfaced here, before any
+        # report is built, so a malformed exception is visible even if it
+        # matches nothing.
+        msr_exception_issues = []
+        msr_exception_index = reporting_exceptions.index_register(
+            reporting_exceptions.load_register(), issues=msr_exception_issues)
+        msr_exception_period = reporting_exceptions._period_label(
+            _resolve_portfolio_summary_cycle_month(
+                {e["cycle_month"] for e in correction_state.values()
+                 if e.get("cycle_month") is not None})[0])
+        # ---- D3: per-deal expected roster ----------------------------------
+        # CLIENT-CONFIRMED (2026-08-13). correction_state is the authoritative
+        # roster: since 2026-08-10 it holds exactly one entry per uploaded
+        # servicer, whether or not the audit found anything to correct. D3
+        # asserts that roster rather than inferring coverage from absence.
+        #
+        # PARTITIONED BY SOUP DEAL, and gated per deal. A failure in one deal
+        # must never suppress a valid report for another: a blocked SOUP 2024
+        # does not stop a complete SOUP 2025 from generating, and vice versa.
+        # The partition key is the deal already resolved at /api/audit and
+        # persisted on the entry -- available even when the read below fails,
+        # which is the whole reason it is persisted.
+        expected_by_deal = {}
+        for _servicer, _entry in correction_state.items():
+            expected_by_deal.setdefault(_entry.get("deal"), []).append(_servicer)
+        # {deal: [servicer]} that got all the way through, and
+        # {deal: [failure record]} for those that did not. Keyed the same way so
+        # reconciliation is a set comparison per deal, never a count.
+        reported_by_deal = {}
+        deal_failures = {}
+
         for servicer, entry in correction_state.items():
+            expected_deal = entry.get("deal")
+            # The stage a failure is attributed to. Advanced as the body
+            # progresses so a structured failure names WHERE it broke -- the
+            # discriminator a reviewer needs to act, and the difference between
+            # "this file is unreadable" and "this file broke consolidation".
+            stage = "read"
             try:
                 # The 5th return value is this file's own SOUP deal, parsed
                 # from its "Note Series:" cell by
                 # file_readers.extract_deal_from_note_series -- the same value
-                # POP-01 already scopes on. Captured here (it used to be
-                # discarded) so the Final Audited Portfolio Summary can total
-                # per SOUP deal. Nothing is inferred from the filename and no
-                # servicer name is hardcoded.
-                _, _, _, servicer_inputs_df, deal = file_readers.read_servicer_file(
+                # POP-01 already scopes on. Nothing is inferred from the
+                # filename and no servicer name is hardcoded.
+                soup_key, _, _, servicer_inputs_df, deal = file_readers.read_servicer_file(
                     entry["original_bytes"], filename=entry.get("original_filename"),
                 )
-            except Exception:
-                # One unreadable servicer must not lose the whole summary; the
-                # others are still reported. Same isolation principle the
-                # per-servicer generation loop above uses.
+                # The persisted deal and the freshly-read one come from the same
+                # bytes through the same parser, so they cannot legitimately
+                # differ. If they ever do, the roster and the report would be
+                # partitioned differently and reconciliation would silently
+                # compare the wrong sets -- so this fails CLOSED and names it,
+                # rather than picking one and carrying on.
+                if deal != expected_deal:
+                    stage = "deal_mismatch"
+                    raise ValueError(
+                        f"SOUP deal changed between audit and review: "
+                        f"expected {expected_deal!r}, read {deal!r}"
+                    )
+                stage = "consolidate"
+                # ONE verified population per servicer, feeding all three views
+                # -- Count, Balance % and Balance ($).
+                # verified_portfolio_summary_views builds it once; constructing
+                # it separately per view is the failure mode this call shape
+                # exists to prevent.
+                views = checks_mod.verified_portfolio_summary_views(
+                    servicer_inputs_df,
+                    verified_overrides_by_servicer.get(servicer) or {},
+                    servicer_name=servicer,
+                    excluded_gps=entry.get("excluded_gps") or [],
+                )
+                stage = "build_rows"
+                servicer_issues = []
+                servicer_rows = msr_mod.build_servicer_rows(
+                    servicer_inputs_df, soup_key,
+                    verified_overrides=verified_overrides_by_servicer.get(servicer) or {},
+                    excluded_gps=entry.get("excluded_gps") or [],
+                    issues=servicer_issues,
+                    # CLIENT-CONFIRMED (2026-08-12): historical reporting
+                    # exceptions, applied at the report-writing layer only and
+                    # keyed on this exact reporting period + deal + loan +
+                    # field. An empty or absent register leaves every value as
+                    # calculated.
+                    reporting_period=msr_exception_period,
+                    deal=deal,
+                    exception_index=msr_exception_index,
+                )
+                stage = "metadata"
+                note_series = file_readers.read_note_series_label(entry["original_bytes"])
+                remittance_date = file_readers.read_remittance_date(entry["original_bytes"])
+            except Exception as exc:
+                # CLIENT-CONFIRMED (2026-08-13): ONE try around the WHOLE body.
+                # Previously only the read was guarded (silent skip) while
+                # consolidation and row-building sat outside it, so an exception
+                # there escaped to the outer handler and returned HTTP 500 --
+                # discarding corrected workbooks whose decisions had already
+                # been applied and whose Correction Logs were already written,
+                # and forcing a resubmission that rewrites the log timestamp.
+                # Two adjacent lines, opposite failure semantics. Both now
+                # collapse into one deterministic, named, per-deal outcome and
+                # no path from this loop returns 500.
                 traceback.print_exc()
+                deal_failures.setdefault(expected_deal, []).append({
+                    "servicer": servicer,
+                    "filename": entry.get("original_filename"),
+                    "deal": expected_deal,
+                    "stage": stage,
+                    "error_type": type(exc).__name__,
+                    "error_detail": str(exc),
+                    "source_sha256": entry.get("source_sha256"),
+                })
                 continue
-            # ONE verified population per servicer, feeding all three views --
-            # Count, Balance % and Balance ($). verified_portfolio_summary_views
-            # builds it once; constructing it separately per view is the
-            # failure mode this call shape exists to prevent.
-            views = checks_mod.verified_portfolio_summary_views(
-                servicer_inputs_df,
-                verified_overrides_by_servicer.get(servicer) or {},
-                servicer_name=servicer,
-                excluded_gps=entry.get("excluded_gps") or [],
-            )
+
+            # Everything below is reached only when the whole body succeeded, so
+            # a partially-built servicer can never reach a report.
             portfolio_summary_final_records.append(views["dollars"])
             portfolio_summary_final_counts.append(views["counts"])
             portfolio_summary_final_deals.append(deal)
             if entry.get("cycle_month") is not None:
                 final_cycle_months.add(entry["cycle_month"])
+            reported_by_deal.setdefault(deal, []).append(servicer)
 
+            # CLIENT-CONFIRMED (2026-08-11): the Monthly Servicer Report is a
+            # CONSOLIDATION of this same verified layer -- the lender's own
+            # values plus the overrides that were actually written into the
+            # corrected workbook, minus the closed-at-zero suppressions -- so
+            # it reconciles with the Final Audited Portfolio Summary by
+            # construction rather than by a second derivation. Deliberately
+            # built from verified_overrides rather than by re-reading the
+            # corrected workbook bytes: that artifact is exactly what
+            # preflight.py blocks from re-ingestion (no value cache), so
+            # parsing it back would be fragile in the way that control exists
+            # to prevent.
+            #
+            # servicer_name is the soup_key, which is what the client's
+            # workbook carries in Lender/Servicer Name and what its Remittance
+            # SUMIFS matches on -- never the SRF's own "Servicer:" cell.
+            msr_servicers_by_deal.setdefault(deal, []).append({
+                "servicer_name": soup_key,
+                "display_label": servicer,
+                "rows": servicer_rows,
+                "issues": servicer_issues,
+                "note_series": note_series,
+                "remittance_date": remittance_date,
+            })
+
+        # ---- D3: reconcile expected vs reported, PER DEAL -------------------
+        # CLIENT-CONFIRMED (2026-08-13). Every deal present on either side is
+        # judged independently. A deal is BLOCKED when any expected servicer is
+        # missing from its reported set (whatever stage it failed at); otherwise
+        # it is provisionally complete and the zero-row test below can still
+        # block it. Reconciliation is a SET comparison, never a count -- a count
+        # cannot tell "all present" from "one swapped for another".
+        deal_status = {}
+        for _deal in (set(expected_by_deal) | set(reported_by_deal)
+                      | set(msr_servicers_by_deal) | set(deal_failures)):
+            _expected = sorted(expected_by_deal.get(_deal, []))
+            _reported = sorted(reported_by_deal.get(_deal, []))
+            _failures = list(deal_failures.get(_deal, []))
+            _missing = [s for s in _expected if s not in set(_reported)]
+            # D4 blocks EVERY deal when reporting is not ready. Expressed through
+            # D3's own shape rather than a parallel structure, so the frontend has
+            # one blocked-state renderer and the two gates cannot describe the same
+            # deal differently. D3 remains solely responsible for WHICH deals can
+            # report once D4 has passed -- the readiness term below is simply
+            # unconditional when readiness fails.
+            deal_status[_deal] = {
+                "deal": _deal,
+                "status": ("blocked" if (_missing or not _reporting_ready)
+                           else "complete"),
+                "servicers_expected": _expected,
+                "servicers_reported": _reported,
+                "failures": _failures,
+                "servicers_missing": _missing,
+                # Present only when D4 is the cause, so _describe_deal_block can
+                # say why without re-deriving it. Stripped from the payload below
+                # alongside servicers_missing.
+                "readiness_block": (None if _reporting_ready
+                                    else ", ".join(_blocking_reasons)),
+                "report_available": False,      # decided by the MSR loop below
+            }
+
+        # EXECUTION ORDER (CLIENT-CONFIRMED 2026-08-13). The Final Audited
+        # Portfolio Summary is generated AFTER the Monthly Servicer Report pass
+        # below, from the SAME final per-deal verdicts -- not here.
+        #
+        # A deal can only be found zero-row by attempting its consolidation, so
+        # a verdict taken at this point is still provisional. Building the
+        # summary here would write that deal's figures as though it were
+        # complete while the same response reported it blocked: two artifacts
+        # from one run disagreeing about the same deal, which is the class of
+        # defect D3 exists to remove.
+        #
+        # The MSR pass is therefore the last place a verdict may change. After
+        # it, the verdicts are frozen and both artifacts are derived from them.
+        # Nothing in that pass feeds the summary's FIGURES -- only the verdict
+        # is shared, and the figures were already computed above.
+
+        # CLIENT-CONFIRMED (2026-08-11): ONE Monthly Servicer Report per SOUP
+        # deal, 2024 first then 2025, never combined -- a 2024-deal and a
+        # 2025-deal servicer belong to different securitizations. Sorted by
+        # checks._deal_sort_key, the same ordering the Final Audited Portfolio
+        # Summary's deal blocks already use, so the download sequence and the
+        # summary read in the same order.
+        #
+        # Generated ONLY here, after Human Review. There is no path to a
+        # Monthly Servicer Report from /api/audit.
+        #
+        # SCOPE -- CLIENT-CONFIRMED (2026-08-13). This loop is deal-PARTITIONED,
+        # not deal-restricted, and must stay that way: it emits one workbook for
+        # every deal present in the upload, so SOUP 2024 keeps working. What is
+        # scoped is the VALIDATION, not the code -- SOUP 2025 (Community Bank &
+        # Trust 155 + Lendistry 2025 1,234 + Millennium 2025 47 = 1,436 loans,
+        # $2,805,017.89) is the only deal reconciled against a client-supplied
+        # workbook. A 2024 workbook generates but is not client-validated.
+        #
+        # `deal` comes from each SRF's own Note Series cell; no lender name
+        # participates in this routing and none may be added. See
+        # monthly_servicer_report.py's SCOPE section and test_soup2025_scope.py.
+        monthly_servicer_reports = []
+        msr_validation_issues = list(msr_exception_issues)
+        msr_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
+        # CLIENT-CONFIRMED (2026-08-13): the D3 gate, applied PER DEAL. A deal
+        # whose roster did not reconcile produces NO workbook -- never a partial
+        # or degraded one, since the MSR is a population-level consolidation and
+        # a partial consolidation is not a degraded report, it is a wrong one.
+        # Every OTHER deal still generates normally.
+        for deal in sorted(set(deal_status) | set(msr_servicers_by_deal),
+                           key=checks_mod._deal_sort_key):
+            state = deal_status.setdefault(deal, {
+                "deal": deal, "status": "complete",
+                "servicers_expected": [], "servicers_reported": [],
+                "failures": [], "servicers_missing": [], "report_available": False,
+            })
+            if state["status"] == "blocked":
+                # Named, not silent. build_deal_report is deliberately not even
+                # called: a blocked deal has nothing legitimate to consolidate.
+                msr_validation_issues.append({
+                    "code": msr_mod.ISSUE_SERVICER_FAILED,
+                    "deal": deal,
+                    "detail": _describe_deal_block(state),
+                })
+                continue
+            if deal not in msr_servicers_by_deal:
+                # Provisionally complete but nothing to build from -- an empty
+                # expected roster for this deal. Treated as the zero-row case.
+                state["status"] = "blocked"
+                msr_validation_issues.append({
+                    "code": msr_mod.ISSUE_DEAL_EMPTY,
+                    "deal": deal,
+                    "detail": f"SOUP deal {deal!r} produced no servicer rows.",
+                })
+                continue
+            deal_report = msr_mod.build_deal_report(deal, msr_servicers_by_deal[deal])
+            msr_validation_issues.extend(deal_report["validation_issues"])
+            if not deal_report["rows"]:
+                # CLIENT-CONFIRMED (2026-08-13): a zero-row deal was previously
+                # a silent `continue`, indistinguishable from a bug that emptied
+                # it. It now blocks THIS deal, named, and no other.
+                state["status"] = "blocked"
+                msr_validation_issues.append({
+                    "code": msr_mod.ISSUE_DEAL_EMPTY,
+                    "deal": deal,
+                    "detail": (f"SOUP deal {deal!r} consolidated to zero rows from "
+                               f"{len(msr_servicers_by_deal[deal])} reported servicer(s)."),
+                })
+                continue
+            state["report_available"] = True
+            msr_buffer = io.BytesIO()
+            msr_mod.generate_monthly_servicer_report_bytes(deal_report, msr_buffer)
+            monthly_servicer_reports.append({
+                "deal": deal,
+                "note_series": deal_report["note_series"],
+                "loan_count": len(deal_report["rows"]),
+                "servicers": deal_report["remittance_servicers"],
+                "filename": msr_mod.monthly_servicer_report_filename(
+                    deal, deal_report["note_series"], msr_cycle_month),
+                "file_b64": base64.b64encode(msr_buffer.getvalue()).decode("utf-8"),
+            })
+
+        # ---- D3: verdicts are now FROZEN ------------------------------------
+        # CLIENT-CONFIRMED (2026-08-13): the MSR pass above is the LAST place a
+        # deal's complete/blocked status may change. Everything below reads the
+        # verdicts and must not alter one.
+        #
+        # THE INVARIANT: status == "complete" if and only if report_available is
+        # True. It holds because the only two ways a provisionally-complete deal
+        # can fail to produce a workbook -- absent from msr_servicers_by_deal, or
+        # consolidating to zero rows -- both set status to "blocked" in the same
+        # pass that would have set report_available. So "did this deal produce a
+        # Monthly Servicer Report" and "is this deal complete" are one fact, not
+        # two that could drift.
+        _complete_deals = {d for d, s in deal_status.items() if s["status"] == "complete"}
+        _blocked_deals = sorted(set(deal_status) - _complete_deals,
+                                key=checks_mod._deal_sort_key)
+
+        # ---- Final Audited Portfolio Summary, from those same verdicts -------
+        # CLIENT-CONFIRMED (2026-08-13): ONLY complete deals contribute numeric
+        # blocks. A blocked deal's figures were computed above, but once the deal
+        # is blocked they are not FINAL AUDITED figures -- they describe a
+        # population the audit could not fully assemble. So the figure block is
+        # replaced by an explicit marker naming the deal and the reason:
+        #
+        #   NOT zero-filled  -- $0.00 across a deal reads as a real measurement
+        #                       of an empty portfolio, which is worse than absence
+        #   NOT omitted      -- silent omission is the exact D3 defect
+        #
+        # A complete deal's block is untouched and identical to today's output.
         portfolio_summary_final_b64 = None
         portfolio_summary_final_filename_value = None
-        if portfolio_summary_final_records:
+        _fs_records, _fs_counts, _fs_deals = [], [], []
+        for _rec, _cnt, _dl in zip(portfolio_summary_final_records,
+                                   portfolio_summary_final_counts,
+                                   portfolio_summary_final_deals):
+            if _dl in _complete_deals:
+                _fs_records.append(_rec)
+                _fs_counts.append(_cnt)
+                _fs_deals.append(_dl)
+        _blocked_summary_deals = [
+            {"deal": d, "reason": _describe_deal_block(deal_status[d])}
+            for d in _blocked_deals
+        ]
+        # D4 gate on the summary. When reporting is not ready NOTHING is produced --
+        # not even a markers-only workbook. A blocked-deal marker is D3's way of
+        # saying "this deal could not be assembled"; a whole summary consisting of
+        # nothing but markers would be an artifact asserting that the review is
+        # finished, which is precisely what D4 has determined is false. The
+        # corrected workbooks above still carry the reviewer's work.
+        if _reporting_ready and (_fs_records or _blocked_summary_deals):
             final_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
             final_buffer = io.BytesIO()
             # CLIENT-CONFIRMED (2026-08-10): one Total PER SOUP DEAL, each
@@ -958,13 +1436,13 @@ async def corrections_review(payload: dict):
             # A servicer whose SRF declares no usable Note Series lands in an
             # explicit "Unassigned Total" rather than being dropped.
             final_blocks = checks_mod.group_portfolio_summary_by_deal(
-                portfolio_summary_final_records, portfolio_summary_final_counts,
-                portfolio_summary_final_deals,
+                _fs_records, _fs_counts, _fs_deals,
             )
             # cycle_month feeds the heading's "Reporting Period" line only --
             # the same value the filename already uses. It never touches a figure.
             report_mod.generate_final_portfolio_summary_bytes(
                 final_blocks, final_buffer, cycle_month=final_cycle_month,
+                blocked_deals=_blocked_summary_deals,
             )
             portfolio_summary_final_b64 = base64.b64encode(final_buffer.getvalue()).decode("utf-8")
             # Underscored: the label is interpolated straight into the
@@ -977,8 +1455,30 @@ async def corrections_review(payload: dict):
                 final_cycle_month, label="Final_Audited"
             )
 
+        # CLIENT-CONFIRMED (2026-08-13): completeness asserted AFFIRMATIVELY and
+        # per deal, so no consumer has to infer success from a non-empty list --
+        # the failure mode where total collapse and "nothing to report" look
+        # identical. Top-level status is "complete" only when EVERY deal is.
+        deals_payload = [
+            {k: v for k, v in deal_status[d].items()
+             if k not in ("servicers_missing", "readiness_block")}
+            for d in sorted(deal_status, key=checks_mod._deal_sort_key)
+        ]
+        overall_status = ("complete"
+                          if (_reporting_ready
+                              and all(d["status"] == "complete" for d in deals_payload))
+                          else "blocked")
+
         return JSONResponse({
             "corrected_workbooks": corrected_workbooks,
+            "monthly_servicer_reports": monthly_servicer_reports,
+            "monthly_servicer_report_validation_issues": msr_validation_issues,
+            # D3. Corrected workbooks above are returned regardless of these.
+            "status": overall_status,
+            "deals": deals_payload,
+            # D4. Both SERVER-CALCULATED; nothing in the payload can assert either.
+            "review_completeness": review_completeness,
+            "reporting_readiness": reporting_readiness,
             "portfolio_summary_final_b64": portfolio_summary_final_b64,
             "portfolio_summary_final_filename": portfolio_summary_final_filename_value,
             "summary": {

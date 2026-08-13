@@ -365,14 +365,35 @@ class ResponseAndErrorContractTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("reviewer name", body["error"])
 
-    def test_an_audit_with_no_candidates_anywhere_still_reports_nothing_reviewable(self):
-        # The guard now checks for CANDIDATES, not merely a session entry,
-        # since every servicer is stashed. Original meaning preserved.
+    def test_an_audit_with_no_candidates_is_a_complete_review_and_reports(self):
+        """AMENDED 2026-08-13 for D4. This previously asserted a 400,
+        "This audit produced no reviewable corrections."
+
+        CLIENT-CONFIRMED: under a completeness model, zero candidates is 0 of 0 --
+        the most complete review possible, and reporting-ready. Refusing it implied
+        a report is only issuable when the audit found problems, which left a clean
+        month with no path to a Monthly Servicer Report or a Final Audited
+        Portfolio Summary at all. The 400 is deliberately gone.
+
+        The reviewer-name 400 is NOT relaxed and is still asserted by
+        test_missing_reviewer_name_behaviour_is_unchanged above -- an unattributed
+        sign-off is not an audit record, even of a clean month."""
         sid = _session(candidates_a=[])
         status, body = _post({"session_id": sid, "reviewed_by": "QA",
                               "decisions": [{"id": "x", "decision": "approve"}]})
-        self.assertEqual(status, 400)
-        self.assertIn("no reviewable corrections", body["error"])
+        self.assertEqual(status, 200)
+        self.assertEqual(body["review_completeness"]["total"], 0)
+        self.assertEqual(body["review_completeness"]["pending"], 0)
+        self.assertTrue(body["review_completeness"]["review_complete"])
+        self.assertTrue(body["reporting_readiness"]["reporting_ready"])
+        self.assertEqual(body["reporting_readiness"]["blocking_reasons"], [])
+        # ...and the reports the old 400 made unreachable are produced.
+        self.assertIsNotNone(body["portfolio_summary_final_b64"])
+        self.assertEqual(body["status"], "complete")
+        # The id matched no candidate, so it is unknown and counts toward neither
+        # condition -- it must not make the review look partially decided.
+        self.assertEqual(body["unknown_ids"], ["x"])
+        self.assertEqual(body["review_completeness"]["unknown"], 1)
 
 
 class FrontendContractTests(unittest.TestCase):

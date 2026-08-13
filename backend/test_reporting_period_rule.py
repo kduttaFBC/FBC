@@ -430,12 +430,22 @@ class ProductionBehaviourIsUnchangedTests(unittest.TestCase):
         sig = inspect.signature(checks._infer_cycle_month)
         self.assertEqual(list(sig.parameters), ["soup_servicer_df"])
 
-    def test_production_still_does_not_read_a_servicer_reporting_period(self):
+    def test_no_cycle_month_module_reads_a_servicer_reporting_period(self):
+        """The modules that DERIVE or RESOLVE the audit cycle month must not
+        see a stated reporting period at all.
+
+        NARROWED (2026-08-11, Monthly Servicer Report): this assertion
+        originally covered file_readers too, as a proxy for "the stated period
+        influences nothing". file_readers now exposes read_remittance_date so
+        the Monthly Servicer Report can PRINT the remittance date in its
+        metadata block -- a presentational read that never touches the cycle
+        month. The proxy was replaced with the invariant it stood for, asserted
+        directly in the two tests below; checks.py, where _infer_cycle_month
+        lives, is still held to the original bar."""
         import corrections
         import preflight
         import report
-        for name, module in (("checks", checks), ("file_readers", file_readers),
-                             ("main", main), ("corrections", corrections),
+        for name, module in (("checks", checks), ("corrections", corrections),
                              ("preflight", preflight), ("report", report)):
             body = "\n".join(line for line in inspect.getsource(module).splitlines()
                              if not line.strip().startswith("#"))
@@ -444,9 +454,32 @@ class ProductionBehaviourIsUnchangedTests(unittest.TestCase):
                     self.assertNotIn(
                         label, body,
                         f"{name} now reads '{label}' -- reporting period validation "
-                        f"has been wired into production. Revisit the CLIENT-CONFIRMED "
-                        f"(2026-08-11) decision: a disagreement is a REVIEW issue and "
-                        f"must never change the cycle month.")
+                        f"has been wired into the cycle-month path. Revisit the "
+                        f"CLIENT-CONFIRMED (2026-08-11) decision: a disagreement is a "
+                        f"REVIEW issue and must never change the cycle month.")
+
+    def test_the_remittance_date_reader_never_reaches_the_cycle_month(self):
+        """file_readers.read_remittance_date exists for the Monthly Servicer
+        Report's metadata block. It must never feed _infer_cycle_month,
+        _resolve_portfolio_summary_cycle_month, or any cycle_month variable."""
+        body = "\n".join(line for line in inspect.getsource(main).splitlines()
+                         if not line.strip().startswith("#"))
+        for line in body.splitlines():
+            if "read_remittance_date" not in line:
+                continue
+            with self.subTest(line=line.strip()):
+                self.assertNotIn("cycle_month", line)
+                self.assertNotIn("_infer_cycle_month", line)
+        source = inspect.getsource(file_readers.read_remittance_date)
+        self.assertNotIn("cycle", source)
+
+    def test_the_cycle_month_still_comes_only_from_soup(self):
+        """The invariant the proxy above stood for, asserted directly."""
+        self.assertEqual(list(inspect.signature(checks._infer_cycle_month).parameters),
+                         ["soup_servicer_df"])
+        body = inspect.getsource(checks._infer_cycle_month)
+        self.assertIn("Payment Month", body)
+        self.assertNotIn("remittance", body.lower())
 
     def test_the_only_period_enforcement_is_the_mixed_month_guard(self):
         """The one place a reporting period stops an audit today: several

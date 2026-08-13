@@ -458,11 +458,167 @@ def _write_final_summary_section(ws, start_row, title, rows, number_format, alig
     return header_row + 1 + len(rows) + 2       # one blank row between sections
 
 
+# CLIENT-CONFIRMED (2026-08-13): a fourth section, FINAL AUDITED ONLY, putting
+# the current period's terminal activity beside the population it came out of.
+#
+# Deliberately NOT added to FINAL_SUMMARY_SECTIONS. That tuple is shared by both
+# workbook writers, and test_original_summary_final_format.py asserts the
+# Original summary's section titles equal it exactly and that each deal label
+# appears len(FINAL_SUMMARY_SECTIONS) times. Adding a Final-Audited-only section
+# there would break both assertions -- correctly, since the Original summary
+# does not carry this section.
+FINAL_SUMMARY_TERMINAL_SECTION = "CURRENT PERIOD TERMINAL ACTIVITY"
+
+# (header, key, kind). kind drives the number format only -- "int" for counts,
+# "money" for dollars -- because this section mixes the two in one row, unlike
+# the three sections above which are each single-format.
+#
+# Servicing Population and Outstanding are POPULATION measures; Paid In Full and
+# Liquidation are CURRENT PERIOD TERMINAL ACTIVITY and are never added into
+# either (their dollars are BEGINNING balance -- what left the portfolio -- not
+# ending balance). The section presents them side by side precisely so a reader
+# stops inferring that the four columns sum to anything.
+FINAL_SUMMARY_TERMINAL_COLUMNS = (
+    ("Servicing Population", "Servicing Population", "int"),
+    ("Outstanding", "Outstanding", "int"),
+    ("PIF Count", "Paid In Full", "int"),
+    ("PIF ($)", "Paid In Full ($)", "money"),
+    ("Liquidation Count", "Liquidation", "int"),
+    ("Liquidation ($)", "Liquidation ($)", "money"),
+)
+
+_TERMINAL_INT_FORMAT = "#,##0"
+_TERMINAL_MONEY_FORMAT = '"$"#,##0.00'
+
+
+def _write_terminal_activity_section(ws, start_row, rows):
+    """The Current Period Terminal Activity section.
+
+    Same visual grammar as _write_final_summary_section -- title band, header
+    row at the shared height, per-deal Total row followed by its servicers,
+    blank separator between deal blocks -- but its own writer because this
+    section has its own column set and mixes integer and currency formats in a
+    single row, which that function's one-format signature cannot express.
+
+    rows is [(label, values, is_total)] with values already ordered to match
+    FINAL_SUMMARY_TERMINAL_COLUMNS, or (None, None, None) for a separator.
+    Computes nothing: every value arrives already calculated.
+
+    Returns the next free row."""
+    width = len(FINAL_SUMMARY_TERMINAL_COLUMNS) + 1
+
+    ws.cell(row=start_row, column=1,
+            value=FINAL_SUMMARY_TERMINAL_SECTION).font = _SECTION_FONT
+    for col in range(1, width + 1):
+        c = ws.cell(row=start_row, column=col)
+        c.fill = HEADER_FILL
+        c.border = BORDER
+        if col > 1:
+            c.value = None
+
+    header_row = start_row + 1
+    headers = ["Servicer"] + [h for h, _key, _kind in FINAL_SUMMARY_TERMINAL_COLUMNS]
+    for col, name in enumerate(headers, start=1):
+        c = ws.cell(row=header_row, column=col, value=name)
+        c.fill = HEADER_FILL
+        c.font = HEADER_FONT
+        c.border = BORDER
+        c.alignment = Alignment(vertical="center",
+                                horizontal="left" if col == 1 else "right",
+                                wrap_text=True)
+    ws.row_dimensions[header_row].height = _HEADER_ROW_HEIGHT
+
+    formats = [_TERMINAL_INT_FORMAT if kind == "int" else _TERMINAL_MONEY_FORMAT
+               for _h, _key, kind in FINAL_SUMMARY_TERMINAL_COLUMNS]
+
+    shade = 0
+    for offset, (label, values, is_total) in enumerate(rows):
+        r = header_row + 1 + offset
+        if label is None:
+            shade = 0
+            continue
+        if is_total:
+            shade = 0
+            fill = _TOTAL_FILL
+        else:
+            fill = ALT_FILL if shade % 2 else WHITE_FILL
+            shade += 1
+        label_cell = ws.cell(row=r, column=1, value=label)
+        label_cell.border = BORDER
+        label_cell.alignment = Alignment(vertical="center", horizontal="left")
+        label_cell.fill = fill
+        if is_total:
+            label_cell.font = _TOTAL_FONT
+        for col, value in enumerate(values, start=2):
+            c = ws.cell(row=r, column=col, value=value)
+            c.border = BORDER
+            c.number_format = formats[col - 2]
+            c.alignment = Alignment(vertical="center", horizontal="right")
+            c.fill = fill
+            if is_total:
+                c.font = _TOTAL_FONT
+    return header_row + 1 + len(rows) + 2
+
+
+def _terminal_activity_values(counts, dollars):
+    """One row's values in FINAL_SUMMARY_TERMINAL_COLUMNS order. Counts come
+    from the counts record and dollars from the dollars record -- the same two
+    records the other three sections read, so this section cannot show a
+    different population than they do."""
+    out = []
+    for _header, key, kind in FINAL_SUMMARY_TERMINAL_COLUMNS:
+        if kind == "int":
+            out.append(int(counts.get(key, 0) or 0))
+        else:
+            out.append(dollars.get(key, 0.0) or 0.0)
+    return out
+
+
 FINAL_SUMMARY_DEFAULT_TITLE = "Final Audited Portfolio Summary"
 
 
+_BLOCKED_FONT = Font(bold=True, color="9C0006")
+_BLOCKED_FILL = PatternFill("solid", fgColor="FFC7CE")
+
+# D3 (CLIENT-CONFIRMED 2026-08-13). A blocked SOUP deal is named in every
+# section rather than omitted or zero-filled.
+#
+#   OMITTED would be the exact defect D3 closes -- a deal silently absent is
+#   indistinguishable from a deal that did not exist.
+#   ZERO-FILLED would be worse: $0.00 across a deal's row reads as a real
+#   measurement of an empty portfolio rather than an absence of measurement.
+#
+# So the marker carries the reason in column A and leaves every figure cell
+# EMPTY (None, not 0). A blocked deal's partial servicer rows are not rendered
+# either -- showing some of its servicers would be a degraded summary, the same
+# defect as a partial Monthly Servicer Report.
+_BLOCKED_LABEL_SUFFIX = " — BLOCKED"
+BLOCKED_SECTION_TITLE = "DEALS BLOCKED — NO MONTHLY SERVICER REPORT PRODUCED"
+
+
+def _write_blocked_deal_rows(ws, start_row, blocked_deals, width):
+    """Appends one marker row per blocked deal. Returns the next free row."""
+    row = start_row
+    for entry in blocked_deals or []:
+        deal = entry.get("deal") or "Unassigned"
+        label = f"{deal}{_BLOCKED_LABEL_SUFFIX}: {entry.get('reason') or 'blocked'}"
+        c = ws.cell(row=row, column=1, value=label)
+        c.font = _BLOCKED_FONT
+        c.fill = _BLOCKED_FILL
+        c.border = BORDER
+        c.alignment = Alignment(vertical="center", horizontal="left")
+        for col in range(2, width + 1):
+            b = ws.cell(row=row, column=col)
+            b.value = None                     # never 0 -- see above
+            b.fill = _BLOCKED_FILL
+            b.border = BORDER
+        row += 1
+    return row
+
+
 def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None,
-                                           title=FINAL_SUMMARY_DEFAULT_TITLE):
+                                           title=FINAL_SUMMARY_DEFAULT_TITLE,
+                                           blocked_deals=None):
     """The stacked-section Portfolio Summary workbook.
 
     blocks comes from checks.group_portfolio_summary_by_deal -- one entry per
@@ -505,12 +661,12 @@ def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None,
         ws.cell(row=2, column=1,
                 value=f"Reporting Period: {period}").font = _REPORT_SUBTITLE_FONT
 
-    count_rows, pct_rows, dollar_rows = [], [], []
+    count_rows, pct_rows, dollar_rows, terminal_rows = [], [], [], []
     for index, block in enumerate(blocks):
         if index:
             # One blank row between deal blocks so 2024 and 2025 read as
             # distinct blocks rather than one continuous list.
-            for rows in (count_rows, pct_rows, dollar_rows):
+            for rows in (count_rows, pct_rows, dollar_rows, terminal_rows):
                 rows.append((None, None, None))
         totals = block["totals"]
         label = totals["counts"].get("Servicer", block["label"])
@@ -523,6 +679,17 @@ def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None,
         dollar_rows.append((label,
                             [totals["dollars"].get(f"{c} ($)", 0.0)
                              for c in FINAL_SUMMARY_CATEGORIES], True))
+        terminal_rows.append((label,
+                              _terminal_activity_values(totals["counts"],
+                                                        totals["dollars"]), True))
+        # Servicer rows are paired by position: block["counts"] and
+        # block["dollars"] are the same servicers in the same upload order (both
+        # come from one verified_portfolio_summary_views call per servicer), which
+        # is what lets this section read a count and a dollar from the same row.
+        for count_record, dollar_record in zip(block["counts"], block["dollars"]):
+            terminal_rows.append((count_record.get("Servicer", ""),
+                                  _terminal_activity_values(count_record,
+                                                            dollar_record), False))
         for record in block["counts"]:
             count_rows.append((record.get("Servicer", ""),
                                [int(record.get(c, 0) or 0)
@@ -537,12 +704,34 @@ def generate_final_portfolio_summary_bytes(blocks, buffer, cycle_month=None,
 
     # Sections start below the two heading lines plus a blank spacer.
     row = 4
+    # D3: blocked deals are named BEFORE any figures, so the caveat precedes the
+    # data rather than trailing it. A reader cannot reach the COUNT section
+    # without passing the statement that a deal produced no report.
+    if blocked_deals:
+        width = len(FINAL_SUMMARY_CATEGORIES) + 1
+        band = ws.cell(row=row, column=1, value=BLOCKED_SECTION_TITLE)
+        band.font = _SECTION_FONT
+        for col in range(1, width + 1):
+            c = ws.cell(row=row, column=col)
+            c.fill = HEADER_FILL
+            c.border = BORDER
+            if col > 1:
+                c.value = None
+        row = _write_blocked_deal_rows(ws, row + 1, blocked_deals, width)
+        row += 1
     # Percentages are already scaled (84.33 means 84.33%), so a literal "%"
     # suffix -- Excel's native 0.00% format would multiply by 100 again.
     row = _write_final_summary_section(ws, row, "COUNT", count_rows, "#,##0", "right")
     row = _write_final_summary_section(ws, row, "BALANCE %", pct_rows, '#,##0.00"%"', "right")
     row = _write_final_summary_section(ws, row, "BALANCE ($)", dollar_rows,
                                        '"$"#,##0.00', "right")
+    # FINAL AUDITED ONLY. The Original Portfolio Summary shares this layout but
+    # reports the lender's submission, where "current period terminal activity"
+    # would be the servicer's own assertion rather than the audited outcome --
+    # the distinction this section exists to make. Keyed off the title, the same
+    # single input that already decides which report this is.
+    if title == FINAL_SUMMARY_DEFAULT_TITLE:
+        row = _write_terminal_activity_section(ws, row, terminal_rows)
 
     ws.column_dimensions["A"].width = 30
     for i in range(2, len(FINAL_SUMMARY_CATEGORIES) + 2):
