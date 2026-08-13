@@ -1387,6 +1387,14 @@ def format_self_declared_reviewer(name):
 _DECISION_APPROVE = "approve"
 _DECISION_REJECT = "reject"
 _DECISION_RETURN = "return"
+# D4 (CLIENT-CONFIRMED 2026-08-13): the ONLY decision strings that constitute an
+# adjudication. Exposed so main.py's completeness computation can tell a real
+# decision from an unrecognised one WITHOUT duplicating this vocabulary. A
+# decision outside this set is not a decision: it is counted as PENDING, so it
+# blocks final reporting rather than silently satisfying the gate while nothing
+# is written for that recommendation.
+VALID_DECISIONS = frozenset(("approve", "reject", "return"))
+
 _DECISION_LABELS = {
     _DECISION_APPROVE: "Approved and applied",
     _DECISION_REJECT: "Rejected",
@@ -1441,6 +1449,18 @@ def generate_reviewed_workbook(
     empty = {
         "file_bytes": None, "filename": None,
         "applied_count": 0, "rejected_count": 0, "returned_count": 0,
+        # D4 (CLIENT-CONFIRMED 2026-08-13). An APPROVAL that did not take
+        # effect: the value was refused by validate_approved_value, or
+        # _apply_one_correction could not write it safely. Both are REVIEWED but
+        # NOT REPORTABLE -- the reviewer decided, and the workbook does not
+        # contain what they decided -- so either blocks final reporting.
+        #
+        # A real counter rather than len(corrections_not_applied). That list is
+        # exactly this count today (it is appended in only the two approve-failure
+        # branches below and nowhere else), but a future append for a non-approve
+        # reason would silently corrupt the reporting-readiness gate. Incremented
+        # beside _DECISION_LABELS, where the decision vocabulary already lives.
+        "approved_not_applied_count": 0,
         "corrections_not_applied": [], "unknown_ids": [], "skip_reason": None,
         # Always present, even on an early return, so every caller sees one
         # contract and never has to guess whether the key exists.
@@ -1469,6 +1489,7 @@ def generate_reviewed_workbook(
     log_rows = []
     corrections_not_applied = []
     applied_count = rejected_count = returned_count = 0
+    approved_not_applied_count = 0
     # {(gp, field): approved_value} -- the VERIFIED layer.
     #
     # Populated in exactly one place: the `written_ok` branch below, the same
@@ -1551,6 +1572,7 @@ def generate_reviewed_workbook(
                 "gp": gp, "field": field,
                 "reason": f"Approved value not written — {result}",
             })
+            approved_not_applied_count += 1
             log_rows.append({
                 **base_row,
                 "approved_value": approved_input,
@@ -1591,6 +1613,7 @@ def generate_reviewed_workbook(
             # reason is surfaced, and it is logged as a decided-but-unwritten
             # row so the attempt isn't lost.
             corrections_not_applied.append({"gp": gp, "field": field, "reason": detail})
+            approved_not_applied_count += 1
             log_rows.append({
                 **base_row,
                 "approved_value": approved_value,
@@ -1622,6 +1645,7 @@ def generate_reviewed_workbook(
         "applied_count": applied_count,
         "rejected_count": rejected_count,
         "returned_count": returned_count,
+        "approved_not_applied_count": approved_not_applied_count,
         "corrections_not_applied": corrections_not_applied,
         "unknown_ids": unknown_ids,
         "skip_reason": None,

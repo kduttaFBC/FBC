@@ -159,7 +159,22 @@ export default function CorrectionReview({ recommendations, sessionId }) {
     () => recs.filter((r) => decisionOf(r.id).decision).length,
     [recs, decisions]
   )
+  const pendingCount = recs.length - decidedCount
+  // D4 (CLIENT-CONFIRMED 2026-08-13): submission is deliberately NOT gated on
+  // pendingCount. Corrected workbooks and Correction Logs are PER-DECISION
+  // artifacts and are explicitly not gated, so a reviewer must be able to record
+  // partial review work and take the workbooks for it. D4 gates FINAL REPORTING,
+  // not the ability to record a completed decision.
+  //
+  // Reviewer name is still required -- an unattributed sign-off is not an audit
+  // record -- and an empty submission still records nothing, so at least one
+  // decision is required. Both mirror the server's own guards; neither is the
+  // authority. review_complete and reporting_ready are computed SERVER-SIDE and
+  // read off the response, never derived here.
   const blocked = !reviewer.trim() || decidedCount === 0
+  // Zero recommendations is 0 of 0 -- complete and reporting-ready -- so the
+  // reviewer must still be able to submit and get the reports.
+  const nothingToReview = recs.length === 0
 
   const submit = async () => {
     setSubmitting(true)
@@ -200,7 +215,14 @@ export default function CorrectionReview({ recommendations, sessionId }) {
     }
   }
 
-  if (!recs.length) return null
+  // D4 (CLIENT-CONFIRMED 2026-08-13): a clean month must still be able to record
+  // its review and produce its reports. This component previously returned null
+  // when there was nothing to review, so the reviewer-name field and the submit
+  // button never rendered at all -- there was no path from a clean audit to a
+  // Monthly Servicer Report or a Final Audited Portfolio Summary. 0 of 0 is the
+  // most complete review possible, and it is reporting-ready.
+  // NOTE: no early return here any more. `nothingToReview` drives the table and
+  // the bulk controls instead, so the submit affordance is always present.
 
   return (
     <div className="card" style={{ marginBottom: 22 }}>
@@ -211,6 +233,65 @@ export default function CorrectionReview({ recommendations, sessionId }) {
         return it to the servicer. The corrected workbook is generated from your decisions, from the
         original uploaded file; the original is never modified.
       </p>
+
+      {nothingToReview && (
+        <div className="alert" style={{ marginBottom: 12 }}>
+          <strong>Nothing to review — this audit produced no recommendations.</strong>
+          <div className="hint" style={{ marginTop: 4 }}>
+            That is a complete review (0 of 0) and is ready for final reporting. Enter
+            your name and record it to generate the Monthly Servicer Report and the
+            Final Audited Portfolio Summary.
+          </div>
+        </div>
+      )}
+
+      {/* D4 progress + bulk affordances. A gate tedious enough to route around is
+          not a control: at 121 recommendations and rising, "reject all remaining"
+          and "jump to next undecided" are what make finishing a review feasible. */}
+      {!nothingToReview && (
+        <div className="map-row" style={{ gridTemplateColumns: '1.6fr 1fr', marginBottom: 12 }}>
+          <div className="field-name">
+            {decidedCount} of {recs.length} reviewed
+            {pendingCount > 0 ? ` · ${pendingCount} pending` : ' · none pending'}
+            <div className="hint" style={{ marginTop: 2 }}>
+              {pendingCount > 0
+                ? 'Final reporting is blocked until every recommendation reaches a reportable disposition.'
+                : 'All recommendations decided. Reporting readiness is confirmed by the server on submission.'}
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button
+              className="btn"
+              disabled={pendingCount === 0}
+              onClick={() => {
+                const next = recs.find((r) => !decisionOf(r.id).decision)
+                if (!next) return
+                const el = document.getElementById(`rec-${next.id}`)
+                if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' })
+              }}
+            >
+              Jump to next undecided
+            </button>
+            <button
+              className="btn"
+              disabled={pendingCount === 0}
+              onClick={() =>
+                setDecisions((cur) => {
+                  const out = { ...cur }
+                  recs.forEach((r) => {
+                    if (!(out[r.id] && out[r.id].decision)) {
+                      out[r.id] = { ...out[r.id], decision: 'reject' }
+                    }
+                  })
+                  return out
+                })
+              }
+            >
+              Reject all remaining ({pendingCount})
+            </button>
+          </div>
+        </div>
+      )}
 
       <table className="detail-table" style={{ width: '100%' }}>
         <thead>
@@ -235,7 +316,8 @@ export default function CorrectionReview({ recommendations, sessionId }) {
             const currentPeriod = currentPeriodEvidence(r)
             return (
               <React.Fragment key={r.id}>
-                <tr>
+                {/* id is the jump-to-next-undecided anchor. */}
+                <tr id={`rec-${r.id}`}>
                   <td>
                     <strong>{r.gp}</strong>
                     <div className="hint">{r.servicer}{r.postings ? ` · ${r.postings} posting${r.postings === 1 ? '' : 's'}` : ''}</div>
@@ -400,12 +482,34 @@ export default function CorrectionReview({ recommendations, sessionId }) {
         {/* No authentication exists — the recorded name is self-declared and is
             written to the Correction Log labelled "(unverified)". */}
         <span className="hint">Recorded as self-declared (unverified) — no authentication.</span>
-        <button className="btn btn-teal" onClick={submit} disabled={blocked || submitting}>
-          {submitting ? 'Recording…' : `Record ${decidedCount} decision${decidedCount === 1 ? '' : 's'}`}
+        <button
+          className="btn btn-teal"
+          onClick={submit}
+          disabled={(blocked && !nothingToReview) || !reviewer.trim() || submitting}
+        >
+          {submitting
+            ? 'Recording…'
+            : nothingToReview
+              ? 'Record review (nothing to review)'
+              : `Record ${decidedCount} decision${decidedCount === 1 ? '' : 's'}`}
         </button>
-        {blocked && !submitting && (
+        {!submitting && !reviewer.trim() && (
+          <span className="hint">A reviewer name is required.</span>
+        )}
+        {!submitting && reviewer.trim() && !nothingToReview && decidedCount === 0 && (
+          <span className="hint">Decide at least one recommendation.</span>
+        )}
+        {/* D4: pending items do NOT block submission -- they block FINAL
+            REPORTING. Said plainly here so the reviewer knows a partial
+            submission is legitimate and what it will and will not produce. */}
+        {!submitting && reviewer.trim() && decidedCount > 0 && pendingCount > 0 && (
           <span className="hint">
-            {reviewer.trim() ? 'Decide at least one recommendation.' : 'A reviewer name is required.'}
+            <strong>
+              {decidedCount} of {recs.length} reviewed, {pendingCount} pending. Final
+              reporting is blocked.
+            </strong>{' '}
+            Recording now still produces corrected workbooks and Correction Logs for
+            the decisions you have made.
           </span>
         )}
       </div>
@@ -473,6 +577,62 @@ export default function CorrectionReview({ recommendations, sessionId }) {
               </button>
             </div>
           ))}
+          {/* D4 — review completeness and reporting readiness, BOTH computed
+              server-side and only read here. They can legitimately disagree: a
+              review can be 100% decided and still not reportable, when a
+              recommendation was returned to the servicer or an approval could not
+              be applied. Corrected workbooks above are returned either way. */}
+          {result.reporting_readiness && !result.reporting_readiness.reporting_ready && (
+            <div className="alert alert-error" style={{ marginTop: 10 }}>
+              <strong>Final reporting is blocked.</strong>
+              <div className="hint" style={{ marginTop: 4 }}>
+                {result.review_completeness && (
+                  <>
+                    {result.review_completeness.approved_applied +
+                      result.review_completeness.rejected +
+                      result.review_completeness.returned +
+                      result.review_completeness.approved_not_applied}{' '}
+                    of {result.review_completeness.total} reviewed,{' '}
+                    {result.review_completeness.pending} pending.{' '}
+                  </>
+                )}
+                No Monthly Servicer Report and no Final Audited Portfolio Summary was
+                produced. Your corrected workbooks and Correction Logs above are
+                complete for the decisions you recorded.
+              </div>
+              {(result.reporting_readiness.blocking_reasons || []).includes('returned') && (
+                <div className="hint" style={{ marginTop: 4 }}>
+                  {result.review_completeness.returned} recommendation(s) were{' '}
+                  <strong>returned to the servicer</strong> — reviewed, but the value is
+                  awaiting a resubmission, so it cannot be reported as final.
+                </div>
+              )}
+              {(result.reporting_readiness.blocking_reasons || []).includes('approved_not_applied') && (
+                <div className="hint" style={{ marginTop: 4 }}>
+                  {result.review_completeness.approved_not_applied} approval(s) could{' '}
+                  <strong>not be applied</strong> (value refused, or no verifiable row to
+                  write to). The review is decided but the workbook does not contain the
+                  approved value. This cannot be cleared from this page — the source file
+                  needs correcting and the audit re-running.
+                </div>
+              )}
+              {(result.reporting_readiness.blocking_reasons || []).includes('pending') && (
+                <div className="hint" style={{ marginTop: 4 }}>
+                  Decide the remaining {result.review_completeness.pending} recommendation(s)
+                  and record again to produce the reports.
+                </div>
+              )}
+            </div>
+          )}
+          {result.reporting_readiness && result.reporting_readiness.reporting_ready &&
+           result.review_completeness && (
+            <div className="hint" style={{ marginTop: 10 }}>
+              Review complete and reporting ready — {result.review_completeness.total} of{' '}
+              {result.review_completeness.total} at a reportable disposition (
+              {result.review_completeness.approved_applied} applied,{' '}
+              {result.review_completeness.rejected} rejected).
+            </div>
+          )}
           {/* D3 — per-deal blocked state. A SOUP deal whose expected servicers
               did not all reach the report produces NO workbook, and says so
               here as a prominent panel rather than a hint. Rendered per deal:

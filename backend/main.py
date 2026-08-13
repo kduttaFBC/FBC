@@ -137,6 +137,14 @@ def _describe_deal_block(state):
     control exists to close. Reads only the reconciliation state; derives
     nothing."""
     deal = state.get("deal") or "unassigned"
+    # D4 takes precedence in the message: when reporting is not ready the deal
+    # was never assessed on its own merits, and telling the reviewer to fix a
+    # servicer file would send them to the wrong thing.
+    readiness = state.get("readiness_block")
+    if readiness:
+        return (f"SOUP deal {deal}: final reporting is blocked until Human Review "
+                f"reaches a reportable disposition for every recommendation "
+                f"({readiness}) — no Monthly Servicer Report was produced")
     failures = state.get("failures") or []
     if failures:
         parts = ", ".join(
@@ -831,11 +839,10 @@ async def corrections_review(payload: dict):
         reviewed_on = payload.get("reviewed_on")
         decisions = payload.get("decisions") or []
 
-        if not decisions:
-            return JSONResponse(status_code=400, content={
-                "error": "No decisions were submitted. Approve, reject, or return at least one "
-                         "recommendation before recording.",
-            })
+        # NOTE: the "no decisions submitted" check moved BELOW the session load.
+        # D4 (CLIENT-CONFIRMED 2026-08-13) allows one case with zero decisions --
+        # zero candidates, i.e. 0 of 0 -- and whether that holds can only be known
+        # once the session's candidate set is in hand.
 
         # An approval that cannot be attributed is not an audit record. The
         # name is self-declared (no auth) and recorded as unverified, but it
@@ -863,9 +870,25 @@ async def corrections_review(payload: dict):
         # Portfolio Summary needs one row each), so a non-empty
         # correction_state no longer implies anything was reviewable. This
         # keeps the original meaning of the guard exactly.
-        if not any((entry.get("candidates") or []) for entry in correction_state.values()):
+        # D4 (CLIENT-CONFIRMED 2026-08-13): the 400 that used to live here is
+        # RELAXED. Under a completeness model, zero candidates is 0 of 0 -- the
+        # most complete review possible, and reporting-ready -- so a clean month
+        # must be able to produce its Monthly Servicer Report and Final Audited
+        # Portfolio Summary. Refusing it implied a report is only issuable when
+        # the audit found problems.
+        #
+        # The reviewer-name requirement above is deliberately NOT relaxed: an
+        # unattributed sign-off is not an audit record, even of a clean month.
+        _has_candidates = any((entry.get("candidates") or [])
+                              for entry in correction_state.values())
+        if not decisions and _has_candidates:
+            # Recommendations exist and none was decided. Submission requires at
+            # least one decision -- a reviewer may submit a PARTIAL review (that is
+            # explicitly allowed and produces corrected workbooks), but an empty
+            # one records nothing and is refused as before.
             return JSONResponse(status_code=400, content={
-                "error": "This audit produced no reviewable corrections.",
+                "error": "No decisions were submitted. Approve, reject, or return at least one "
+                         "recommendation before recording.",
             })
 
         # Route each decision to the servicer that owns its recommendation id.
@@ -886,6 +909,7 @@ async def corrections_review(payload: dict):
         corrected_workbooks = []
         corrections_not_applied = []
         applied_total = rejected_total = returned_total = 0
+        approved_not_applied_total = 0
         # {servicer: {(gp, field): approved_value}} -- the VERIFIED layer, the
         # single source both post-review artifacts are built from.
         verified_overrides_by_servicer = {}
@@ -909,6 +933,7 @@ async def corrections_review(payload: dict):
             applied_total += outcome["applied_count"]
             rejected_total += outcome["rejected_count"]
             returned_total += outcome["returned_count"]
+            approved_not_applied_total += outcome.get("approved_not_applied_count", 0)
             unknown_ids.extend(outcome.get("unknown_ids") or [])
 
             for not_applied in outcome.get("corrections_not_applied") or []:
@@ -933,6 +958,118 @@ async def corrections_review(payload: dict):
                     "servicer": servicer,
                     "reason": outcome["skip_reason"],
                 })
+
+        # ---- D4: review completeness and reporting readiness ----------------
+        # CLIENT-CONFIRMED (2026-08-13). TWO SEPARATE CONDITIONS, and they can
+        # legitimately disagree:
+        #
+        #   REVIEW COMPLETENESS   every candidate has a reviewer decision.
+        #                         pending == 0.
+        #   REPORTING READINESS   every candidate reached a disposition that
+        #                         PERMITS FINAL REPORTING. non_reportable == 0.
+        #
+        # Disposition -> reportable?
+        #   approved AND applied   yes   the approved value is in the workbook
+        #   rejected               yes   the submitted value remains authoritative
+        #   returned to servicer   NO    reviewer flagged the value as questionable
+        #                                and expects a resubmission; the MSR would
+        #                                otherwise report a flagged value as final
+        #   approved, not applied  NO    the decision did not take effect, so the
+        #                                workbook does not contain what was approved
+        #   pending                NO    not reviewed
+        #   unknown id             --    counts toward neither, ever
+        #
+        # reporting_ready implies review_complete, never the reverse. The state
+        # that only exists because these are separate -- complete but NOT ready --
+        # is the real June workflow: everything decided, one returned.
+        #
+        # D4 GATES FINAL REPORTING, NOT THE RECORDING OF REVIEW WORK. Corrected
+        # workbooks and their Correction Logs are PER-DECISION artifacts, are
+        # generated above, and are returned regardless of either condition. A
+        # reviewer may deliberately submit a partial review; that is accepted,
+        # recorded and downloadable. Only the two POPULATION-level reports are
+        # withheld.
+        #
+        # WHY THIS SITS HERE and not before the loop above: approved_not_applied
+        # is an OUTCOME of the write attempt, not a property of the payload, so
+        # readiness is unknowable until the workbooks have been generated. Since
+        # those are never gated they are generated either way, so nothing is
+        # produced wastefully -- and this still precedes every line of report work.
+        #
+        # SERVER-CALCULATED ONLY. pending is derived from the session's own
+        # candidate set minus the ids actually decided, so a client cannot
+        # under-report it by omitting undecided items -- which is exactly what the
+        # review page does today. Nothing in the payload can assert either flag.
+        _all_candidate_ids = {
+            cand["id"]
+            for entry in correction_state.values()
+            for cand in (entry.get("candidates") or [])
+        }
+        # An UNRECOGNISED decision string is not a decision. corrections.py logs it
+        # and refuses to write ("Unrecognised decision ... — not applied"), but it
+        # increments no disposition counter -- so counting it as decided would leave
+        # it in NO bucket, making reportable + non_reportable < total and letting a
+        # payload of {"decision": "banana"} pass the readiness gate while nothing
+        # was written for that recommendation. It counts as PENDING instead, which
+        # blocks. The vocabulary is read from corrections.VALID_DECISIONS rather
+        # than restated here, so the two cannot drift.
+        _decided_ids = {
+            d.get("id") for d in decisions
+            if d.get("id") in _all_candidate_ids
+            and str(d.get("decision") or "").strip().lower() in corrections_mod.VALID_DECISIONS
+        }
+        _pending_total = len(_all_candidate_ids - _decided_ids)
+        _reportable_total = applied_total + rejected_total
+        _non_reportable_total = returned_total + approved_not_applied_total + _pending_total
+        _review_complete = _pending_total == 0
+        _reporting_ready = _non_reportable_total == 0
+
+        _blocking_reasons = []
+        if _pending_total:
+            _blocking_reasons.append("pending")
+        if returned_total:
+            _blocking_reasons.append("returned")
+        if approved_not_applied_total:
+            _blocking_reasons.append("approved_not_applied")
+
+        # The pending items themselves, so the review page can point at them
+        # rather than making the reviewer hunt. Only pending is enumerable here:
+        # returned and approved-not-applied are already itemised in the
+        # Correction Log and corrections_not_applied respectively.
+        _pending_items = [
+            {"servicer": servicer, "gp": cand.get("gp"), "field": cand.get("field"),
+             "recommendation_id": cand["id"]}
+            for servicer, entry in correction_state.items()
+            for cand in (entry.get("candidates") or [])
+            if cand["id"] not in _decided_ids
+        ]
+
+        review_completeness = {
+            "total": len(_all_candidate_ids),
+            "approved_applied": applied_total,
+            "approved_not_applied": approved_not_applied_total,
+            "rejected": rejected_total,
+            "returned": returned_total,
+            "pending": _pending_total,
+            "unknown": len([i for i in unknown_ids if i is not None]),
+            # NOTE ON THE DENOMINATOR. `total` is the CANDIDATE set -- exactly what
+            # the reviewer was shown. corrections_skipped items (eligible for
+            # correction but with no valid posting row to write to) are excluded
+            # STRUCTURALLY, not by subtraction: build_recommendations never puts
+            # them in `candidates`, so they cannot enter this count. Including
+            # them would make the gate unsatisfiable, since a decision on them
+            # could never be applied. They are already reported to the reviewer by
+            # /api/audit's own corrections_skipped field and are not duplicated
+            # here.
+            "review_complete": _review_complete,
+        }
+        reporting_readiness = {
+            "reportable": _reportable_total,
+            "non_reportable": _non_reportable_total,
+            "reporting_ready": _reporting_ready,
+            "blocking_reasons": _blocking_reasons,
+            "blocking_items": _pending_items,
+        }
 
         # ---- Final Audited Portfolio Summary --------------------------------
         # CLIENT-CONFIRMED (2026-08-10): the third layer, generated ONLY here,
@@ -1120,13 +1257,25 @@ async def corrections_review(payload: dict):
             _reported = sorted(reported_by_deal.get(_deal, []))
             _failures = list(deal_failures.get(_deal, []))
             _missing = [s for s in _expected if s not in set(_reported)]
+            # D4 blocks EVERY deal when reporting is not ready. Expressed through
+            # D3's own shape rather than a parallel structure, so the frontend has
+            # one blocked-state renderer and the two gates cannot describe the same
+            # deal differently. D3 remains solely responsible for WHICH deals can
+            # report once D4 has passed -- the readiness term below is simply
+            # unconditional when readiness fails.
             deal_status[_deal] = {
                 "deal": _deal,
-                "status": "blocked" if _missing else "complete",
+                "status": ("blocked" if (_missing or not _reporting_ready)
+                           else "complete"),
                 "servicers_expected": _expected,
                 "servicers_reported": _reported,
                 "failures": _failures,
                 "servicers_missing": _missing,
+                # Present only when D4 is the cause, so _describe_deal_block can
+                # say why without re-deriving it. Stripped from the payload below
+                # alongside servicers_missing.
+                "readiness_block": (None if _reporting_ready
+                                    else ", ".join(_blocking_reasons)),
                 "report_available": False,      # decided by the MSR loop below
             }
 
@@ -1270,7 +1419,13 @@ async def corrections_review(payload: dict):
             {"deal": d, "reason": _describe_deal_block(deal_status[d])}
             for d in _blocked_deals
         ]
-        if _fs_records or _blocked_summary_deals:
+        # D4 gate on the summary. When reporting is not ready NOTHING is produced --
+        # not even a markers-only workbook. A blocked-deal marker is D3's way of
+        # saying "this deal could not be assembled"; a whole summary consisting of
+        # nothing but markers would be an artifact asserting that the review is
+        # finished, which is precisely what D4 has determined is false. The
+        # corrected workbooks above still carry the reviewer's work.
+        if _reporting_ready and (_fs_records or _blocked_summary_deals):
             final_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
             final_buffer = io.BytesIO()
             # CLIENT-CONFIRMED (2026-08-10): one Total PER SOUP DEAL, each
@@ -1305,11 +1460,13 @@ async def corrections_review(payload: dict):
         # the failure mode where total collapse and "nothing to report" look
         # identical. Top-level status is "complete" only when EVERY deal is.
         deals_payload = [
-            {k: v for k, v in deal_status[d].items() if k != "servicers_missing"}
+            {k: v for k, v in deal_status[d].items()
+             if k not in ("servicers_missing", "readiness_block")}
             for d in sorted(deal_status, key=checks_mod._deal_sort_key)
         ]
         overall_status = ("complete"
-                          if all(d["status"] == "complete" for d in deals_payload)
+                          if (_reporting_ready
+                              and all(d["status"] == "complete" for d in deals_payload))
                           else "blocked")
 
         return JSONResponse({
@@ -1319,6 +1476,9 @@ async def corrections_review(payload: dict):
             # D3. Corrected workbooks above are returned regardless of these.
             "status": overall_status,
             "deals": deals_payload,
+            # D4. Both SERVER-CALCULATED; nothing in the payload can assert either.
+            "review_completeness": review_completeness,
+            "reporting_readiness": reporting_readiness,
             "portfolio_summary_final_b64": portfolio_summary_final_b64,
             "portfolio_summary_final_filename": portfolio_summary_final_filename_value,
             "summary": {
