@@ -317,6 +317,49 @@ def consolidate_cycle_postings(servicer_inputs_df):
                 bool((pd.to_numeric(group["Payment Received"], errors="coerce") < 0).any())
                 if "Payment Received" in group.columns else False
             ),
+            # CLIENT-CONFIRMED (2026-08-12). Purely ADDITIVE raw fact, same kind
+            # and same reason as has_negative_posting above: did the servicer
+            # actually FILE a posting for this cycle, as evidenced by the
+            # template's own posting-identity fields?
+            #
+            #   Last Payment Instance? == "Y"  on any posting, OR
+            #   Loan Payment Instance numerically populated on any posting
+            #
+            # Either-or, not both: a servicer may populate the ordinal without
+            # the flag or the reverse, and both independently mean "this row is
+            # a filed posting". Presence is `any posting in the cycle`, matching
+            # has_negative_posting -- a reversal pair can carry the ordinal on
+            # one row and leave it blank on another, and the loan does not stop
+            # having been filed because one row omitted it.
+            #
+            # WHY IT IS A FACT AND NOT A JUDGEMENT. Both columns are literal
+            # template data that this function ALREADY reads to order postings
+            # and identify the cycle's last one (see the sort above). This
+            # records what it already saw; it invents nothing. Deliberately NOT
+            # derived from the "Confirm Principal + Interest = Payment Received"
+            # column, which separates the same loans equally well but is an
+            # Excel FORMULA (=H-G-F) -- python-calamine reads cached values
+            # only, and preflight.py exists precisely because a formula's cache
+            # can be stale, overwritten or absent. A business rule must not
+            # depend on a servicer's helper formula.
+            #
+            # NOT an input to any calculation. Nothing in the delinquency
+            # ladder, payment-sufficiency/BR-002, the reversal deficiency
+            # formula, expected_loan_status, or consolidation itself reads it --
+            # every consolidated value above is byte-for-byte unchanged by its
+            # presence. Its one consumer is the Portfolio Summary "Not Making
+            # Payment" rule (_build_portfolio_summary_record), which needs to
+            # tell a filed no-payment posting from a row that was never filed.
+            "has_filed_posting": (
+                bool(
+                    (group["Last Payment Instance?"].astype("string").str.strip().str.upper() == "Y").any()
+                    if "Last Payment Instance?" in group.columns else False
+                )
+                or bool(
+                    pd.to_numeric(group["Loan Payment Instance"], errors="coerce").notna().any()
+                    if "Loan Payment Instance" in group.columns else False
+                )
+            ),
             # CLIENT-CONFIRMED (2026-08-12). Purely ADDITIVE raw facts, the same
             # kind and for the same reason as has_negative_posting above: the
             # current cycle's own terminal-event dates, recorded here because
@@ -389,6 +432,7 @@ def consolidate_cycle_postings(servicer_inputs_df):
 
     return pd.DataFrame(rows).set_index("SBA GP Number") if rows else pd.DataFrame(
         columns=["posting_count", "loan_status", "dq_status", "received", "has_negative_posting",
+                 "has_filed_posting",
                  "bankruptcy_date", "bankruptcy_date_populated",
                  "paid_in_full_date", "paid_in_full_date_populated",
                  "liquidation_date", "liquidation_date_populated",
@@ -2977,7 +3021,12 @@ def negative_payment_check(servicer_inputs_df, soup_servicer_df, memo_df=None, s
 # revision (2026-08-04) of the original "Ending Balance for every column"
 # spec:
 #   - Outstanding, every delinquency bucket, Not Making Payment, Deferred,
-#     Bankruptcy, and Foreclosure all use ENDING BALANCE.
+#     Bankruptcy, and Foreclosure all use ENDING BALANCE. (Confirmed for Not
+#     Making Payment against Lendistry July 2026: 60 loans summing to
+#     $3,593,725.78 of Ending Balance, matching the client's expected figure.
+#     Beginning Balance happens to give the same total there because every one
+#     of those 60 loans has beginning == ending, so that reconciliation
+#     confirms the loan set and the magnitude, not the field choice.)
 #   - Paid In Full and Liquidation use BEGINNING BALANCE instead -- these
 #     are treated as separate ACTIVITY metrics (how much left the portfolio
 #     this cycle), not part of the remaining outstanding balance. Their
@@ -3047,6 +3096,14 @@ _PORTFOLIO_SUMMARY_CATEGORY_ORDER = [
     "Current", "Delinquent", "30 Days", "60 Days", "90 Days", "120 Days", "150+ Days",
     "Not Making Payment", "Deferred", "Bankruptcy", "Foreclosure", "Liquidation", "Paid In Full",
 ]
+
+# Internal passthrough column, written ONLY by _unit_weight_frame and read ONLY
+# by _build_portfolio_summary_record's Not Making Payment rule. Carries
+# "Beginning Balance == Ending Balance" evaluated on the ORIGINAL balances,
+# because _unit_weight_frame replaces both with unit weights and the comparison
+# would otherwise be trivially true in the counts pass. Not a consolidated fact
+# and never part of any record the caller sees.
+_NMP_BALANCES_UNCHANGED = "_nmp_balances_unchanged"
 
 
 def _build_portfolio_summary_record(si_grouped, servicer_name, dq_status_for_aging_fn):
@@ -3129,12 +3186,69 @@ def _build_portfolio_summary_record(si_grouped, servicer_name, dq_status_for_agi
         # incorrectly classified a loan with no payment DATA at all
         # (unknown) the same as a loan CONFIRMED to have received nothing.
         # Only an explicitly present value that equals exactly 0 counts.
+        #
+        # CLIENT-CONFIRMED (2026-08-12): a SECOND, narrower way in, for a blank
+        # Payment Received that is CORROBORATED as no payment activity rather
+        # than as absent data. The 2026-08-04 rule above stands unchanged and
+        # still decides every present value; this only reaches rows it would
+        # otherwise drop.
+        #
+        # WHY. Measured on Lendistry's July 2026 file: 37 loans reported a
+        # single filed posting with Payment Received, Principal, Net Interest,
+        # Scheduled Payment and Payment Receipt Date ALL empty, no balance
+        # movement, and 120+ day delinquency on 35 of them. 36 of those 37 were
+        # filed by the same servicer as an explicit 0 the month before, for the
+        # same loans in the same condition — the servicer changed how it writes
+        # "no payment this cycle", not what happened. The blank-is-unknown rule
+        # then dropped $2,241,118.06 the audit had counted in June. Excluding
+        # them is the defect; the client's expected 60 loans / $3,593,725.78
+        # reproduces exactly with this branch and only with it.
+        #
+        # THE DISCRIMINATOR IS has_filed_posting, NOT THE SERVICER. A blank
+        # payment field on a posting the servicer actually filed asserts "no
+        # payment"; the same blank on a row carrying no posting identity at all
+        # asserts nothing, and stays unknown. Measured across all 20 available
+        # servicer/period files, this separates perfectly: the 37 Lendistry-2025
+        # rows all carry posting identity, while 2 Lendistry-2024 rows (GP
+        # 4490649110, GP 5462759105) carry none and are correctly left out —
+        # they are unvalidated by the client and unsupported by the data.
+        #
+        # Deliberately NOT part of the corroboration: Payment Receipt Date and
+        # Net Interest. Both are blank on all 39 blank-payment loans in every
+        # available file, so neither discriminates anything, and the receipt
+        # date is not even carried on the consolidated frame.
         received_raw = row.get("received")
-        if (
+        received_present_zero = (
             received_raw is not None
             and pd.notna(received_raw)
             and float(received_raw) == 0
+        )
+
+        principal_raw = row.get("principal")
+        principal_blank_or_zero = (
+            principal_raw is None or pd.isna(principal_raw) or float(principal_raw) == 0
+        )
+        # _unit_weight_frame REWRITES both balance columns to unit weights, so
+        # comparing them here would be trivially true in the counts pass and
+        # would let counts classify a loan the dollars pass rejected — the exact
+        # drift that function's docstring promises is impossible. It therefore
+        # precomputes this predicate from the ORIGINAL balances and passes it
+        # through; the fallback covers the dollars pass, where the real
+        # balances are still present and the column is absent.
+        balances_unchanged = row.get(_NMP_BALANCES_UNCHANGED)
+        if balances_unchanged is None or (
+            not isinstance(balances_unchanged, bool) and pd.isna(balances_unchanged)
         ):
+            balances_unchanged = beginning_balance == ending_balance
+
+        received_blank_corroborated = (
+            (received_raw is None or pd.isna(received_raw))
+            and principal_blank_or_zero
+            and bool(balances_unchanged)
+            and bool(row.get("has_filed_posting"))
+        )
+
+        if received_present_zero or received_blank_corroborated:
             totals["Not Making Payment"] += ending_balance
 
         # Loan Status buckets. Deferred/Bankruptcy/Foreclosure are mutually
@@ -3293,11 +3407,22 @@ def _unit_weight_frame(si_grouped):
     row unconditionally would silently re-admit loans the client confirmed
     must be excluded before any categorisation.
 
+    Any predicate the builder derives FROM the balances must also be preserved
+    here, for the same reason and it is not optional: once both columns are 1.0,
+    "Beginning Balance == Ending Balance" is trivially true, so a rule using it
+    would classify in the counts pass what it rejected in the dollars pass --
+    precisely the drift this function exists to make impossible. The Not Making
+    Payment corroboration rule uses that comparison, so it is evaluated here on
+    the ORIGINAL values and passed through on _NMP_BALANCES_UNCHANGED. Every
+    other input that rule reads (received, principal, has_filed_posting) is left
+    untouched by this function and needs no such treatment.
+
     Never mutates the input."""
     out = si_grouped.copy()
     beginning = pd.to_numeric(out.get("beginning_balance"), errors="coerce").fillna(0.0)
     ending = pd.to_numeric(out.get("ending_balance"), errors="coerce").fillna(0.0)
     eligible = ~((beginning == 0) & (ending == 0))
+    out[_NMP_BALANCES_UNCHANGED] = (beginning == ending)
     out["beginning_balance"] = eligible.astype(float)
     out["ending_balance"] = eligible.astype(float)
     return out
