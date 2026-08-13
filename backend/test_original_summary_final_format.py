@@ -423,15 +423,40 @@ class WorkbookShapeTests(unittest.TestCase):
         self.assertEqual(ws.cell(row=1, column=1).value, "Final Audited Portfolio Summary")
 
     def test_the_two_layouts_are_identical_apart_from_the_title(self):
+        """AMENDED 2026-08-13. Still the same guarantee -- ONE writer, so the
+        Original summary cannot drift from the Final Audited layout across
+        everything the Original carries -- narrowed to exactly that.
+
+        It previously asserted whole-sheet equality including max_row. The
+        client then confirmed a FINAL-AUDITED-ONLY fourth section (CURRENT
+        PERIOD TERMINAL ACTIVITY), so the Final Audited sheet is deliberately
+        longer. Freezing max_row would have pinned "the Original summary must
+        also carry the audited terminal-activity section", which is the opposite
+        of what was confirmed: that section reports the audited outcome, and the
+        Original summary reports the lender's submission.
+
+        The three shared sections are still compared cell for cell, and the
+        next test asserts the ONLY difference is the appended section."""
         original = _render(title="Original Portfolio Summary")["Original Portfolio Summary"]
         final = _render()["Final Audited Portfolio Summary"]
-        self.assertEqual(original.max_row, final.max_row)
         self.assertEqual(original.max_column, final.max_column)
         for r in range(3, original.max_row + 1):      # row 1 is the title
             for c in range(1, original.max_column + 1):
                 with self.subTest(row=r, col=c):
                     self.assertEqual(original.cell(row=r, column=c).value,
                                      final.cell(row=r, column=c).value)
+
+    def test_the_only_extra_content_in_the_final_audited_sheet_is_that_section(self):
+        original = _render(title="Original Portfolio Summary")["Original Portfolio Summary"]
+        final = _render()["Final Audited Portfolio Summary"]
+        self.assertGreater(final.max_row, original.max_row)
+        extra = [str(final.cell(row=r, column=1).value or "")
+                 for r in range(original.max_row + 1, final.max_row + 1)]
+        self.assertIn(report.FINAL_SUMMARY_TERMINAL_SECTION, extra)
+        # ...and none of the three shared section titles is repeated down there.
+        for section in report.FINAL_SUMMARY_SECTIONS:
+            with self.subTest(section=section):
+                self.assertNotIn(section, extra)
 
     def test_the_two_sheet_writer_still_exists_for_the_audited_workbook(self):
         buf = io.BytesIO()

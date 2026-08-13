@@ -3428,6 +3428,44 @@ def _unit_weight_frame(si_grouped):
     return out
 
 
+# CLIENT-CONFIRMED (2026-08-13): the loan count of the population the summary
+# actually reports on, carried beside the categories on the counts record and
+# rendered in the Final Audited summary's Current Period Terminal Activity
+# section. Named as a key rather than added to
+# _PORTFOLIO_SUMMARY_CATEGORY_ORDER on purpose: it is NOT a category. Adding it
+# there would give it a column in COUNT / BALANCE % / BALANCE ($) and a
+# meaningless "Servicing Population ($)" dollar figure, and would change the
+# three existing sections this change must leave alone.
+SERVICING_POPULATION = "Servicing Population"
+
+
+def _eligible_loan_count(si_grouped):
+    """The number of loans that pass the Portfolio Summary eligibility gate.
+
+    CLIENT-CONFIRMED (2026-08-13): computed INDEPENDENTLY from the population,
+    never as Outstanding + Paid In Full + Liquidation. That arithmetic happens
+    to be right on the June 2026 accepted SOUP 2025 files only because every
+    $0-Ending-Balance loan there is a Paid In Full, and it breaks in two ways
+    that occur in real data: it double-counts a PAID-IN-FULL or LIQUIDATION
+    loan carrying a positive balance (Mission Valley GP 4778059109, $276,702.10)
+    and it misses an ACTIVE loan at $0. Categories overlap by design, so no sum
+    over them is a population count.
+
+    Derived through _unit_weight_frame so the eligibility gate is encoded in
+    exactly ONE place: that function already weights each eligible loan 1.0 and
+    each ineligible loan 0.0, so summing the weights IS the eligible-loan
+    count. A loan excluded by the gate, or dropped upstream by closed-at-zero
+    suppression (it never reaches this frame), contributes nothing -- which is
+    what keeps this figure consistent with every other number in the same
+    report rather than being a second, competing population."""
+    if si_grouped is None or len(si_grouped) == 0:
+        return 0
+    weights = pd.to_numeric(
+        _unit_weight_frame(si_grouped).get("ending_balance"), errors="coerce"
+    ).fillna(0.0)
+    return int(round(float(weights.sum())))
+
+
 def _verified_population(servicer_inputs_df, verified_overrides, excluded_gps=None):
     """THE verified loan population, built ONCE:
 
@@ -3467,6 +3505,10 @@ def verified_portfolio_summary_views(servicer_inputs_df, verified_overrides,
     counts = {"Servicer": servicer_name or ""}
     for category in ["Outstanding"] + _PORTFOLIO_SUMMARY_CATEGORY_ORDER:
         counts[category] = int(round(weighted[f"{category} ($)"]))
+    # From THIS population -- the verified one, after verified_overrides and
+    # closed-at-zero exclusions -- so it cannot describe a different set of
+    # loans than the categories beside it. See _eligible_loan_count.
+    counts[SERVICING_POPULATION] = _eligible_loan_count(population)
     return {"dollars": dollars, "counts": counts}
 
 
@@ -3519,6 +3561,12 @@ def original_portfolio_summary_views(servicer_inputs_df, servicer_name=None):
     counts = {"Servicer": servicer_name or ""}
     for category in ["Outstanding"] + _PORTFOLIO_SUMMARY_CATEGORY_ORDER:
         counts[category] = int(round(weighted[f"{category} ($)"]))
+    # Carried here too so the two summaries expose the same counts contract.
+    # This population is the lender's submission alone -- no verified_overrides
+    # and no closed-at-zero suppression, per this function's own guarantee -- so
+    # the figure can legitimately differ from the Final Audited one for the same
+    # servicer, exactly as Outstanding already can.
+    counts[SERVICING_POPULATION] = _eligible_loan_count(population)
     return {"dollars": dollars, "counts": counts}
 
 
@@ -3652,6 +3700,13 @@ def portfolio_summary_totals(dollar_records, count_records, label="Total"):
 
     total_counts = {"Servicer": label}
     total_counts.update(counts)
+    # Summed like any other count: each servicer's population is disjoint, so
+    # the deal's servicing population is exactly the sum of its servicers'.
+    # Absent from a record (e.g. a caller that built counts before this key
+    # existed) contributes 0 rather than raising.
+    total_counts[SERVICING_POPULATION] = sum(
+        int(r.get(SERVICING_POPULATION, 0) or 0) for r in count_records
+    )
     return {"dollars": total_dollars, "counts": total_counts}
 
 
