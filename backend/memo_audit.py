@@ -67,9 +67,14 @@ partition members (a "date-anomaly" row is also a "joined" row):
                             disagree; which one is authoritative is a
                             business-rule question, NOT something this module
                             decides.
-    lender-unmapped         the "Lender" spelling is claimed by no servicer in
-                            MEMO_LENDER_ALIASES, so no servicer_key can ever
-                            match this row.
+    lender-unmapped         nothing identifies the row's servicer: the
+                            "Lender" spelling is claimed by no servicer in
+                            MEMO_LENDER_ALIASES *and* the attribution fallback
+                            matched no loan either, so no servicer_key can
+                            match this row. A blank or unrecognized Lender on
+                            a row the fallback DID resolve is not flagged --
+                            attribution succeeded, and the matched loan
+                            supplies the servicer. See _row_soup_key.
 
 DATE-ANOMALY COUNTING (matters -- it's the regression baseline)
 --------------------------------------------------------------
@@ -165,6 +170,43 @@ def _as_datetime(series):
 
 def _normalized_action(series):
     return series.map(lambda v: "" if _is_blank(v) else str(v).strip().lower())
+
+
+def _row_soup_key(row):
+    """CLIENT-CONFIRMED (2026-08-12): the canonical soup_key a memo row belongs
+    to, or None when nothing identifies it. THE SINGLE ATTRIBUTION ANSWER for
+    this module -- the lender-unmapped flag, "Memo Scope" and "Resolved
+    Servicer Key" must all come from here, never from the Lender cell alone.
+
+    PRECEDENCE, and it matters:
+      1. the Lender spelling, when MEMO_LENDER_ALIASES claims it
+      2. resolved_servicer -- the servicer of the loan
+         file_readers.resolve_memo_attribution matched via its SBA Loan ID ->
+         Lender Loan Number fallback
+
+    The Lender cell wins whenever it resolves, so this can only ever ADD an
+    attribution, never move a row from one servicer to another.
+
+    Why (2) exists at all: the fallback is blank-Lender territory by
+    construction -- the memo workbook's INDEX/MATCH left those cells #N/A,
+    which is exactly why the Lender cell cannot answer the question and the
+    matched loan has to. checks._lookup_deferral already attributes this way
+    (checks.py, "THE MATCHED LOAN DETERMINES THE SERVICER"); reading it here
+    too is what keeps STAT-01 and MEMO-01 from disagreeing about who owns a
+    row. Before this, six rows the fallback had already resolved were still
+    reported "UNATTRIBUTABLE -- file level" against a memo_row_class of
+    "joined" -- the resolver's answer was computed and then discarded.
+
+    row.get is used throughout so a memo_df that never went through the
+    resolver (every unit test without fixtures) degrades to (1) alone, which
+    is precisely the pre-fallback behaviour."""
+    key = memo_lender_soup_key(row.get("Lender"))
+    if key:
+        return key
+    resolved = row.get("resolved_servicer")
+    if _is_blank(resolved):
+        return None
+    return str(resolved).strip()
 
 
 def _normalized_population(population_ids):
@@ -263,8 +305,14 @@ def classify_memo_rows(memo_df, population_ids):
         for e, r, a in zip(end_before_start, resume_before_start, resume_before_end)
     ]
 
-    lender_unmapped = content & _column(df, "Lender").map(
-        lambda v: memo_lender_soup_key(v) is None
+    # Flagged only when NOTHING identifies the row -- neither the Lender
+    # spelling nor the loan the attribution fallback matched. A blank Lender
+    # cell on a row the fallback resolved is not a defect and gets no flag
+    # (CLIENT-CONFIRMED 2026-08-12): attribution succeeded, so there is no
+    # audit exception to raise and deliberately no separate blank-Lender
+    # advisory either. See _row_soup_key for the precedence.
+    lender_unmapped = content & df.apply(
+        lambda row: _row_soup_key(row) is None, axis=1
     )
 
     flag_masks = {
@@ -321,7 +369,12 @@ def unresolved_lender_spellings(classified_df):
     """Every distinct memo "Lender" spelling that MEMO_LENDER_ALIASES doesn't
     claim, with the evidence needed to add it: how many rows, which borrowers,
     which Securitization Actions. This is the output that turns "some deferrals
-    are invisible" into a specific alias-table patch."""
+    are invisible" into a specific alias-table patch.
+
+    Driven off the lender-unmapped flag, so it inherits that flag's meaning: a
+    spelling whose rows were all attributed by the fallback is not listed. That
+    is the point -- those rows need no alias-table patch, and listing them
+    would send a reviewer to edit a table that would change nothing."""
     if classified_df is None or len(classified_df) == 0:
         return []
     unmapped = classified_df[classified_df[_FLAG_COLUMNS[FLAG_LENDER_UNMAPPED]]]
@@ -351,19 +404,28 @@ def _format_date(value):
         return str(value).strip()
 
 
-# Blank Lender is its own case, not a spelling variant. Measured on the
-# delivered file, ALL 8 unmapped rows have an empty Lender cell -- there is no
-# alias that could resolve them, so pointing the reviewer at the alias table
-# would send them to fix the wrong thing.
+# Blank Lender is its own case, not a spelling variant: there is no alias that
+# could resolve it, so pointing the reviewer at the alias table would send them
+# to fix the wrong thing.
+#
+# Measured on the delivered file, all 8 rows with an empty Lender cell used to
+# be flagged here. Six of them are no longer flagged at all -- the attribution
+# fallback resolves their servicer from the matched loan, so a blank Lender
+# costs nothing and is not an exception (CLIENT-CONFIRMED 2026-08-12). The 2
+# that remain (memo rows 96 and 112) are blank AND unresolvable: their loan IDs
+# appear nowhere in SOUP under either identifier, so nothing can attribute
+# them. This hint is for exactly that case.
 _HINT_LENDER_BLANK = (
-    "The Lender cell on this memo row is EMPTY, so the row cannot be attributed "
+    "The Lender cell on this memo row is EMPTY and the loan could not be "
+    "identified from its SBA Loan ID either, so the row cannot be attributed "
     "to any servicer and no alias table entry can fix it. This needs a Lender "
     "filled in at source, in the Servicer Memo Summary itself."
 )
 
 _HINTS = {
     FLAG_LENDER_UNMAPPED: (
-        "This exact Lender spelling is in no MEMO_LENDER_ALIASES entry, so no "
+        "This exact Lender spelling is in no MEMO_LENDER_ALIASES entry, and the "
+        "loan could not be identified from its SBA Loan ID either, so no "
         "servicer key can match this row and any deferral on it is invisible to "
         "the audit. Add the spelling to the owning servicer's alias list in "
         "file_readers.py."
@@ -406,9 +468,10 @@ def memo_coverage_records(classified_df, uploaded_soup_keys=None):
     uploaded_soup_keys scopes the output to the servicers actually uploaded
     for this audit. The memo workbook covers EVERY servicer, so without it a
     single-servicer audit reports other servicers' rows as if they were its
-    own. Scoping is by the row's resolved Lender identity -- the same
-    memo_lender_soup_key attribution already shown in the "Resolved Servicer
-    Key" column, reused rather than reimplemented.
+    own. Scoping is by the row's resolved servicer identity -- _row_soup_key,
+    the same attribution shown in the "Resolved Servicer Key" column and used
+    by the lender-unmapped flag, reused rather than reimplemented. All three
+    must agree, which is why they share one function.
 
     Scoping is deliberately NOT done by narrowing population_ids: lookup-failed
     means "this loan ID is in no population", so a narrowed population would
@@ -435,7 +498,7 @@ def memo_coverage_records(classified_df, uploaded_soup_keys=None):
 
     records = []
     for _, row in problem.iterrows():
-        resolved = memo_lender_soup_key(row.get("Lender"))
+        resolved = _row_soup_key(row)
         if resolved is None:
             scope = MEMO_SCOPE_UNATTRIBUTABLE
         elif uploaded_soup_keys is not None and resolved not in uploaded_soup_keys:
@@ -459,7 +522,7 @@ def memo_coverage_records(classified_df, uploaded_soup_keys=None):
             "Memo Row Class": row["memo_row_class"],
             "Data Quality Flags": row["memo_quality_flags"],
             "Lender (as written)": "" if _is_blank(row.get("Lender")) else str(row.get("Lender")).strip(),
-            "Resolved Servicer Key": memo_lender_soup_key(row.get("Lender")) or "",
+            "Resolved Servicer Key": resolved or "",
             "Borrower Name": "" if _is_blank(row.get("Borrower Name")) else str(row.get("Borrower Name")).strip(),
             "SBA Loan ID": "" if _is_blank(row.get("SBA Loan ID")) else str(row.get("SBA Loan ID")).strip(),
             "Lender Loan ID": "" if _is_blank(row.get("Lender Loan ID")) else str(row.get("Lender Loan ID")).strip(),

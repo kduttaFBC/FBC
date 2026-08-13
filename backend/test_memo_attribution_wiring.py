@@ -54,6 +54,12 @@ REAL = all([SOUP_PATH, MEMO_PATH, SRF_DIR])
 FALLBACK_ROWS = [113, 114, 142, 143, 144, 145]
 UNRESOLVABLE_ROWS = [96, 112]
 
+# MEMO-01 issues_found for the Community Bank & Trust run below -- that
+# servicer's OWN memo rows. Pinned so the attribution fix is provably confined
+# to whose-row-is-this: the six fallback rows belong to Mission Valley Bank and
+# Poppy Bank, and attributing them correctly must not add them to this number.
+SCOPED_ISSUE_COUNT = 6
+
 # Community Bank and Trust is used as the servicer file simply because it
 # passes preflight on the June drop. MEMO-01 coverage is computed from the
 # whole memo against the whole SOUP population, so the choice of servicer file
@@ -90,11 +96,26 @@ def _run_audit():
     return response.status_code, json.loads(bytes(response.body).decode())
 
 
+def _memo_result(body):
+    return next(r for r in body["results"] if r["id"].split("::")[0] == "MEMO-01")
+
+
 def _lookup_failed_rows(body):
-    memo_result = next(r for r in body["results"]
-                       if r["id"].split("::")[0] == "MEMO-01")
-    return sorted(rec["Memo Sheet Row"] for rec in memo_result["records"]
+    return sorted(rec["Memo Sheet Row"] for rec in _memo_result(body)["records"]
                   if rec.get("Memo Row Class") == memo_audit.ROW_CLASS_LOOKUP_FAILED)
+
+
+def _unattributable_rows(body):
+    """Rows the report actually labels UNATTRIBUTABLE.
+
+    Deliberately a SEPARATE probe from _lookup_failed_rows. "Memo Row Class"
+    and "Memo Scope" are different columns answering different questions --
+    which loan is this, versus whose row is this -- and the 2026-08-10 fallback
+    fixed only the first. Six rows read "joined" and "UNATTRIBUTABLE -- file
+    level" simultaneously, and every assertion in this file measured the class,
+    so the contradiction was invisible to the suite."""
+    return sorted(rec["Memo Sheet Row"] for rec in _memo_result(body)["records"]
+                  if rec.get("Memo Scope") == memo_audit.MEMO_SCOPE_UNATTRIBUTABLE)
 
 
 class SourceLevelWiringTests(unittest.TestCase):
@@ -139,6 +160,25 @@ class SourceLevelWiringTests(unittest.TestCase):
         self.assertIn("resolved_gp", inspect.getsource(checks._lookup_deferral))
         self.assertIn("resolved_servicer", inspect.getsource(checks._lookup_deferral))
 
+    def test_memo_audit_attributes_through_the_shared_resolver(self):
+        # memo_audit had THREE attribution sites and the 2026-08-10 fallback
+        # wired none of them: the lender-unmapped flag, "Memo Scope" and
+        # "Resolved Servicer Key" each called memo_lender_soup_key(row["Lender"])
+        # directly, so six rows the resolver had already attributed were still
+        # reported "UNATTRIBUTABLE -- file level". They now share _row_soup_key.
+        # A direct Lender-only call reappearing in either consumer is that same
+        # defect coming back, so assert on the absence.
+        self.assertIn("resolved_servicer", inspect.getsource(memo_audit._row_soup_key),
+                      "_row_soup_key must consult the resolver's servicer")
+        for consumer in (memo_audit.classify_memo_rows, memo_audit.memo_coverage_records):
+            source = inspect.getsource(consumer)
+            with self.subTest(consumer=consumer.__name__):
+                self.assertIn("_row_soup_key", source,
+                              "attribution must go through the shared resolver")
+                self.assertNotIn("memo_lender_soup_key(", source,
+                                 "attribution must not bypass _row_soup_key by "
+                                 "reading the Lender cell directly")
+
 
 @unittest.skipUnless(REAL, "set FALCONBRIDGE_SOUP_XLSX / _MEMO_XLSX / _SRF_DIR")
 class EndpointAttributionTests(unittest.TestCase):
@@ -155,10 +195,37 @@ class EndpointAttributionTests(unittest.TestCase):
         self.assertEqual(_lookup_failed_rows(self.body), UNRESOLVABLE_ROWS)
 
     def test_none_of_the_six_fallback_rows_is_reported_unattributable(self):
+        # Asserts BOTH columns. The name always promised the scope, but until
+        # 2026-08-12 the body only checked the class -- and passed green while
+        # all six rows carried "UNATTRIBUTABLE -- file level".
         failed = _lookup_failed_rows(self.body)
+        unattributable = _unattributable_rows(self.body)
         for row in FALLBACK_ROWS:
             with self.subTest(memo_row=row):
                 self.assertNotIn(row, failed)
+                self.assertNotIn(row, unattributable,
+                                 "a row the fallback resolved has a servicer, so it "
+                                 "cannot be scoped UNATTRIBUTABLE")
+
+    def test_only_the_two_unresolvable_rows_are_scoped_unattributable(self):
+        self.assertEqual(_unattributable_rows(self.body), UNRESOLVABLE_ROWS)
+        self.assertEqual(_memo_result(self.body)["unattributable_count"],
+                         len(UNRESOLVABLE_ROWS))
+
+    def test_the_fallback_rows_report_the_servicer_of_the_matched_loan(self):
+        # The attribution is not merely "not unattributable" -- it names the
+        # right servicer, taken from the loan the fallback matched.
+        by_row = {rec["Memo Sheet Row"]: rec for rec in _memo_result(self.body)["records"]}
+        for row in FALLBACK_ROWS:
+            with self.subTest(memo_row=row):
+                # Mission Valley Bank / Poppy Bank are not in this audit, so a
+                # correctly attributed row is scoped OUT of a Community Bank &
+                # Trust run rather than shown as its issue.
+                self.assertNotIn(row, by_row)
+
+    def test_the_uploaded_servicers_own_issue_count_is_unchanged(self):
+        # The fix must not move another servicer's rows onto this audit's books.
+        self.assertEqual(_memo_result(self.body)["issues_found"], SCOPED_ISSUE_COUNT)
 
     def test_the_resolver_produces_198_matched_and_2_unresolved(self):
         # The same population MEMO-01 is computed against, asserted directly on
@@ -172,20 +239,42 @@ class EndpointAttributionTests(unittest.TestCase):
                 resolved, soup["SBA GP Number"].dropna().tolist()))
         self.assertEqual((counts["joined"], counts["lookup_failed"]), (198, 2))
 
-    def test_every_memo_data_quality_count_is_unaffected_by_attribution(self):
+    def _counts_without_and_with_attribution(self):
         soup = file_readers.read_soup_file(open(SOUP_PATH, "rb").read())
         memo = file_readers.read_service_memo(open(MEMO_PATH, "rb").read())
-        before = memo_audit.memo_partition_counts(memo_audit.classify_memo_rows(
-            memo, soup["SBA GP Number"].dropna().tolist()))
+        population = soup["SBA GP Number"].dropna().tolist()
+        before = memo_audit.memo_partition_counts(
+            memo_audit.classify_memo_rows(memo, population))
         after = memo_audit.memo_partition_counts(memo_audit.classify_memo_rows(
             file_readers.resolve_memo_attribution(
                 memo, file_readers.build_memo_loan_index(soup)),
-            soup["SBA GP Number"].dropna().tolist()))
+            population))
+        return before, after
+
+    def test_every_data_quality_count_except_attribution_is_unaffected(self):
+        # AMENDED 2026-08-12. lender_unmapped was in this list, which pinned the
+        # incomplete wiring as if it were the requirement: the flag was computed
+        # from the Lender cell alone, so of course attribution could not move
+        # it, and asserting that it must not move is what protected the defect.
+        # The flag means "nothing identifies this row's servicer", and the
+        # fallback identifies six of them -- so it MUST move. It is asserted
+        # explicitly in the next test instead of being frozen here.
+        #
+        # The rest of the list stands unchanged and is the real invariant:
+        # attribution answers WHOSE ROW THIS IS and must never touch what the
+        # row says about itself. A date anomaly is a date anomaly whether or not
+        # the servicer was identified.
+        before, after = self._counts_without_and_with_attribution()
         for flag in ("deferral_dates_missing", "date_anomaly_violations",
-                     "date_anomaly_rows", "label_conflict", "lender_unmapped",
+                     "date_anomaly_rows", "label_conflict",
                      "total_rows", "content", "phantom"):
             with self.subTest(flag=flag):
                 self.assertEqual(after[flag], before[flag])
+
+    def test_attribution_clears_lender_unmapped_on_exactly_the_fallback_rows(self):
+        before, after = self._counts_without_and_with_attribution()
+        self.assertEqual(before["lender_unmapped"], len(UNRESOLVABLE_ROWS) + len(FALLBACK_ROWS))
+        self.assertEqual(after["lender_unmapped"], len(UNRESOLVABLE_ROWS))
 
 
 @unittest.skipUnless(REAL, "set FALCONBRIDGE_SOUP_XLSX / _MEMO_XLSX / _SRF_DIR")
@@ -214,6 +303,21 @@ class BypassIsDetectedTests(unittest.TestCase):
         # ...and the wiring is intact again afterwards.
         _status, body = _run_audit()
         self.assertEqual(_lookup_failed_rows(body), UNRESOLVABLE_ROWS)
+
+    def test_a_bypass_also_restores_the_unattributable_mislabelling(self):
+        # The scope column is now load-bearing, so the bypass probe has to cover
+        # it too -- otherwise removing the resolver would still look half-clean.
+        original = file_readers.resolve_memo_attribution
+        file_readers.resolve_memo_attribution = lambda memo_df, loan_index: memo_df
+        try:
+            _status, body = _run_audit()
+            degraded = _unattributable_rows(body)
+        finally:
+            file_readers.resolve_memo_attribution = original
+
+        self.assertEqual(degraded, sorted(UNRESOLVABLE_ROWS + FALLBACK_ROWS))
+        _status, body = _run_audit()
+        self.assertEqual(_unattributable_rows(body), UNRESOLVABLE_ROWS)
 
     def test_a_bypass_raises_nothing_and_warns_nothing(self):
         # Records WHY this file exists: the degradation is completely silent, so

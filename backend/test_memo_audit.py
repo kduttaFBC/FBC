@@ -332,9 +332,11 @@ class LenderUnmappedTests(unittest.TestCase):
         self.assertIn(FLAG_LENDER_UNMAPPED, df.iloc[0]["memo_quality_flags"])
 
     def test_blank_lender_hint_does_not_send_the_reviewer_to_the_alias_table(self):
-        # All 8 unmapped rows on the delivered file are blank, not misspelled.
-        # No alias entry can resolve an empty cell, so the hint has to name the
-        # source fix instead of the code fix.
+        # Both remaining unmapped rows on the delivered file are blank, not
+        # misspelled (it was 8 before the attribution fallback was wired into
+        # this module; the other 6 are attributed now). No alias entry can
+        # resolve an empty cell, so the hint has to name the source fix instead
+        # of the code fix.
         blank = memo_audit.memo_coverage_records(
             memo_audit.classify_memo_rows(_build_memo_df([_memo_row(**{"Lender": ""})]), ["6673679110"])
         )[0]
@@ -362,6 +364,114 @@ class LenderUnmappedTests(unittest.TestCase):
         self.assertEqual(found[0]["rows"], 2)
         self.assertEqual(found[0]["borrowers"], ["BCRS Inc", "Oakley Hills LLC"])
         self.assertEqual(found[0]["securitization_actions"], ["Deferred", "Modification"])
+
+
+class AttributionFallbackAttributionTests(unittest.TestCase):
+    """memo_audit must attribute through _row_soup_key, not the Lender cell.
+
+    The 2026-08-10 SBA-Loan-ID -> Lender-Loan-Number fallback wired
+    classify_memo_rows' ROW CLASS to resolved_gp but left three other
+    attribution sites reading the Lender cell alone -- the lender-unmapped
+    flag, "Memo Scope" and "Resolved Servicer Key". Six rows on the delivered
+    file were therefore reported as memo_row_class "joined" and Memo Scope
+    "UNATTRIBUTABLE -- file level" at the same time: the resolver had already
+    found their servicer and the report threw the answer away.
+
+    These are fixture-free and cover the contract in both directions --
+    resolved and still-unresolved -- plus the precedence rule and the
+    degraded (resolver-never-ran) path."""
+
+    def _classify(self, rows, resolved_servicers, population=("6673679110",)):
+        df = _build_memo_df(rows)
+        df["resolved_servicer"] = list(resolved_servicers)
+        # resolved_gp is what the row CLASS reads; kept consistent with
+        # resolved_servicer so these rows look exactly like the real resolver's
+        # output rather than a half-populated frame.
+        df["resolved_gp"] = [("6673679110" if s else None) for s in resolved_servicers]
+        return memo_audit.classify_memo_rows(df, list(population))
+
+    def test_blank_lender_resolved_by_the_fallback_is_not_flagged(self):
+        df = self._classify([_memo_row(**{"Lender": ""})], ["Poppy Bank"])
+        self.assertNotIn(FLAG_LENDER_UNMAPPED, df.iloc[0]["memo_quality_flags"])
+
+    def test_unknown_spelling_resolved_by_the_fallback_is_not_flagged(self):
+        df = self._classify([_memo_row(**{"Lender": "Oakley Hills Bancorp, TX"})],
+                            ["Mission Valley Bank"])
+        self.assertNotIn(FLAG_LENDER_UNMAPPED, df.iloc[0]["memo_quality_flags"])
+
+    def test_blank_lender_and_no_fallback_is_still_flagged(self):
+        # The genuinely unattributable case must keep its flag -- this is the
+        # silent zero the whole module exists to prevent.
+        for resolved in ("", None):
+            with self.subTest(resolved_servicer=resolved):
+                df = self._classify([_memo_row(**{"Lender": ""})], [resolved])
+                self.assertIn(FLAG_LENDER_UNMAPPED, df.iloc[0]["memo_quality_flags"])
+
+    def test_a_recognized_lender_spelling_wins_over_the_fallback(self):
+        # PRECEDENCE. The Lender cell is authoritative when it resolves; the
+        # fallback only fills a gap. A disagreement must not silently move the
+        # row onto the fallback's servicer.
+        df = self._classify([_memo_row(**{"Lender": "Lendistry SBLC, LLC, CA"})],
+                            ["Poppy Bank"])
+        record = memo_audit.memo_coverage_records(df)
+        self.assertEqual(memo_audit._row_soup_key(df.iloc[0]), "Lendistry")
+        if record:  # only present if the row carries some other defect
+            self.assertEqual(record[0]["Resolved Servicer Key"], "Lendistry")
+
+    def test_the_fallback_servicer_reaches_scope_and_resolved_key(self):
+        # A row that is attributable but still defective: the report must name
+        # the servicer in BOTH columns, not leave them blank/UNATTRIBUTABLE.
+        rows = [_memo_row(**{"Lender": "", "Securitization Action": "Deferred",
+                             "Deferral Start Date": None})]
+        df = self._classify(rows, ["Poppy Bank"])
+        record = memo_audit.memo_coverage_records(df)[0]
+        self.assertEqual(record["Memo Scope"], "Poppy Bank")
+        self.assertEqual(record["Resolved Servicer Key"], "Poppy Bank")
+        self.assertNotEqual(record["Memo Scope"], memo_audit.MEMO_SCOPE_UNATTRIBUTABLE)
+
+    def test_an_unresolvable_row_keeps_the_unattributable_scope(self):
+        rows = [_memo_row(**{"Lender": "", "SBA Loan ID": "9999999999",
+                             "Lender Loan ID": "9999999999"})]
+        df = self._classify(rows, [""])
+        record = memo_audit.memo_coverage_records(df)[0]
+        self.assertEqual(record["Memo Scope"], memo_audit.MEMO_SCOPE_UNATTRIBUTABLE)
+        self.assertEqual(record["Resolved Servicer Key"], "")
+
+    def test_scoping_admits_a_fallback_attributed_row_to_its_own_servicer(self):
+        # uploaded_soup_keys filtering reads the same attribution, so a row the
+        # fallback tied to an uploaded servicer is that servicer's to answer for
+        # -- and one tied elsewhere is scoped out rather than mislabelled.
+        rows = [_memo_row(**{"Lender": "", "Securitization Action": "Deferred",
+                             "Deferral Start Date": None})]
+        df = self._classify(rows, ["Poppy Bank"])
+        self.assertEqual(len(memo_audit.memo_coverage_records(df, {"Poppy Bank"})), 1)
+        self.assertEqual(len(memo_audit.memo_coverage_records(df, {"Lendistry"})), 0)
+
+    def test_a_frame_that_never_saw_the_resolver_behaves_exactly_as_before(self):
+        # The degraded path: no attribution columns at all. classify_memo_rows
+        # must not raise and must fall back to the Lender cell alone.
+        df = memo_audit.classify_memo_rows(
+            _build_memo_df([_memo_row(**{"Lender": ""})]), ["6673679110"])
+        self.assertIn(FLAG_LENDER_UNMAPPED, df.iloc[0]["memo_quality_flags"])
+        self.assertEqual(
+            memo_audit.memo_coverage_records(df)[0]["Memo Scope"],
+            memo_audit.MEMO_SCOPE_UNATTRIBUTABLE)
+
+    def test_attribution_does_not_touch_any_other_flag(self):
+        # Attribution answers whose row this is. What the row says about itself
+        # is untouched -- a date anomaly survives being attributed.
+        rows = [_memo_row(**{"Lender": "", "Deferral End Date": pd.Timestamp("2025-01-01")})]
+        resolved = self._classify(rows, ["Poppy Bank"]).iloc[0]
+        self.assertIn(FLAG_DATE_ANOMALY, resolved["memo_quality_flags"])
+        self.assertEqual(int(resolved["date_order_violations"]), 1)
+
+    def test_a_fallback_attributed_spelling_is_not_reported_as_needing_an_alias(self):
+        # unresolved_lender_spellings drives the alias-table patch list. A row
+        # the fallback resolved needs no patch, so listing it would send a
+        # reviewer to edit a table that would change nothing.
+        df = self._classify(
+            [_memo_row(**{"Lender": "Oakley Hills Bancorp, TX"})], ["Mission Valley Bank"])
+        self.assertEqual(memo_audit.unresolved_lender_spellings(df), [])
 
 
 class CoverageRecordTests(unittest.TestCase):

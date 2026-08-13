@@ -181,7 +181,14 @@ class DegradesSafelyTests(unittest.TestCase):
 
 
 class DataQualityIsIndependentOfAttributionTests(unittest.TestCase):
-    """A row becoming attributable must not erase any existing defect."""
+    """A row becoming attributable must not erase any existing defect.
+
+    "Defect" means what the row says about ITSELF -- its dates, its labels.
+    lender-unmapped is the one flag that is not that: it is an attribution
+    verdict ("nothing identifies this row's servicer"), so attribution is
+    exactly what is supposed to clear it. Asserting whole-flag-string equality
+    swept the two together and, until 2026-08-12, pinned the incomplete wiring
+    in place -- see test_memo_attribution_wiring.py."""
 
     def _classified(self, attribute):
         memo = pd.DataFrame([{
@@ -203,13 +210,25 @@ class DataQualityIsIndependentOfAttributionTests(unittest.TestCase):
         self.assertEqual(self._classified(True)["memo_row_class"][0],
                          memo_audit.ROW_CLASS_JOINED)
 
+    @staticmethod
+    def _flags(classified):
+        return set(f for f in classified["memo_quality_flags"][0].split("; ") if f)
+
     def test_the_date_anomaly_survives_attribution(self):
         before = self._classified(False)
         after = self._classified(True)
         self.assertGreater(int(before["date_order_violations"][0]), 0)
         self.assertEqual(int(after["date_order_violations"][0]),
                          int(before["date_order_violations"][0]))
-        self.assertEqual(after["memo_quality_flags"][0], before["memo_quality_flags"][0])
+        self.assertIn(memo_audit.FLAG_DATE_ANOMALY, self._flags(after))
+
+    def test_attribution_clears_only_the_lender_unmapped_flag(self):
+        # The precise statement the old whole-string assertion was reaching
+        # for: attribution changes the attribution verdict and NOTHING else.
+        before, after = self._flags(self._classified(False)), self._flags(self._classified(True))
+        self.assertIn(memo_audit.FLAG_LENDER_UNMAPPED, before)
+        self.assertNotIn(memo_audit.FLAG_LENDER_UNMAPPED, after)
+        self.assertEqual(before - {memo_audit.FLAG_LENDER_UNMAPPED}, after)
 
 
 @unittest.skipUnless(REAL, "set FALCONBRIDGE_MEMO_XLSX and FALCONBRIDGE_SOUP_XLSX")
@@ -257,17 +276,53 @@ class RealJuneFixtureTests(unittest.TestCase):
         self.assertEqual((before["joined"], before["lookup_failed"]), (192, 8))
         self.assertEqual((after["joined"], after["lookup_failed"]), (198, 2))
 
-    def test_every_data_quality_flag_count_is_unchanged(self):
+    def _before_after(self):
         population = self.soup["SBA GP Number"].dropna().tolist()
-        before = memo_audit.memo_partition_counts(
-            memo_audit.classify_memo_rows(self.memo, population))
-        after = memo_audit.memo_partition_counts(
-            memo_audit.classify_memo_rows(self.resolved, population))
+        return (memo_audit.memo_partition_counts(
+                    memo_audit.classify_memo_rows(self.memo, population)),
+                memo_audit.memo_partition_counts(
+                    memo_audit.classify_memo_rows(self.resolved, population)))
+
+    def test_every_data_quality_flag_count_except_attribution_is_unchanged(self):
+        # AMENDED 2026-08-12, same reason as the synthetic twin above and as
+        # test_memo_attribution_wiring.py: lender_unmapped is an attribution
+        # verdict, not something the row asserts about itself, so freezing it
+        # here protected the incomplete wiring instead of guarding it. Pinned
+        # explicitly in the next test.
+        before, after = self._before_after()
         for flag in ("deferral_dates_missing", "date_anomaly_violations",
-                     "date_anomaly_rows", "label_conflict", "lender_unmapped",
+                     "date_anomaly_rows", "label_conflict",
                      "total_rows", "content", "phantom"):
             with self.subTest(flag=flag):
                 self.assertEqual(after[flag], before[flag])
+
+    def test_lender_unmapped_moves_8_to_2(self):
+        # The six fallback-resolved rows all have a blank Lender cell, so
+        # before attribution reaches memo_audit they are indistinguishable from
+        # the two genuinely unattributable ones. Only rows 96 and 112 -- whose
+        # IDs appear nowhere in SOUP under either identifier -- may remain.
+        before, after = self._before_after()
+        self.assertEqual(before["lender_unmapped"], 8)
+        self.assertEqual(after["lender_unmapped"], 2)
+
+    def test_only_rows_96_and_112_stay_unattributable_in_the_report(self):
+        population = self.soup["SBA GP Number"].dropna().tolist()
+        records = memo_audit.memo_coverage_records(
+            memo_audit.classify_memo_rows(self.resolved, population))
+        unattributable = sorted(int(r["Memo Sheet Row"]) for r in records
+                                if r["Memo Scope"] == memo_audit.MEMO_SCOPE_UNATTRIBUTABLE)
+        self.assertEqual(unattributable, [96, 112])
+
+    def test_the_fallback_rows_carry_their_matched_servicer_in_the_report(self):
+        population = self.soup["SBA GP Number"].dropna().tolist()
+        classified = memo_audit.classify_memo_rows(self.resolved, population)
+        by_row = {int(r["_excel_row"]): r for _, r in classified.iterrows()}
+        expected = {113: "Mission Valley Bank", 114: "Mission Valley Bank",
+                    142: "Poppy Bank", 143: "Poppy Bank",
+                    144: "Poppy Bank", 145: "Poppy Bank"}
+        for row, servicer in expected.items():
+            with self.subTest(memo_row=row):
+                self.assertEqual(memo_audit._row_soup_key(by_row[row]), servicer)
 
 
 if __name__ == "__main__":
