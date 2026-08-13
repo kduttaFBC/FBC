@@ -667,9 +667,19 @@ class BoundaryTests(unittest.TestCase):
                 self.assertNotIn(check_id, code)
 
     def test_it_imports_no_correction_or_report_module(self):
-        source = inspect.getsource(msr)
-        self.assertNotIn("import corrections", source)
-        self.assertNotIn("import report", source)
+        """Parsed, not substring-matched: 'import reporting_exceptions' contains
+        the substring 'import report' while importing no such module."""
+        import ast
+        tree = ast.parse(inspect.getsource(msr))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertNotIn("corrections", imported)
+        self.assertNotIn("report", imported)
+        self.assertEqual(imported, {"pandas", "openpyxl", "checks", "reporting_exceptions"})
 
     def test_the_only_checks_helpers_used_are_the_shared_ones(self):
         # Executable lines only -- docstrings name checks._norm_id in prose.

@@ -38,6 +38,7 @@ import corrections as corrections_mod
 import preflight as preflight_mod
 import memo_audit as memo_audit_mod
 import monthly_servicer_report as msr_mod
+import reporting_exceptions
 
 
 load_dotenv(override=False)
@@ -915,6 +916,18 @@ async def corrections_review(payload: dict):
         # {deal: [servicer payload, ...]} in upload order, for the Monthly
         # Servicer Reports -- one workbook per SOUP deal, never combined.
         msr_servicers_by_deal = {}
+        # CLIENT-CONFIRMED (2026-08-12): the Reporting Exception Register.
+        # Loaded once per run and keyed on (reporting period, deal, loan,
+        # field). Every rejected register entry is surfaced here, before any
+        # report is built, so a malformed exception is visible even if it
+        # matches nothing.
+        msr_exception_issues = []
+        msr_exception_index = reporting_exceptions.index_register(
+            reporting_exceptions.load_register(), issues=msr_exception_issues)
+        msr_exception_period = reporting_exceptions._period_label(
+            _resolve_portfolio_summary_cycle_month(
+                {e["cycle_month"] for e in correction_state.values()
+                 if e.get("cycle_month") is not None})[0])
         for servicer, entry in correction_state.items():
             try:
                 # The 5th return value is this file's own SOUP deal, parsed
@@ -973,6 +986,14 @@ async def corrections_review(payload: dict):
                     verified_overrides=verified_overrides_by_servicer.get(servicer) or {},
                     excluded_gps=entry.get("excluded_gps") or [],
                     issues=servicer_issues,
+                    # CLIENT-CONFIRMED (2026-08-12): historical reporting
+                    # exceptions, applied at the report-writing layer only and
+                    # keyed on this exact reporting period + deal + loan +
+                    # field. An empty or absent register leaves every value as
+                    # calculated.
+                    reporting_period=msr_exception_period,
+                    deal=deal,
+                    exception_index=msr_exception_index,
                 ),
                 "issues": servicer_issues,
                 "note_series": file_readers.read_note_series_label(entry["original_bytes"]),
@@ -1021,7 +1042,7 @@ async def corrections_review(payload: dict):
         # Generated ONLY here, after Human Review. There is no path to a
         # Monthly Servicer Report from /api/audit.
         monthly_servicer_reports = []
-        msr_validation_issues = []
+        msr_validation_issues = list(msr_exception_issues)
         msr_cycle_month, _ = _resolve_portfolio_summary_cycle_month(final_cycle_months)
         for deal in sorted(msr_servicers_by_deal, key=checks_mod._deal_sort_key):
             deal_report = msr_mod.build_deal_report(deal, msr_servicers_by_deal[deal])

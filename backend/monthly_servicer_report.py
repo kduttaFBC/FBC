@@ -61,6 +61,7 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 import checks
+import reporting_exceptions
 
 
 MONTHLY_SERVICER_REPORT_SHEET = "Monthly Servicer Report"
@@ -289,7 +290,8 @@ def _coerce_date(value):
 
 
 def build_servicer_rows(servicer_inputs_df, servicer_name, verified_overrides=None,
-                        excluded_gps=None, issues=None):
+                        excluded_gps=None, issues=None, reporting_period=None, deal=None,
+                        exception_index=None):
     """One report row per reviewed, non-suppressed loan for ONE servicer.
 
     servicer_name is the soup_key -- the value that lands in Lender/Servicer
@@ -345,6 +347,20 @@ def build_servicer_rows(servicer_inputs_df, servicer_name, verified_overrides=No
 
         row["Lender/Servicer Name"] = servicer_name
         rows.append(row)
+
+    # CLIENT-CONFIRMED (2026-08-12): historical reporting exceptions are applied
+    # HERE, after every value above has been produced by the standard
+    # calculation, and nowhere else. reporting_exceptions never touches
+    # checks.py, never widens the correction allow-list, and matches only on an
+    # exact (reporting period, deal, SBA GP Number, field) -- so an exception
+    # for one loan and period can never become a rule for another. Every
+    # application is surfaced, and a recorded exception whose system-calculated
+    # value no longer matches is refused and reported instead. Passing no
+    # exception_index (the default) leaves the rows exactly as calculated.
+    reporting_exceptions.apply_exceptions(
+        rows, reporting_period, deal, exception_index,
+        servicer_name=servicer_name, issues=issues,
+    )
     return rows
 
 
