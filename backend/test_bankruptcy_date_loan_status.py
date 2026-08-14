@@ -255,10 +255,24 @@ class ZeroBalanceExceptionTests(unittest.TestCase):
         self.assertEqual(recs, [])
 
     def test_zero_balance_liquidation_status_ignores_bankruptcy_date(self):
+        # SUPERSEDED ASSERTION 2026-08-14. This asserted `recs == []`. The
+        # client-confirmed lender-reported LIQUIDATION Human Review rule now makes
+        # EVERY in-scope lender-reported LIQUIDATION produce a Loan Status review
+        # item -- including at a $0.00 Ending Balance, since the balance does not
+        # determine Loan Status and no zero-balance exception exists. The only
+        # exception remains a prior finalized PAID-IN-FULL at $0.00.
+        #
+        # What this test actually protects is UNCHANGED and still asserted: the
+        # BANKRUPTCY branch must not propose BANKRUPTCY for this loan.
         recs, _ = _loan_status_recs([_entry(
             srf_status="LIQUIDATION", ending_balance=0.0,
             liquidation_date="2026-07-20", liquidation_date_populated=True)])
-        self.assertEqual(recs, [])
+        self.assertNotIn("BANKRUPTCY", [r["calculated"] for r in recs])
+        self.assertNotIn(corrections.REVIEW_REASON_BANKRUPTCY_CURRENT_PERIOD,
+                         " ".join(r["reviewFlag"] or "" for r in recs))
+        # the one item present is the mandatory LIQUIDATION review, not a proposal
+        self.assertEqual([r["reviewFlag"] for r in recs],
+                         [corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION])
 
     def test_zero_balance_alone_ignores_bankruptcy_date(self):
         """Gate 2 excludes every $0 balance regardless of why it is $0 — a loan
@@ -275,8 +289,15 @@ class ZeroBalanceExceptionTests(unittest.TestCase):
         self.assertEqual(recs, [])
 
     def test_liquidation_reported_status_blocks_even_with_a_positive_balance(self):
+        # SUPERSEDED ASSERTION 2026-08-14 (see the zero-balance sibling above). This
+        # asserted `recs == []`; a lender-reported LIQUIDATION now always produces a
+        # Loan Status review item. The property this test exists for is unchanged:
+        # BANKRUPTCY is still never PROPOSED for a loan the servicer reports as
+        # LIQUIDATION, whatever the balance.
         recs, _ = _loan_status_recs([_entry(srf_status="LIQUIDATION", ending_balance=1234.56)])
-        self.assertEqual(recs, [])
+        self.assertNotIn("BANKRUPTCY", [r["calculated"] for r in recs])
+        self.assertEqual([r["reviewFlag"] for r in recs],
+                         [corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION])
 
     def test_missing_balance_is_not_treated_as_outstanding(self):
         recs, _ = _loan_status_recs([_entry(ending_balance=None)])

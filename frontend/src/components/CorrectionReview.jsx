@@ -55,6 +55,15 @@ const REVIEW_REQUIRED_CATEGORIES = [
   REVIEW_CATEGORY_OTHER,
 ]
 
+// CLIENT-CONFIRMED (2026-08-14): the prefix of
+// corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION. Matched rather than
+// duplicated in full, so the backend stays the single source of the reason text.
+// Every in-scope lender-reported LIQUIDATION carries this ONE reason; the
+// contradictions against prior status, balances, dates, payments, bankruptcy /
+// foreclosure / REO information, proceeds, losses, recoveries, reversals and memo
+// evidence are shown as EVIDENCE on the loan card, never as further decision rules.
+const LENDER_LIQUIDATION_REASON = 'LENDER REPORTED LIQUIDATION'
+
 const CATEGORY_BLURB = {
   [REVIEW_CATEGORY_LOAN_STATUS]:
     'Every Loan Status write requires explicit reviewer approval — including one the audit derived without flagging it. Select the correct status from the field’s own nine-value domain.',
@@ -444,9 +453,18 @@ function RecommendationRow({ rec, grouped, decision, onChange }) {
           {d.decision === 'approve' ? (
             <select
               aria-label={`Approved value for loan ${rec.gp} ${rec.field}`}
-              value={d.approved_value || rec.calculated}
+              value={d.approved_value || rec.calculated || ''}
               onChange={(e) => onChange(rec.id, { approved_value: e.target.value })}
             >
+              {/* CLIENT-CONFIRMED (2026-08-14): a mandatory lender-reported
+                  LIQUIDATION review carries NO engine recommendation when the
+                  audit has no proposable status. Nothing is defaulted -- not
+                  ACTIVE, not LIQUIDATION -- so the reviewer must choose. This adds
+                  an empty placeholder only; the domain below is unchanged and is
+                  still exactly the nine permitted values. `|| ''` keeps the select
+                  controlled, since value={null} would silently make it
+                  uncontrolled and drop the reviewer's choice. */}
+              {!rec.calculated && <option value="">— Select Loan Status —</option>}
               {domainFor(rec.field).map((v) => (
                 <option key={v} value={v}>
                   {v}
@@ -511,6 +529,26 @@ function RecommendationRow({ rec, grouped, decision, onChange }) {
               {dash(rec.priorLoanStatus)} · Servicer Loan Status{' '}
               {dash(rec.servicerLoanStatus)}
             </div>
+          </td>
+        </tr>
+      )}
+      {/* CLIENT-CONFIRMED (2026-08-14): the reviewer instruction for a mandatory
+          lender-reported LIQUIDATION review. Stated plainly and above the reason
+          text, because this item asks the reviewer to make a decision rather than
+          to confirm one the audit already made. */}
+      {rec.field === 'Loan Status'
+        && (rec.reviewFlag || '').includes(LENDER_LIQUIDATION_REASON) && (
+        <tr>
+          <td colSpan={10} style={{ fontWeight: 600 }}>
+            The lender reported this loan as LIQUIDATION. The prior finalized record
+            and current servicing evidence are shown below. Please review the
+            evidence and select the Loan Status you believe is appropriate.
+            {!rec.calculated && (
+              <span style={{ fontWeight: 400 }}>
+                {' '}Falcon Bridge has no recommended value for this loan — you must
+                choose one of the nine permitted statuses.
+              </span>
+            )}
           </td>
         </tr>
       )}
@@ -635,6 +673,25 @@ export default function CorrectionReview({ recommendations, sessionId }) {
   )
   const bulkHeld = useMemo(
     () => standardRecs.filter((r) => !decisionOf(r.id).decision && loanStatusUndecided(r)),
+    [recs, decisions]
+  )
+
+  // CLIENT-CONFIRMED (2026-08-14): an "approve" on a recommendation that carries NO
+  // engine value -- a mandatory lender-reported LIQUIDATION with no proposable
+  // status -- is INCOMPLETE until the reviewer picks one of the nine permitted
+  // statuses.
+  //
+  // This is a MALFORMED-ENTRY guard, not a review-completeness gate. D4 still does
+  // not gate submission on pending items, and a partial review is still legitimate.
+  // The server already fails closed on a blank approved value
+  // (validate_approved_value -> "Approved value is blank." -> approved_not_applied
+  // -> D4 blocks final reporting), so this only stops a submission that provably
+  // could not be applied, and says which loans need a choice.
+  const approvalsMissingValue = useMemo(
+    () => recs.filter((r) => {
+      const d = decisionOf(r.id)
+      return d.decision === 'approve' && !d.approved_value && !r.calculated
+    }),
     [recs, decisions]
   )
 
@@ -915,7 +972,8 @@ export default function CorrectionReview({ recommendations, sessionId }) {
         <button
           className="btn btn-teal"
           onClick={submit}
-          disabled={(blocked && !nothingToReview) || !reviewer.trim() || submitting}
+          disabled={(blocked && !nothingToReview) || !reviewer.trim() || submitting
+            || approvalsMissingValue.length > 0}
         >
           {submitting
             ? 'Recording…'
@@ -928,6 +986,13 @@ export default function CorrectionReview({ recommendations, sessionId }) {
         )}
         {!submitting && reviewer.trim() && !nothingToReview && decidedCount === 0 && (
           <span className="hint">Decide at least one recommendation.</span>
+        )}
+        {!submitting && approvalsMissingValue.length > 0 && (
+          <span className="hint" style={{ color: 'var(--amber, #BA7517)', fontWeight: 600 }}>
+            Select a Loan Status for{' '}
+            {approvalsMissingValue.map((r) => `loan ${r.gp}`).join(', ')}. An approval
+            with no value cannot be applied, so final reporting would stay blocked.
+          </span>
         )}
         {/* D4: pending items do NOT block submission -- they block FINAL
             REPORTING. Said plainly here so the reviewer knows a partial

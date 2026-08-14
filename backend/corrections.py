@@ -210,6 +210,45 @@ REVIEW_REASON_BANKRUPTCY_LIQUIDATION_CONTRADICTION = (
     "before approving."
 )
 
+# CLIENT-CONFIRMED (2026-08-14): every in-scope loan whose CURRENT lender-reported
+# Loan Status is LIQUIDATION must reach Human Review, unconditionally. Falcon
+# Bridge does not attempt to decide whether a liquidation is complete, in progress,
+# or sufficiently supported -- the client makes the Loan Status decision. This is a
+# PRESENCE rule, not a contradiction rule, which is what makes it different from
+# every other Loan Status branch in this module:
+#
+#   * it does NOT require LOAN STATUS MISMATCH, so a loan reported LIQUIDATION
+#     against a prior LIQUIDATION still surfaces (it previously did not);
+#   * it does NOT require a proposable expected status, so a prior BANKRUPTCY /
+#     FORECLOSURE / SUBSTITUTION-IN / blank still surfaces (it previously did not);
+#   * it takes PRECEDENCE over the 2026-08-03 reversal suppression, for Loan
+#     Status ONLY -- Delinquency Status processing and every non-LIQUIDATION Loan
+#     Status branch keep the existing reversal treatment exactly;
+#   * it is NOT suppressed by WARNING_REASONS. Those stay visible as evidence.
+#
+# ONE CONSISTENT REASON, deliberately (CLIENT-CONFIRMED 2026-08-14). Every in-scope
+# lender-reported LIQUIDATION carries exactly this text and nothing appended to it.
+# Contradictions against the prior finalized status, balances, terminal dates,
+# payment information, bankruptcy / foreclosure / REO information, proceeds,
+# losses, recoveries, reversals or memo evidence all remain visible as REVIEW
+# EVIDENCE on the loan card -- they are NOT additional Loan Status decision rules
+# and must not be restated as further review reasons here. The existing
+# terminal-contradiction reason is preserved for NON-LIQUIDATION cases only.
+#
+# THE ONE EXCEPTION IS UNCHANGED: a loan the prior finalized SOUP already
+# established as PAID-IN-FULL at $0.00 is CLOSED and is never reopened by a later
+# lender submission. That suppression happens upstream in checks.py
+# (loans_closed_at_zero) and this branch never sees such a loan.
+REVIEW_REASON_LENDER_REPORTED_LIQUIDATION = (
+    "LENDER REPORTED LIQUIDATION — HUMAN LOAN STATUS DECISION REQUIRED. The "
+    "lender reported this loan as LIQUIDATION. That report is not self-validating "
+    "and Falcon Bridge does not decide whether the liquidation is complete or in "
+    "progress. Review the prior finalized record and the current servicing "
+    "evidence below, then select the Loan Status you believe is correct from the "
+    "field's own domain. Where a Falcon Bridge recommendation is shown it is a "
+    "recommendation only; you may select a different permitted status."
+)
+
 # CLIENT-CONFIRMED (2026-08-12): the marker-based write gate. Set on a candidate
 # ONLY by the current-period Bankruptcy Date branch, and the ONLY thing that lets
 # validate_approved_value accept BANKRUPTCY as a value this application
@@ -352,6 +391,14 @@ def _is_collection_status(status_value):
     trigger for terminal-status REVIEW routing."""
     s = str(status_value or "").strip().upper()
     return any(k in s for k in _COLLECTION_STATUS_KEYWORDS)
+
+
+def _is_liquidation_status(status_value):
+    """True when the servicer reports LIQUIDATION specifically. Deliberately
+    NARROWER than _is_collection_status (FORECLOSURE / LIQUIDATION / REO): the
+    2026-08-14 mandatory-review rule is scoped to LIQUIDATION alone, and widening
+    it to the other two would change which loans require review."""
+    return "LIQUIDATION" in str(status_value or "").strip().upper()
 
 
 def _is_deferred_status(status_value):
@@ -655,8 +702,10 @@ def build_eligible_corrections(correction_data):
 
     for c in correction_data or []:
         reasons = set(c.get("reasons") or [])
-        if reasons & WARNING_REASONS:
-            continue  # any data-quality warning excludes this loan entirely
+        # The WARNING_REASONS gate that used to stand HERE has moved a few lines
+        # down, to sit immediately AFTER the mandatory lender-reported LIQUIDATION
+        # branch and BEFORE everything else. Its set, its test and its effect are
+        # unchanged for every other correction type -- see the comment at the gate.
 
         # CLIENT-CONFIRMED (2026-08-03): a Delinquency Status driven by a
         # negative Payment Received amount (a reversal) requires manual
@@ -814,6 +863,50 @@ def build_eligible_corrections(correction_data):
                 "prior_ending_balance": c.get("prior_ending_balance"),
             })
 
+        # --- Loan Status: MANDATORY review of a lender-reported LIQUIDATION ----
+        # CLIENT-CONFIRMED (2026-08-14). FIRST of the Loan Status branches, and
+        # ahead of BOTH the WARNING_REASONS gate below and the reversal `continue`,
+        # because this is the only Loan Status rule that is unconditional. See
+        # REVIEW_REASON_LENDER_REPORTED_LIQUIDATION for the full rationale.
+        #
+        # NO PROPOSED VALUE IS MANUFACTURED. corrected_value is the engine's
+        # existing proposable status when one exists, and None when it does not --
+        # never a default, and specifically never ACTIVE and never LIQUIDATION.
+        # A None here is deliberate and is carried through to the review page as
+        # "no recommendation"; validate_approved_value already refuses a blank
+        # approved value, so an approval that never selects a status cannot be
+        # applied and D4 keeps final reporting blocked until one is chosen.
+        #
+        # ONE reason, never accumulated. Unlike the Delinquency Status branch below
+        # and the bankruptcy branch further down, this deliberately does NOT append
+        # additional reasons -- not even the terminal-status contradiction, which
+        # would otherwise apply to most of these loans. Every in-scope
+        # lender-reported LIQUIDATION carries one consistent reason; the
+        # contradictions stay visible as EVIDENCE on the loan card rather than
+        # becoming further decision rules.
+        if _is_liquidation_status(c.get("srf_status")):
+            _emit(
+                "Loan Status",
+                _canonical_proposable_loan_status(c.get("expected_loan_status_effective")),
+                "Lender-reported LIQUIDATION requires a human Loan Status decision",
+                review_required=True,
+                review_reason=REVIEW_REASON_LENDER_REPORTED_LIQUIDATION,
+            )
+
+        # MOVED HERE 2026-08-14 (was the first statement in this loop). Any
+        # data-quality warning still excludes this loan from EVERY OTHER correction
+        # type, unchanged -- same set, same test, same effect. It now sits after the
+        # mandatory LIQUIDATION branch above so that a warning cannot suppress a
+        # review the client has made unconditional. The warning itself stays
+        # visible: `reasons` is untouched and STAT-01 still reports it.
+        #
+        # Everything between the loop head and this line is inert -- reversal fact
+        # computation, gp/excel_rows, _emitted_fields, the _emit closure, and the
+        # one branch above. Nothing else emits, so relocating the gate cannot widen
+        # what any other correction type is eligible for.
+        if reasons & WARNING_REASONS:
+            continue  # any data-quality warning excludes this loan entirely
+
         # --- Delinquency Status -------------------------------------------------
         if (
             "DELINQUENCY STATUS MISMATCH" in reasons
@@ -929,6 +1022,15 @@ def build_eligible_corrections(correction_data):
         _proposed_status = _canonical_proposable_loan_status(c.get("expected_loan_status_effective"))
         if (
             "LOAN STATUS MISMATCH" in reasons
+            # 2026-08-14: the mandatory lender-reported LIQUIDATION branch above
+            # runs first and already emitted for every LIQUIDATION loan, so this
+            # guard is what delivers "one Loan Status item, not two". Without it
+            # both branches would share one id and generate_reviewed_workbook's
+            # `by_id` dict would keep only the last -- a reviewer's decision
+            # applied to a recommendation they were never shown. This branch is
+            # otherwise UNCHANGED and still governs FORECLOSURE and REO, which the
+            # LIQUIDATION-only branch above deliberately does not touch.
+            and "Loan Status" not in _emitted_fields
             and _is_collection_status(c.get("srf_status"))
             and _proposed_status is not None
             and _norm(_proposed_status) != _norm(c.get("srf_status"))

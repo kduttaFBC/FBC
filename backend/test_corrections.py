@@ -908,9 +908,22 @@ class TerminalStatusRoutesToReviewTests(unittest.TestCase):
         self.assertEqual(ls["calculated"], "ACTIVE")
 
     def test_unverified_expected_value_produces_no_loan_status_candidate(self):
-        # Insufficient or contradictory independent evidence -> no proposal.
+        # Insufficient or contradictory independent evidence -> no PROPOSAL.
+        #
+        # SUPERSEDED ASSERTION 2026-08-14. This asserted the fields were exactly
+        # ["Delinquency Status"]. Under the client-confirmed lender-reported
+        # LIQUIDATION Human Review rule a Loan Status review item is now ALWAYS
+        # created, precisely so that an unproposable expected value can no longer
+        # make the loan disappear. What is still asserted -- and is the point of
+        # this test -- is that NO VALUE IS MANUFACTURED: calculated is None.
         recs, _, _ = _recommend([self._entry(expected_loan_status_effective="UNVERIFIED")])
-        self.assertEqual([r["field"] for r in recs], ["Delinquency Status"])
+        ls = [r for r in recs if r["field"] == "Loan Status"]
+        self.assertEqual(len(ls), 1)
+        self.assertIsNone(ls[0]["calculated"])
+        self.assertNotEqual(ls[0]["calculated"], "ACTIVE")
+        self.assertEqual(ls[0]["reviewFlag"],
+                         corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION)
+        self.assertIn("Delinquency Status", [r["field"] for r in recs])
 
     def test_collection_status_is_never_proposed_even_if_it_is_the_expected_value(self):
         recs, _, _ = _recommend([self._entry(
@@ -919,8 +932,22 @@ class TerminalStatusRoutesToReviewTests(unittest.TestCase):
         self.assertEqual([r["field"] for r in recs], [])
 
     def test_no_candidate_when_expected_matches_what_the_servicer_reported(self):
+        # SUPERSEDED ASSERTION 2026-08-14. This asserted "Loan Status" was ABSENT
+        # when the audit's expected status agreed with the servicer's reported
+        # LIQUIDATION. That agreement is exactly the bypass the client-confirmed
+        # lender-reported LIQUIDATION Human Review rule closes: a loan reported
+        # LIQUIDATION against a prior LIQUIDATION previously vanished from Human
+        # Review and now always surfaces.
+        #
+        # Still asserted: no value is manufactured for it, and the old
+        # terminal-CONTRADICTION reason is not used, because there is no
+        # contradiction here.
         recs, _, _ = _recommend([self._entry(expected_loan_status_effective="LIQUIDATION")])
-        self.assertNotIn("Loan Status", [r["field"] for r in recs])
+        ls = [r for r in recs if r["field"] == "Loan Status"]
+        self.assertEqual(len(ls), 1)
+        self.assertIsNone(ls[0]["calculated"])
+        self.assertEqual(ls[0]["reviewFlag"],
+                         corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION)
 
 
 class TerminalWriteRequiresExplicitApprovalTests(unittest.TestCase):
@@ -1185,11 +1212,22 @@ class CollectionStatusReviewRoutingTests(unittest.TestCase):
                 self.assertEqual(recs["Loan Status"]["calculated"], "ACTIVE")
 
     def test_all_three_collection_statuses_flag_the_loan_status_candidate(self):
+        # SUPERSEDED ASSERTION 2026-08-14 for LIQUIDATION only. All three still
+        # produce a review-flagged Loan Status candidate -- unchanged, and still
+        # asserted below. What changed is the REASON on LIQUIDATION: under the
+        # client-confirmed rule every in-scope lender-reported LIQUIDATION carries
+        # one consistent reason of its own, with nothing appended, so it no longer
+        # says "terminal collection status". FORECLOSURE and REO are untouched and
+        # keep the terminal-contradiction reason verbatim.
         for status in self.COLLECTION:
             with self.subTest(status=status):
                 flag = self._candidates_for(status)["Loan Status"]["reviewFlag"]
                 self.assertIsNotNone(flag)
-                self.assertIn("terminal collection status", flag)
+                if status.upper() == "LIQUIDATION":
+                    self.assertEqual(
+                        flag, corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION)
+                else:
+                    self.assertIn("terminal collection status", flag)
 
     def test_all_three_collection_statuses_flag_the_dq_candidate(self):
         for status in self.COLLECTION:

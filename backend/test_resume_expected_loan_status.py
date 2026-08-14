@@ -179,10 +179,22 @@ class ResumeIsTypeAgnosticTests(unittest.TestCase):
         # Weak evidence is REPORTED, never written: an unclassified deferral
         # carries DEFERRAL DATA QUALITY WARNING, which corrections.
         # WARNING_REASONS excludes from candidacy entirely.
+        #
+        # SUPERSEDED ASSERTION 2026-08-14. This asserted NO Loan Status candidate.
+        # The client-confirmed lender-reported LIQUIDATION Human Review rule is
+        # explicitly NOT suppressed by WARNING_REASONS, so this loan -- reported
+        # LIQUIDATION -- now produces the mandatory Loan Status review item. The
+        # warning itself is unchanged and still suppresses everything else: the
+        # Delinquency Status candidate is still absent, which is asserted below.
         record, entry, recs = _end_to_end("LIQUIDATION", action=UNCLASSIFIED)
         self.assertIn("DEFERRAL DATA QUALITY WARNING", entry["reasons"])
-        self.assertEqual([r for r in recs if r["field"] == "Loan Status"], [])
         self.assertIn("DEFERRAL DATA QUALITY WARNING", corrections.WARNING_REASONS)
+        ls = [r for r in recs if r["field"] == "Loan Status"]
+        self.assertEqual(len(ls), 1)
+        self.assertEqual(ls[0]["reviewFlag"],
+                         corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION)
+        # the warning still does its job for every OTHER correction type
+        self.assertEqual([r for r in recs if r["field"] == "Delinquency Status"], [])
 
 
 class UntouchedCarveOutTests(unittest.TestCase):
@@ -466,8 +478,19 @@ class EndToEndRecommendationTests(unittest.TestCase):
         self.assertEqual(len(loan_status), 1)
         rec = loan_status[0]
         self.assertEqual(rec["reported"], "LIQUIDATION")
+        # The audit's derived ACTIVE is still offered, unchanged -- a confirmed
+        # resume produces a proposable expected status, so this loan DOES carry a
+        # Falcon Bridge recommendation.
         self.assertEqual(rec["calculated"], "ACTIVE")
-        self.assertEqual(rec["reviewFlag"], corrections.REVIEW_REASON_TERMINAL_STATUS)
+        # SUPERSEDED ASSERTION 2026-08-14: this asserted the terminal-CONTRADICTION
+        # reason. Under the client-confirmed rule every in-scope lender-reported
+        # LIQUIDATION carries one consistent reason of its own, with nothing
+        # appended -- the contradiction remains visible as evidence on the loan
+        # card rather than as a second decision rule. Review is still REQUIRED,
+        # which is what this test protects.
+        self.assertEqual(rec["reviewFlag"],
+                         corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION)
+        self.assertFalse(rec["standard"])
 
     def test_the_recommendation_is_never_auto_applied(self):
         # review_required is what stops an automatic write; the reviewer_approved
