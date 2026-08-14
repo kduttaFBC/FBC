@@ -3268,6 +3268,24 @@ def _build_portfolio_summary_record(si_grouped, servicer_name, dq_status_for_agi
         if is_paid_in_full:
             totals["Paid In Full"] += beginning_balance
 
+    # CLIENT-CONFIRMED (2026-08-13): OUTSTANDING ENDING BALANCE IS THE
+    # DENOMINATOR for every Portfolio Summary percentage, Paid In Full and
+    # Liquidation included.
+    #
+    # Paid In Full and Liquidation are CURRENT PERIOD TERMINAL ACTIVITY
+    # measures, and their dollar numerators use Beginning Balance under their
+    # own existing business rules (see the terminal-activity block just above),
+    # while this denominator is the Ending Balance of the loans that REMAIN --
+    # which explicitly excludes the PIF and Liquidation loans themselves. So the
+    # numerator and the denominator are drawn from different balance points and
+    # from disjoint sets of loans.
+    #
+    # THE MIXED BASIS IS INTENTIONAL. It is not an oversight, and it must NOT be
+    # "normalized" -- neither by moving this denominator to Beginning Balance nor
+    # by switching the terminal-activity numerators to Ending Balance -- without
+    # a NEW client-approved business rule. Pinned by
+    # test_portfolio_summary_percentage_basis.py, which fails if either basis
+    # moves.
     def pct(amount):
         return round((amount / outstanding) * 100, 2) if outstanding else 0.0
 
