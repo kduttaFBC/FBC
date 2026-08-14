@@ -471,6 +471,90 @@ def read_remittance_date(file_bytes):
     return None
 
 
+def read_collection_period_calendar(file_bytes):
+    """The "Reference Tables" Collection Period -> Remittance Due Date schedule.
+
+    Returns {"2026-07-23": 26, ...} -- ISO date string to period number -- or
+    None when the sheet is absent or nothing parses. Never a guess: an
+    unreadable calendar returns None so the caller leaves Collection Period
+    blank and raises its existing validation issue.
+
+    HISTORICALLY VALIDATED (2026-08-14). This table is the ONLY published
+    source that ties a remittance date to a period number. It is a lookup, not
+    date arithmetic, and that is deliberate: the remittance dates are irregular
+    (the 21st, 22nd, 23rd or 24th depending on weekends and holidays -- see
+    2026-01-22, 2026-05-21 and 2026-08-21), so any months-between formula would
+    be wrong precisely where an exact lookup is right.
+
+    Measured across all 10 available SRFs (8 June 2026 + 2 July 2026): the
+    sheet is present in every one, including Peoples Bank and the Lendistry
+    2025 file that ships no Data Validation sheet; the O2 header reads
+    "Collection Period" in every one; and the schedule is byte-identical across
+    both SOUP deals. It grows by exactly one row per month (26 rows in the June
+    files ending 2026-07-23, 27 in the July files ending 2026-08-21), and the
+    last row's date equals that file's own stated Remittance Date.
+
+    Column positions are LOCATED BY HEADER, not assumed. O/P/Q happens to hold
+    them in every file measured, but a shifted template would silently return
+    the wrong period under fixed indices, and a wrong period is worse than a
+    blank one.
+    """
+    try:
+        wb = _load_workbook(file_bytes)
+        sheet = wb.get_sheet_by_name("Reference Tables")
+        rows = sheet.to_python()
+    except Exception:
+        return None
+
+    period_col = due_col = header_row = None
+    for row_index, row in enumerate(rows[:12]):
+        for col_index, cell in enumerate(row):
+            text = str(cell).strip().lower() if cell is not None else ""
+            if text == "collection period":
+                # The schedule is the ONE Collection Period column paired with
+                # a Remittance Due Date. The same sheet carries two other
+                # Collection Period columns (Cumulative Realized Loss Level and
+                # Total Default Level trigger tables), which are not calendars.
+                for scan in range(col_index + 1, min(col_index + 4, len(row))):
+                    neighbour = str(row[scan]).strip().lower() if row[scan] is not None else ""
+                    if neighbour == "remittance due date":
+                        period_col, due_col, header_row = col_index, scan, row_index
+                        break
+            if period_col is not None:
+                break
+        if period_col is not None:
+            break
+    if period_col is None:
+        return None
+
+    calendar = {}
+    for row in rows[header_row + 1:]:
+        if period_col >= len(row) or due_col >= len(row):
+            continue
+        raw_period, raw_due = row[period_col], row[due_col]
+        if raw_period is None or raw_due is None:
+            continue
+        # calamine hands every cell back as a STRING, so a period of 1 arrives
+        # as "1.0" and int() alone would raise on every row -- which silently
+        # emptied the whole calendar. Parsed as a float and required to be
+        # integral, so "1.0" resolves to 1 while "1.5" is rejected rather than
+        # truncated into a period that does not exist.
+        try:
+            numeric = float(str(raw_period).strip())
+        except (TypeError, ValueError):
+            continue
+        if numeric != int(numeric):
+            continue
+        period = int(numeric)
+        due = pd.to_datetime(str(raw_due).strip(), errors="coerce")
+        if pd.isna(due):
+            continue
+        # First occurrence wins, so a duplicated date cannot silently
+        # renumber a period that was already established.
+        calendar.setdefault(due.strftime("%Y-%m-%d"), period)
+    return calendar or None
+
+
 def normalize_id_series(series):
     """Normalizes an ID column to clean strings — SBA GP Numbers load as
     floats when any row in the column is blank, which turns '1261949109'

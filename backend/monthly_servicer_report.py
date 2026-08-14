@@ -201,6 +201,7 @@ _DATE_COLUMNS = ("Paid-In-Full Date", "Liquidation Date", "Foreclosure Date",
 
 # Validation issue codes surfaced to the reviewer.
 ISSUE_COLLECTION_PERIOD_UNAVAILABLE = "collection_period_unavailable"
+ISSUE_COLLECTION_PERIOD_CALENDAR_CONFLICT = "collection_period_calendar_conflict"
 ISSUE_NOTE_SERIES_UNAVAILABLE = "note_series_unavailable"
 ISSUE_NOTE_SERIES_CONFLICT = "note_series_conflict"
 ISSUE_REMITTANCE_DATE_UNAVAILABLE = "remittance_date_unavailable"
@@ -398,6 +399,100 @@ def build_servicer_rows(servicer_inputs_df, servicer_name, verified_overrides=No
     return rows
 
 
+# HISTORICALLY VALIDATED / CLIENT OUTPUT VALIDATED (2026-08-14).
+#
+# THE ANCHOR IS DERIVED FROM CLIENT-PRODUCED REPORTS, NOT STATED BY THE CLIENT.
+# That is why this is not labelled CLIENT-CONFIRMED. The Reference Tables
+# calendar in every SRF is anchored at period 1 = remittance 2024-06-21, which
+# is the 2024 deal's schedule, and it is byte-identical in the 2025 files -- so
+# the calendar alone cannot say where a given deal's period 1 falls. The offset
+# comes from two client-produced Monthly Servicer Reports:
+#
+#   client May 2026 MSR   remittance 2026-06-23  = calendar row 25  states 10
+#   client June 2026 MSR  remittance 2026-07-23  = calendar row 26  states 11
+#
+# Both imply the same anchor, calendar row 16 = 2025-09-23, and the rule
+# reproduces both stated values exactly. A third month agrees without a client
+# report to lean on: the July 2026 SRFs state remittance 2026-08-21, which their
+# own calendar carries at row 27, giving 12.
+#
+# NOTHING IN ANY SOURCE FILE SAYS "SOUP 2025-1 STARTS AT 2025-09-23". If the
+# client later states a different anchor, THIS DATE is the single thing to
+# change. Keyed by deal so no other deal can inherit it.
+#
+# SOUP2024_1 IS DELIBERATELY ABSENT. Its calendar row 1 (2024-06-21) looks like
+# its anchor, which would make June 2026 period 26, but no 2024-deal client MSR
+# exists to confirm it and an unverified anchor would put a wrong period number
+# on a distributed report. A deal with no entry here keeps a blank Collection
+# Period and the existing validation issue -- the same behaviour every deal had
+# before this rule existed.
+_DEAL_COLLECTION_PERIOD_ANCHOR = {
+    "SOUP2025_1": "2025-09-23",
+}
+
+
+def _resolve_collection_period(deal, calendar, remittance_date, issues):
+    """Collection Period = the report's row in the deal's own remittance
+    calendar, counted from that deal's first remittance.
+
+        collection_period = row(remittance_date) - row(deal anchor) + 1
+
+    Returns None and appends ISSUE_COLLECTION_PERIOD_UNAVAILABLE whenever any
+    input is missing or does not resolve -- an absent calendar, an unknown
+    deal, a remittance date the calendar does not list, or an anchor the
+    calendar does not list. A blank field with an issue is always preferable to
+    a fabricated period number, which would be indistinguishable from a real
+    one on a distributed report.
+
+    Deliberately NOT a nearest-match or a months-between calculation: see
+    file_readers.read_collection_period_calendar for why the irregular
+    remittance dates make an exact lookup the only safe form.
+    """
+    def unavailable(detail):
+        issues.append({
+            "code": ISSUE_COLLECTION_PERIOD_UNAVAILABLE,
+            "field": "Collection Period",
+            "message": (
+                f"Collection Period could not be derived from the uploaded files "
+                f"({detail}) and was left blank in the Monthly Servicer Report. "
+                f"Please enter the correct Collection Period in cell B4 of the "
+                f"Monthly Servicer Report worksheet before distributing the report."
+            ),
+        })
+        return None
+
+    anchor = _DEAL_COLLECTION_PERIOD_ANCHOR.get(deal)
+    if anchor is None:
+        return unavailable(f"no established first-remittance anchor for deal {deal or 'unknown'}")
+    if not calendar:
+        # Covers BOTH "no servicer file published a calendar" and "the servicer
+        # files disagreed, so build_deal_report withheld it" -- the conflict
+        # issue beside this one names the disagreeing files.
+        return unavailable(
+            "no single agreed Reference Tables remittance calendar across the servicer files")
+    if remittance_date is None or _blank(remittance_date):
+        return unavailable("no Remittance Date")
+    parsed = pd.to_datetime(remittance_date, errors="coerce")
+    if pd.isna(parsed):
+        return unavailable("unreadable Remittance Date")
+
+    key = parsed.strftime("%Y-%m-%d")
+    report_row = calendar.get(key)
+    if report_row is None:
+        return unavailable(f"Remittance Date {key} is not listed in the remittance calendar")
+    anchor_row = calendar.get(anchor)
+    if anchor_row is None:
+        return unavailable(f"anchor date {anchor} is not listed in the remittance calendar")
+
+    period = report_row - anchor_row + 1
+    if period < 1:
+        # The report predates the deal's first remittance. Arithmetically
+        # possible, business-impossible; blank rather than zero or negative.
+        return unavailable(
+            f"Remittance Date {key} precedes the deal's first remittance {anchor}")
+    return period
+
+
 def _resolve_shared_field(values, servicers, issues, unavailable_code, conflict_code, label):
     """One value shared by every servicer in a deal (Note Series, Remittance
     Date). Absent or conflicting is a VALIDATION ISSUE, never a guess."""
@@ -432,16 +527,23 @@ def build_deal_report(deal, servicers):
     servicers is a list of dicts, in upload order:
         {"servicer_name": soup_key, "display_label": ..., "rows": [...],
          "note_series": "2025 FBC-1" | None,
-         "remittance_date": Timestamp | None}
+         "remittance_date": Timestamp | None,
+         "collection_period_calendar": {"2026-07-23": 26, ...} | None}
 
-    Collection Period is ALWAYS None. CLIENT-CONFIRMED (2026-08-11): the
-    client's reference workbook states 11, while the SRF's Data Validation
-    sheet states 26 for every servicer in BOTH deals -- so it is not a
-    deal-level period and cannot be that field -- and Lendistry 2025 ships no
-    Data Validation sheet at all. No reliable source exists, so the report is
-    generated with the field blank and a validation issue raised, rather than a
-    fabricated number. Recorded as a future enhancement: collect the Collection
-    Period explicitly from the reviewer before generation."""
+    Collection Period is resolved by _resolve_collection_period from the
+    servicers' own Reference Tables remittance calendar and the deal's
+    first-remittance anchor. HISTORICALLY VALIDATED (2026-08-14) for SOUP2025_1
+    only -- see _DEAL_COLLECTION_PERIOD_ANCHOR for why the anchor is derived
+    from client-produced reports rather than client-stated, and why SOUP2024_1
+    is deliberately excluded.
+
+    SUPERSEDES the earlier position that no source existed. That reasoning held
+    that the SRFs "state a Collection Period that does not vary by SOUP deal, so
+    it cannot be used" -- correct about the calendar in isolation, since it is
+    anchored to the 2024 deal in every file. What it was missing is the
+    per-deal anchor, which the historical client MSRs supply. Every deal
+    without an established anchor keeps exactly the previous behaviour: blank
+    field, validation issue raised."""
     issues = []
     names = [s["display_label"] for s in servicers]
 
@@ -453,18 +555,37 @@ def build_deal_report(deal, servicers):
         ISSUE_REMITTANCE_DATE_UNAVAILABLE, ISSUE_REMITTANCE_DATE_CONFLICT,
         "Remittance Date")
 
-    issues.append({
-        "code": ISSUE_COLLECTION_PERIOD_UNAVAILABLE,
-        "field": "Collection Period",
-        "message": (
-            "Collection Period could not be derived from the uploaded files and "
-            "was left blank in the Monthly Servicer Report. The servicer files "
-            "state a Collection Period that does not vary by SOUP deal, so it "
-            "cannot be used here. Please enter the correct Collection Period in "
-            "cell B4 of the Monthly Servicer Report worksheet before "
-            "distributing the report."
-        ),
-    })
+    # One calendar for the deal, resolved the same way Note Series and
+    # Remittance Date are: a conflict between servicers is surfaced, never
+    # silently resolved by picking the first file.
+    calendars = [s.get("collection_period_calendar") for s in servicers]
+    present_calendars = [(n, c) for n, c in zip(names, calendars) if c]
+    calendar = present_calendars[0][1] if present_calendars else None
+    if len({tuple(sorted(c.items())) for _n, c in present_calendars}) > 1:
+        # DELIBERATELY NOT first-file-wins, unlike Note Series and Remittance
+        # Date above. Those two conflict resolutions pick the first value and
+        # flag it because the competing values are VISIBLE in the issue message,
+        # so a reviewer can see exactly what was chosen over what. A calendar is
+        # a 27-row table: the reviewer cannot eyeball which one won, and the two
+        # calendars can differ at a single row that happens to be THIS report's
+        # reporting month -- producing a confidently wrong period number that
+        # looks identical to a correct one. Disagreeing servicers mean the
+        # period is genuinely unknown, so the field is blanked. This keeps the
+        # never-guess rule intact and matches every other failure path here.
+        calendar = None
+        issues.append({
+            "code": ISSUE_COLLECTION_PERIOD_CALENDAR_CONFLICT,
+            "field": "Collection Period",
+            "message": (
+                "The servicer files in this deal publish different remittance "
+                "calendars in their Reference Tables sheets "
+                f"({', '.join(n for n, _c in present_calendars)}). Collection Period "
+                "was left blank rather than resolved from one of them; please "
+                "confirm which calendar is correct."
+            ),
+        })
+    collection_period = _resolve_collection_period(
+        deal, calendar, remittance_date, issues)
 
     rows = []
     for servicer in servicers:
@@ -484,7 +605,7 @@ def build_deal_report(deal, servicers):
         "deal": deal,
         "note_series": note_series,
         "remittance_date": remittance_date,
-        "collection_period": None,
+        "collection_period": collection_period,
         "rows": rows,
         "remittance_servicers": remittance_servicers,
         "validation_issues": issues,
@@ -510,7 +631,9 @@ def _write_metadata(ws, report):
     date_cell.number_format = _DATE
 
     ws.cell(row=_COLLECTION_PERIOD_ROW, column=1, value="► Collection Period:")
-    # Deliberately left as None -- see build_deal_report.
+    # Resolved per deal by _resolve_collection_period; None when no anchor is
+    # established for the deal or the calendar could not be read, in which case
+    # build_deal_report has already raised the validation issue.
     ws.cell(row=_COLLECTION_PERIOD_ROW, column=2,
             value=report.get("collection_period")).number_format = _COUNT
 

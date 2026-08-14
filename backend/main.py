@@ -1187,6 +1187,11 @@ async def corrections_review(payload: dict):
                 stage = "metadata"
                 note_series = file_readers.read_note_series_label(entry["original_bytes"])
                 remittance_date = file_readers.read_remittance_date(entry["original_bytes"])
+                # Read from the SAME original bytes as the two lines above, so
+                # the calendar cannot describe a different file than the
+                # Remittance Date it is looked up against.
+                collection_period_calendar = file_readers.read_collection_period_calendar(
+                    entry["original_bytes"])
             except Exception as exc:
                 # CLIENT-CONFIRMED (2026-08-13): ONE try around the WHOLE body.
                 # Previously only the read was guarded (silent skip) while
@@ -1241,6 +1246,7 @@ async def corrections_review(payload: dict):
                 "issues": servicer_issues,
                 "note_series": note_series,
                 "remittance_date": remittance_date,
+                "collection_period_calendar": collection_period_calendar,
             })
 
         # ---- D3: reconcile expected vs reported, PER DEAL -------------------
