@@ -39,6 +39,49 @@ def _round2(value):
     return round(float(v), 2) if pd.notna(v) else None
 
 
+def _nan_to_none(value):
+    """Restore a deliberate None that pandas turned into NaN.
+
+    WHY THIS IS NEEDED. _cycle_review_evidence sets each review-evidence AMOUNT
+    to a literal None when the source column carried nothing for the loan --
+    `out[key] = None if pd.isna(total) else _round2(total)` -- because the
+    client-confirmed rule is that an all-blank column stays None and must NOT
+    become 0.00. That None then passes through
+    `pd.DataFrame(rows).set_index("SBA GP Number")`, which infers each column's
+    dtype from the rows it was handed:
+
+        every loan None          -> object  dtype, None survives as None
+        ANY loan a real value    -> float64 dtype, EVERY None becomes NaN
+
+    So one liquidating loan in a file silently converts every other loan's
+    "nothing reported" into NaN. Starlette's JSONResponse renders with
+    allow_nan=False and raises inside the handler body, which main.py's outer
+    handler reports as HTTP 400 -- a server-side serialization defect surfacing
+    as a client error. Observed in production on 'liquidationLoss'.
+
+    Fixed HERE, at the point the value leaves the frame and enters
+    correction_data, rather than by forcing dtypes at construction (that frame
+    has many consumers and this is a display-only concern) or by patching the
+    payload in corrections.py (which would leave the corrupted value live inside
+    correction_data, read by more than one call site).
+
+    NOT a 0-substitution: a liquidation that reported no loss is not a
+    liquidation with a loss of zero.
+
+    DELIBERATELY LEAVES ±inf ALONE. _round2 passes infinities through and that
+    is a separate latent issue with its own evidence and its own fix; widening
+    this function to cover it would blur what this change is validated against.
+    pd.isna(float("inf")) is False, so an infinity reaches the caller unchanged,
+    exactly as before.
+    """
+    try:
+        missing = bool(pd.isna(value))
+    except (TypeError, ValueError):
+        # Non-scalar (list, array); nothing this function should touch.
+        return value
+    return None if missing else value
+
+
 def _result(check_id, name, category, severity, records, details_fn, issues_found=None):
     issues = len(records) if issues_found is None else issues_found
     status = "PASS" if issues == 0 else severity
@@ -2914,9 +2957,13 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             # an input to a rule.
             "foreclosure_date": row.get("foreclosure_date") or "",
             "reo_date": row.get("reo_date") or "",
-            "liquidation_proceeds": row.get("liquidation_proceeds"),
-            "liquidation_loss": row.get("liquidation_loss"),
-            "subsequent_recoveries": row.get("subsequent_recoveries"),
+            # _nan_to_none: pandas turns these deliberate Nones into NaN as soon
+            # as ANY loan in the same file reports a real amount (float64 dtype
+            # inference). See _nan_to_none for the full mechanism -- without it
+            # the payload cannot serialize and /api/audit fails.
+            "liquidation_proceeds": _nan_to_none(row.get("liquidation_proceeds")),
+            "liquidation_loss": _nan_to_none(row.get("liquidation_loss")),
+            "subsequent_recoveries": _nan_to_none(row.get("subsequent_recoveries")),
             # CLIENT-CONFIRMED (2026-08-13): the PRIOR FINALISED reporting period's
             # Ending Balance -- SOUP's last recorded "Ending Actual Balance" for
             # this loan, off the SAME soup_latest row that already supplies
