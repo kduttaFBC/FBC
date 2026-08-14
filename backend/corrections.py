@@ -751,6 +751,21 @@ def build_eligible_corrections(correction_data):
                 # arithmetic that ran and stays on screen. This flag only adds
                 # the fact that reversed postings are hidden inside that $0.00.
                 "offsetting_zero_net_reversal": _reversal_offset,
+                # CLIENT-CONFIRMED (2026-08-13): the RAW negative-posting fact,
+                # passed straight through from checks.py (correction_data). It is
+                # the third reversal discriminator classify_recommendation reads --
+                # the one the two flags above cannot express, because both are
+                # keyed on the consolidated NET and a reversed posting more than
+                # offset by positive ones nets POSITIVE.
+                #
+                # DELIBERATELY NOT an input to eligibility, and deliberately NOT a
+                # review_reason. The 2026-08-03 reversal rule's scope is unchanged:
+                # these loans keep their existing review_required state, keep
+                # STAT-01's calculated value, and remain individually approvable.
+                # Only the BULK control declines to sweep them. Adding it to
+                # `_reversal` above would have changed which recommendations exist
+                # and what they say -- a business rule change, which this is not.
+                "has_negative_posting": bool(c.get("has_negative_posting")),
                 # The shared deferral-evidence contract (checks.
                 # DEFERRAL_EVIDENCE_STATUSES). Passed through verbatim and
                 # NEVER recomputed here: STAT-01 is the only place that
@@ -784,6 +799,19 @@ def build_eligible_corrections(correction_data):
                 "bankruptcy_date": c.get("bankruptcy_date"),
                 "paid_in_full_date": c.get("paid_in_full_date"),
                 "liquidation_date": c.get("liquidation_date"),
+                # CLIENT-CONFIRMED (2026-08-13): additional DISPLAY-ONLY review
+                # evidence for the Human Review loan card, so a reviewer judging a
+                # Loan Status contradiction can see the terminal-event evidence and
+                # the prior finalised balance without opening the workbook. Passed
+                # straight through from STAT-01; read by NO rule in this module --
+                # not by the allow-list above, not by validate_approved_value, not
+                # by any write gate. The reviewer is the judgement here.
+                "foreclosure_date": c.get("foreclosure_date"),
+                "reo_date": c.get("reo_date"),
+                "liquidation_proceeds": c.get("liquidation_proceeds"),
+                "liquidation_loss": c.get("liquidation_loss"),
+                "subsequent_recoveries": c.get("subsequent_recoveries"),
+                "prior_ending_balance": c.get("prior_ending_balance"),
             })
 
         # --- Delinquency Status -------------------------------------------------
@@ -1051,6 +1079,105 @@ def build_eligible_corrections(correction_data):
     return eligible
 
 
+# ---------------------------------------------------------------------------
+# HUMAN REVIEW CLASSIFICATION (CLIENT-CONFIRMED 2026-08-13)
+#
+# PRESENTATION AND WORKFLOW METADATA ONLY. This is not a second audit engine and
+# not an eligibility layer. It answers exactly one question -- "which review
+# bucket does the reviewer see this in, and may the bulk control sweep it" -- as
+# a PURE FUNCTION of facts the audit has ALREADY decided.
+#
+# What it may read: field, review_required/review_reason, reversal_equivalents,
+# offsetting_zero_net_reversal, has_negative_posting. All set upstream.
+# What it must never do: read a payment amount, a balance, a scheduled payment or
+# a date; re-derive a ladder; recompute a threshold; or return, alter or reorder a
+# recommended value. It is called AFTER a recommendation is fully built, so it is
+# structurally downstream of every value it could otherwise disturb.
+#
+# THE 80% PAYMENT-SUFFICIENCY THRESHOLD IS DELIBERATELY NOT A CATEGORY. It is the
+# divisor in EVERY delinquency judgement (checks.PAYMENT_SUFFICIENCY_THRESHOLD --
+# single-period sufficiency, the 80-100% hold-steady band, catch-up installment
+# counting and the reversal deficiency formula all use it), so it discriminates
+# nothing: a "threshold" bucket would either be empty or contain every
+# Delinquency Status recommendation. Deriving a narrower band would also mean
+# restating the Adjusted Payment Total numerator, which checks.py records as NOT
+# YET CLIENT-CONFIRMED. The real, rule-backed exception category is
+# REVIEW_CATEGORY_DATA_DOMAIN -- values outside the permitted domain.
+STANDARD_CATEGORY = "Standard — Delinquency"
+REVIEW_CATEGORY_REVERSAL = "Reversal / Transaction"
+REVIEW_CATEGORY_LOAN_STATUS = "Loan Status"
+REVIEW_CATEGORY_DATA_DOMAIN = "Data Domain / Exception"
+REVIEW_CATEGORY_TERMINAL = "Terminal Status Conflict"
+REVIEW_CATEGORY_OTHER = "Other — Flagged"
+
+# Display order for the REVIEW REQUIRED section. Mirrored by the review page.
+REVIEW_REQUIRED_CATEGORIES = (
+    REVIEW_CATEGORY_LOAN_STATUS,
+    REVIEW_CATEGORY_REVERSAL,
+    REVIEW_CATEGORY_DATA_DOMAIN,
+    REVIEW_CATEGORY_TERMINAL,
+    REVIEW_CATEGORY_OTHER,
+)
+
+
+def classify_recommendation(eligible):
+    """Returns (category, is_standard) for one built recommendation/candidate.
+
+    PRECEDENCE IS FIRST-MATCH-WINS, most-judgement-first, and the order is not
+    arbitrary -- it reproduces the engine's own ranking:
+
+      1. REVERSAL / TRANSACTION. First because build_eligible_corrections
+         already ranks it first: `if _reversal: continue` suppresses all four
+         Loan Status branches, so a reversal already outranks Loan Status
+         upstream. Any other order here would contradict the audit.
+         THREE facts, not two: a net-negative reversal (the deficiency formula
+         ran), an offsetting zero-net reversal, AND -- CLIENT-CONFIRMED
+         2026-08-13 -- a negative posting whose consolidated net is POSITIVE.
+         The third is the gap the first two leave: _reversal upstream tests only
+         net-negative or net-exactly-zero, so a reversed posting more than offset
+         by positive ones carries no review flag at all and would otherwise be
+         swept into the bulk group. Measured on real June data: 5 Lendistry
+         loans. The client's own principle governs -- "the existence of an
+         offsetting positive posting does not make a reversal stop being a
+         reversal" (checks._is_offsetting_zero_net_reversal). This does NOT
+         change eligibility, the recommended value, or any review flag: the loan
+         is still individually approvable and STAT-01's figure is untouched. It
+         is removed from BULK approval only, which is strictly more conservative.
+      2. LOAN STATUS -- every one, flagged or not. _apply_one_correction refuses
+         to write ANY Loan Status without reviewer_approved, so this makes the UI
+         agree with a write gate that is already enforced. Two of the five June
+         recommendations (confirmed Full P&I deferral, phase "mid") carry NO
+         review flag and would otherwise land in the deterministic group.
+      3. DATA DOMAIN / EXCEPTION -- the reported value is outside its domain.
+      4. TERMINAL STATUS CONFLICT -- the servicer asserts FORECLOSURE /
+         LIQUIDATION / REO on a Delinquency Status recommendation.
+      5. OTHER -- FLAGGED. FAIL CLOSED: anything still carrying ANY review reason
+         is never Standard. A review reason added upstream in future is therefore
+         Review Required by DEFAULT rather than silently joining the bulk group.
+      6. STANDARD -- the terminal fallback, reachable only when no flag of any
+         kind and none of the above applies.
+
+    Precedence can only ever move an item BETWEEN Review Required buckets. It can
+    never move one INTO Standard, because Standard is reached only by falling
+    through every test above."""
+    if eligible.get("reversal_equivalents") is not None:
+        return REVIEW_CATEGORY_REVERSAL, False
+    if eligible.get("offsetting_zero_net_reversal"):
+        return REVIEW_CATEGORY_REVERSAL, False
+    if eligible.get("has_negative_posting"):
+        return REVIEW_CATEGORY_REVERSAL, False
+    if eligible.get("field") == "Loan Status":
+        return REVIEW_CATEGORY_LOAN_STATUS, False
+    reason = eligible.get("review_reason") or ""
+    if REVIEW_REASON_CROSS_DOMAIN in reason:
+        return REVIEW_CATEGORY_DATA_DOMAIN, False
+    if REVIEW_REASON_TERMINAL_STATUS in reason:
+        return REVIEW_CATEGORY_TERMINAL, False
+    if reason or eligible.get("review_required"):
+        return REVIEW_CATEGORY_OTHER, False
+    return STANDARD_CATEGORY, True
+
+
 def _recommendation_id(servicer, gp, field):
     """Stable, deterministic id for one recommendation within a session.
     Deterministic (not a uuid) so a resubmitted review maps to the same
@@ -1110,6 +1237,12 @@ def build_recommendations(stat01_result, servicer):
         candidate["servicer"] = servicer
         candidates.append(candidate)
 
+        # HUMAN REVIEW CLASSIFICATION (CLIENT-CONFIRMED 2026-08-13). Computed HERE
+        # -- after eligibility, after the value, after the review flag -- so it is
+        # structurally incapable of influencing any of them. Presentation and
+        # workflow metadata only; no write path reads it.
+        category, is_standard = classify_recommendation(e)
+
         recommendations.append({
             "id": rec_id,
             "servicer": servicer,
@@ -1158,6 +1291,30 @@ def build_recommendations(stat01_result, servicer):
             "bankruptcyDate": e.get("bankruptcy_date"),
             "paidInFullDate": e.get("paid_in_full_date"),
             "liquidationDate": e.get("liquidation_date"),
+            # CLIENT-CONFIRMED (2026-08-13): additional DISPLAY-ONLY review
+            # evidence for the loan card. Never re-derived on the client, never an
+            # input to any decision here or there.
+            "foreclosureDate": e.get("foreclosure_date"),
+            "reoDate": e.get("reo_date"),
+            "liquidationProceeds": e.get("liquidation_proceeds"),
+            "liquidationLoss": e.get("liquidation_loss"),
+            "subsequentRecoveries": e.get("subsequent_recoveries"),
+            "priorEndingBalance": e.get("prior_ending_balance"),
+            # CLIENT-CONFIRMED (2026-08-13): the raw negative-posting fact behind
+            # the third reversal discriminator, exposed so the review page can SAY
+            # why an otherwise unflagged recommendation sits in Reversal /
+            # Transaction rather than leaving the reviewer to guess.
+            "hasNegativePosting": bool(e.get("has_negative_posting")),
+            # PRESENTATION AND WORKFLOW METADATA. `category` names the review
+            # bucket; `standard` is the ONLY thing the bulk control consults.
+            # Both are computed server-side from facts the audit already decided
+            # and are never recomputed on the client -- the review page reads them,
+            # exactly as it already reads review_completeness and
+            # reporting_readiness. Neither is read by any write path: a decision is
+            # applied because a REVIEWER submitted it, never because an item was
+            # classified Standard.
+            "category": category,
+            "standard": is_standard,
         })
 
     return recommendations, candidates, skipped

@@ -15,6 +15,12 @@ const DQ_LADDER = [
 // reviewer picks from the real field domain, exactly as they do for
 // Delinquency Status above; the application itself never GENERATES a terminal
 // collection status, and nothing is written without explicit approval.
+//
+// CLIENT-CONFIRMED (2026-08-13): these nine values are the ONLY way a Loan Status
+// is entered. There is no free-text path anywhere on this screen — a Loan Status
+// contradiction is resolved by the reviewer SELECTING from this domain, and
+// validate_approved_value re-checks the selection against _PERMITTED_LOAN_STATUS
+// server-side regardless of what this list says.
 const LOAN_STATUS_DOMAIN = [
   'ACTIVE', 'DEFERRED', 'PAID-IN-FULL', 'REO', 'FORECLOSURE',
   'BANKRUPTCY', 'SUBSTITUTION-IN', 'SUBSTITUTION-OUT', 'LIQUIDATION',
@@ -25,6 +31,42 @@ const DECISIONS = [
   { v: 'reject', label: 'Reject — keep the reported value' },
   { v: 'return', label: 'Return to servicer — source defect' },
 ]
+
+// HUMAN REVIEW CLASSIFICATION (CLIENT-CONFIRMED 2026-08-13). Mirrors
+// corrections.STANDARD_CATEGORY / REVIEW_CATEGORY_* / REVIEW_REQUIRED_CATEGORIES
+// verbatim; a parity test asserts the two lists agree, the same way the existing
+// DQ_LADDER and SERVICER_SOUP_KEYS parity tests do.
+//
+// GROUPING AND DISPLAY ONLY. `standard` and `category` are read off the server
+// response and are NEVER recomputed here — this screen must not re-derive a
+// classification any more than it re-derives a delinquency figure.
+const STANDARD_CATEGORY = 'Standard — Delinquency'
+const REVIEW_CATEGORY_LOAN_STATUS = 'Loan Status'
+const REVIEW_CATEGORY_REVERSAL = 'Reversal / Transaction'
+const REVIEW_CATEGORY_DATA_DOMAIN = 'Data Domain / Exception'
+const REVIEW_CATEGORY_TERMINAL = 'Terminal Status Conflict'
+const REVIEW_CATEGORY_OTHER = 'Other — Flagged'
+
+const REVIEW_REQUIRED_CATEGORIES = [
+  REVIEW_CATEGORY_LOAN_STATUS,
+  REVIEW_CATEGORY_REVERSAL,
+  REVIEW_CATEGORY_DATA_DOMAIN,
+  REVIEW_CATEGORY_TERMINAL,
+  REVIEW_CATEGORY_OTHER,
+]
+
+const CATEGORY_BLURB = {
+  [REVIEW_CATEGORY_LOAN_STATUS]:
+    'Every Loan Status write requires explicit reviewer approval — including one the audit derived without flagging it. Select the correct status from the field’s own nine-value domain.',
+  [REVIEW_CATEGORY_REVERSAL]:
+    'Transaction history materially affects the recommendation: a negative Payment Received posting this cycle, whether the consolidated net is negative, exactly $0.00, or positive.',
+  [REVIEW_CATEGORY_DATA_DOMAIN]:
+    'The value the servicer reported is outside its permitted domain — a misspelling, or a value belonging to another field. A source-data defect worth notifying.',
+  [REVIEW_CATEGORY_TERMINAL]:
+    'The servicer reports a terminal collection status (FORECLOSURE / LIQUIDATION / REO) for this loan. That report is evidence to weigh, not a confirmed fact.',
+  [REVIEW_CATEGORY_OTHER]:
+    'Flagged for review for a reason this screen has no dedicated section for. Never eligible for bulk approval.',
+}
 
 const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
@@ -43,6 +85,10 @@ const money = (n) =>
   n === null || n === undefined || n === '' || Number.isNaN(Number(n))
     ? '—'
     : Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+function dash(value) {
+  return value === null || value === undefined || value === '' ? '—' : String(value)
+}
 
 function domainFor(field) {
   return field === 'Loan Status' ? LOAN_STATUS_DOMAIN : DQ_LADDER
@@ -85,6 +131,21 @@ function reversalEvidence(rec) {
   }
 }
 
+// One line describing this cycle's reversal state, for the shared loan card.
+// Reads only flags the audit already set; computes nothing.
+function reversalSummary(rec) {
+  if (rec.reversalEquivalents != null) {
+    return `net-negative — ${rec.reversalEquivalents} payment equivalent(s) removed`
+  }
+  if (rec.offsettingZeroNetReversal) {
+    return 'reversed postings offset to a consolidated net of exactly $0.00'
+  }
+  if (rec.hasNegativePosting) {
+    return 'reversed posting(s) present within a positive consolidated net'
+  }
+  return 'none'
+}
+
 // The deferral-evidence contract, computed ONCE in checks.py (STAT-01) and
 // only rendered here. This screen must never re-derive what the evidence says
 // from the dates or the memo action — that is precisely the drift the shared
@@ -114,10 +175,6 @@ function hasDeferralEvidence(rec) {
   return Boolean(rec.evidenceStatus) && rec.evidenceStatus !== 'no-deferral'
 }
 
-function dash(value) {
-  return value === null || value === undefined || value === '' ? '—' : String(value)
-}
-
 // CLIENT-CONFIRMED (2026-08-12): the current-period evidence behind a BANKRUPTCY
 // Loan Status recommendation. Rendered only when there is something to show, so
 // no existing recommendation's evidence cell changes.
@@ -143,6 +200,371 @@ function currentPeriodEvidence(rec) {
   }
 }
 
+// A recommendation's loan identity. Two recommendations share a loan card when
+// this matches — never `gp` alone, since two servicers can carry the same SBA GP
+// Number and their recommendations are separate work.
+function loanKeyOf(rec) {
+  return `${rec.servicer}||${rec.gp}`
+}
+
+// CLIENT-CONFIRMED (2026-08-13): grouped loan review. A loan with more than one
+// recommendation renders as ONE card with shared evidence and a separate decision
+// control per recommendation. The recommendations keep their own ids and their own
+// decisions throughout — grouping is a display arrangement and nothing else, and
+// the submitted payload is byte-identical to what the flat list produced.
+function groupByLoan(recs) {
+  const order = []
+  const byKey = new Map()
+  recs.forEach((r) => {
+    const key = loanKeyOf(r)
+    if (!byKey.has(key)) {
+      byKey.set(key, { key, servicer: r.servicer, gp: r.gp, recs: [] })
+      order.push(key)
+    }
+    byKey.get(key).recs.push(r)
+  })
+  return order.map((k) => byKey.get(k))
+}
+
+// Which section/category a loan card sorts under: the highest-precedence Review
+// Required category among its recommendations, matching the backend's own
+// precedence order. A card holding ANY Review Required recommendation belongs to
+// REVIEW REQUIRED — which is what puts a contradicted loan's Standard delinquency
+// companion on screen beside the Loan Status decision it must be weighed against.
+function cardCategory(group) {
+  for (const cat of REVIEW_REQUIRED_CATEGORIES) {
+    if (group.recs.some((r) => !r.standard && r.category === cat)) return cat
+  }
+  return STANDARD_CATEGORY
+}
+
+// ---------------------------------------------------------------------------
+// Presentational components. Module scope, props only — deliberately not nested
+// inside CorrectionReview, so each piece of markup is defined exactly once.
+// ---------------------------------------------------------------------------
+
+function CategoryBadge({ rec }) {
+  return (
+    <span
+      style={{
+        display: 'inline-block',
+        padding: '1px 6px',
+        borderRadius: 10,
+        border: '1px solid var(--border, #ccc)',
+        fontSize: '0.85em',
+        color: rec.standard ? 'inherit' : 'var(--amber, #BA7517)',
+      }}
+    >
+      {rec.standard ? 'Standard' : rec.category}
+    </span>
+  )
+}
+
+// The shared evidence block for a multi-recommendation loan card.
+//
+// CLIENT-CONFIRMED (2026-08-13): this is the read-only evidence a reviewer needs
+// to judge a Loan Status contradiction, gathered in one place for the whole loan.
+// Every figure is passed through from the audit — this block computes NOTHING and
+// re-derives NOTHING. A field absent from the source reads "—" rather than being
+// inferred from anything else.
+function LoanEvidenceHeader({ group }) {
+  const loanStatusRec = group.recs.find((r) => r.field === 'Loan Status')
+  const dqRec = group.recs.find((r) => r.field === 'Delinquency Status')
+  const any = group.recs[0]
+  const cp = currentPeriodEvidence(any)
+  const deferral = group.recs.find((r) => hasDeferralEvidence(r))
+  return (
+    <tr>
+      <td colSpan={10} style={{ background: 'var(--surface-2, rgba(0,0,0,0.03))' }}>
+        <div className="field-name">
+          Loan {group.gp} · {group.servicer} · {group.recs.length} recommendations
+        </div>
+        <div className="hint" style={{ marginTop: 4 }}>
+          <div>
+            <strong>Loan Status</strong> — reported {dash(any.servicerLoanStatus)} · prior
+            finalised (SOUP) {dash(any.priorLoanStatus)}
+            {loanStatusRec && (
+              <> · recommended <strong>{dash(loanStatusRec.calculated)}</strong></>
+            )}
+          </div>
+          <div>
+            <strong>Balances</strong> — prior finalised Ending Balance{' '}
+            {money(any.priorEndingBalance)} · current Ending Balance {money(any.balance)}
+          </div>
+          <div>
+            <strong>Delinquency</strong> — reported {dash(dqRec ? dqRec.reported : null)} ·
+            calculated {dash(dqRec ? dqRec.calculated : null)}
+          </div>
+          <div>
+            <strong>Payment</strong> — Received {money(any.paymentReceived)} · Fee{' '}
+            {money(any.servicingFee)} · Scheduled {money(any.scheduledPayment)} ·{' '}
+            {any.postings || 1} posting{(any.postings || 1) === 1 ? '' : 's'}
+          </div>
+          <div>
+            <strong>Terminal events</strong> — Liquidation Date {dash(any.liquidationDate)} ·
+            Bankruptcy Date {dash(any.bankruptcyDate)} · Paid-In-Full Date{' '}
+            {dash(any.paidInFullDate)} · Foreclosure Date {dash(any.foreclosureDate)} · REO
+            Date {dash(any.reoDate)}
+          </div>
+          <div>
+            <strong>Liquidation amounts</strong> — Proceeds {money(any.liquidationProceeds)} ·
+            Loss {money(any.liquidationLoss)} · Subsequent Recoveries/(Losses){' '}
+            {money(any.subsequentRecoveries)}
+          </div>
+          <div>
+            <strong>Reversal</strong> — {reversalSummary(any)}
+          </div>
+          {deferral && (
+            <div>
+              <strong>Servicer Memo</strong>{' '}
+              <span style={{ color: EVIDENCE_COLORS[deferral.evidenceStatus] || 'inherit' }}>
+                {deferral.evidenceStatus}
+              </span>
+              {EVIDENCE_MEANING[deferral.evidenceStatus] && (
+                <> — {EVIDENCE_MEANING[deferral.evidenceStatus]}</>
+              )}
+              <div>
+                Memo action {dash(deferral.memoSecuritizationAction)} · Window{' '}
+                {dash(deferral.deferralStart)} → {dash(deferral.deferralEnd)} · Resume{' '}
+                {dash(deferral.deferralResume)}
+              </div>
+            </div>
+          )}
+          {cp && cp.contradiction && (
+            <div style={{ color: 'var(--amber, #BA7517)', fontWeight: 600, marginTop: 4 }}>
+              ⚠ CONTRADICTORY: a Liquidation Date of {cp.liquidation} is reported against an
+              Ending Balance of {money(any.balance)} (greater than $0), with a reported Loan
+              Status of {dash(any.servicerLoanStatus)}. The zero-balance exception does not
+              apply — weigh both before approving.
+            </div>
+          )}
+          <div style={{ marginTop: 4 }}>
+            Each recommendation below is decided independently and carries its own record.
+          </div>
+        </div>
+      </td>
+    </tr>
+  )
+}
+
+// One recommendation's decision row, plus the per-recommendation evidence rows.
+// `grouped` suppresses only the evidence the shared card header already carries,
+// so nothing is ever shown twice. The review flag stays per recommendation: it
+// describes THAT recommendation, not the loan.
+function RecommendationRow({ rec, grouped, decision, onChange }) {
+  const d = decision || {}
+  const units = paymentUnits(rec)
+  const reversal = reversalEvidence(rec)
+  const currentPeriod = currentPeriodEvidence(rec)
+  return (
+    <React.Fragment>
+      {/* id is the jump-to-next-undecided anchor. */}
+      <tr id={`rec-${rec.id}`}>
+        <td>
+          <strong>{rec.gp}</strong>
+          <div className="hint">
+            {rec.servicer}
+            {rec.postings ? ` · ${rec.postings} posting${rec.postings === 1 ? '' : 's'}` : ''}
+          </div>
+        </td>
+        <td>
+          {rec.field}
+          <div className="hint">
+            <CategoryBadge rec={rec} />
+          </div>
+        </td>
+        <td style={{ fontFamily: 'monospace' }}>{String(rec.reported)}</td>
+        <td style={{ fontFamily: 'monospace' }}>{rec.prior == null ? '—' : String(rec.prior)}</td>
+        <td style={{ fontFamily: 'monospace' }}>{String(rec.calculated)}</td>
+        <td className="hint">
+          {reversal ? (
+            <>
+              <strong>Reversal</strong> — net Received {money(rec.paymentReceived)} / Sched{' '}
+              {money(rec.scheduledPayment)}
+              <div>
+                Deficiency {money(reversal.deficiency)} / {money(reversal.thresholdUnit)}{' '}
+                (80% of sched) ={' '}
+                <strong>
+                  {reversal.equivalents} payment
+                  {reversal.equivalents === 1 ? '' : 's'} removed
+                </strong>
+              </div>
+              <div>Fee {money(rec.servicingFee)} — excluded from this calculation</div>
+            </>
+          ) : (
+            <>
+              Received {money(rec.paymentReceived)} + Fee {money(rec.servicingFee)} / Sched{' '}
+              {money(rec.scheduledPayment)}
+              {units != null && (
+                <>
+                  {' '}= <strong>{units.toFixed(2)} units</strong>
+                </>
+              )}
+              {/* An OFFSETTING reversal keeps the ratio above: its net really is
+                  $0.00 and the ordinary no-payment branch really did produce the
+                  calculated value, so unlike a net-negative reversal the figure on
+                  screen is the arithmetic that ran. What the $0.00 hides is that
+                  reversed postings are inside it — without this line a reviewer
+                  cannot tell this apart from a loan that simply paid nothing. */}
+              {rec.offsettingZeroNetReversal && (
+                <div>
+                  <strong>Includes reversed postings</strong> offset to a net of exactly $0.00
+                </div>
+              )}
+              {/* CLIENT-CONFIRMED (2026-08-13): the third reversal case — a reversed
+                  posting whose CONSOLIDATED NET IS POSITIVE. Neither flag above can
+                  express it, since both are keyed on the net, and without saying so
+                  the reviewer cannot tell why an otherwise unflagged recommendation
+                  sits in Reversal / Transaction. */}
+              {rec.hasNegativePosting && !rec.offsettingZeroNetReversal && (
+                <div>
+                  <strong>Includes reversed postings</strong> within a positive net of{' '}
+                  {money(rec.paymentReceived)}
+                </div>
+              )}
+            </>
+          )}
+          <div>Balance {money(rec.balance)}</div>
+        </td>
+        <td>
+          <select
+            aria-label={`Decision for loan ${rec.gp} ${rec.field}`}
+            value={d.decision || ''}
+            onChange={(e) => onChange(rec.id, { decision: e.target.value })}
+          >
+            <option value="">Not yet decided</option>
+            {DECISIONS.map((opt) => (
+              <option key={opt.v} value={opt.v}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+        </td>
+        <td>
+          {d.decision === 'approve' ? (
+            <select
+              aria-label={`Approved value for loan ${rec.gp} ${rec.field}`}
+              value={d.approved_value || rec.calculated}
+              onChange={(e) => onChange(rec.id, { approved_value: e.target.value })}
+            >
+              {domainFor(rec.field).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <span className="hint">—</span>
+          )}
+        </td>
+        <td style={{ textAlign: 'center' }}>
+          <input
+            type="checkbox"
+            aria-label={`Notify servicer for loan ${rec.gp} ${rec.field}`}
+            checked={!!d.notify}
+            onChange={(e) => onChange(rec.id, { notify: e.target.checked })}
+          />
+        </td>
+        <td>
+          <input
+            type="text"
+            aria-label={`Reviewer note for loan ${rec.gp} ${rec.field}`}
+            value={d.note || ''}
+            placeholder="optional"
+            onChange={(e) => onChange(rec.id, { note: e.target.value })}
+            style={{ width: 140 }}
+          />
+        </td>
+      </tr>
+      {!grouped && currentPeriod && (
+        <tr>
+          <td colSpan={10} className="hint">
+            <strong>Current-period evidence:</strong> Bankruptcy Date{' '}
+            {dash(currentPeriod.bankruptcy)} · Paid-In-Full Date{' '}
+            {dash(currentPeriod.paidInFull)} · Liquidation Date{' '}
+            {dash(currentPeriod.liquidation)} · Ending Balance {money(rec.balance)}
+            {currentPeriod.contradiction && (
+              <div style={{ color: 'var(--amber, #BA7517)', fontWeight: 600, marginTop: 4 }}>
+                ⚠ CONTRADICTORY: a Liquidation Date of {currentPeriod.liquidation} is reported
+                against an Ending Balance of {money(rec.balance)} (greater than $0), with a
+                reported Loan Status of {dash(rec.servicerLoanStatus)}. The zero-balance
+                exception does not apply — weigh both before approving.
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
+      {!grouped && hasDeferralEvidence(rec) && (
+        <tr>
+          <td colSpan={10} className="hint">
+            <strong>Deferral evidence:</strong>{' '}
+            <span style={{ color: EVIDENCE_COLORS[rec.evidenceStatus] || 'inherit' }}>
+              {rec.evidenceStatus}
+            </span>
+            {EVIDENCE_MEANING[rec.evidenceStatus] && (
+              <> — {EVIDENCE_MEANING[rec.evidenceStatus]}</>
+            )}
+            <div>
+              Memo action {dash(rec.memoSecuritizationAction)} · Window{' '}
+              {dash(rec.deferralStart)} → {dash(rec.deferralEnd)} · Resume{' '}
+              {dash(rec.deferralResume)} · Prior (SOUP) Loan Status{' '}
+              {dash(rec.priorLoanStatus)} · Servicer Loan Status{' '}
+              {dash(rec.servicerLoanStatus)}
+            </div>
+          </td>
+        </tr>
+      )}
+      {rec.reviewFlag && (
+        <tr>
+          <td colSpan={10} style={{ color: 'var(--amber, #BA7517)' }}>
+            ⚠ {rec.reviewFlag}
+          </td>
+        </tr>
+      )}
+    </React.Fragment>
+  )
+}
+
+// The one and only recommendation table in this file. Rendered once per section
+// and once per Review Required category; there is no other table of
+// recommendations anywhere on the screen.
+function ReviewTable({ cards, decisionOf, onChange }) {
+  return (
+    <table className="detail-table" style={{ width: '100%' }}>
+      <thead>
+        <tr>
+          <th>Loan</th>
+          <th>Field / Category</th>
+          <th>Reported</th>
+          <th>Prior</th>
+          <th>Calculated</th>
+          <th>Payment evidence (BR-002)</th>
+          <th>Decision</th>
+          <th>Approved value</th>
+          <th>Notify</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {cards.map((group) => (
+          <React.Fragment key={group.key}>
+            {group.recs.length > 1 && <LoanEvidenceHeader group={group} />}
+            {group.recs.map((rec) => (
+              <RecommendationRow
+                key={rec.id}
+                rec={rec}
+                grouped={group.recs.length > 1}
+                decision={decisionOf(rec.id)}
+                onChange={onChange}
+              />
+            ))}
+          </React.Fragment>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
 export default function CorrectionReview({ recommendations, sessionId }) {
   const recs = recommendations || []
   const [decisions, setDecisions] = useState({}) // id -> {decision, approved_value, note, notify}
@@ -150,6 +572,7 @@ export default function CorrectionReview({ recommendations, sessionId }) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
+  const [collapsed, setCollapsed] = useState({}) // category -> bool
 
   const decisionOf = (id) => decisions[id] || {}
   const setDecision = (id, patch) =>
@@ -160,6 +583,96 @@ export default function CorrectionReview({ recommendations, sessionId }) {
     [recs, decisions]
   )
   const pendingCount = recs.length - decidedCount
+
+  // Classification counts, read straight off the server response. `standard` is
+  // never derived here.
+  const standardRecs = useMemo(() => recs.filter((r) => r.standard), [recs])
+  const reviewRecs = useMemo(() => recs.filter((r) => !r.standard), [recs])
+
+  // Loan cards, partitioned into the two sections. A card goes to REVIEW REQUIRED
+  // if it holds ANY Review Required recommendation.
+  const { standardCards, reviewCardsByCategory } = useMemo(() => {
+    const std = []
+    const byCat = {}
+    REVIEW_REQUIRED_CATEGORIES.forEach((c) => {
+      byCat[c] = []
+    })
+    groupByLoan(recs).forEach((group) => {
+      const cat = cardCategory(group)
+      if (cat === STANDARD_CATEGORY) std.push(group)
+      else byCat[cat].push(group)
+    })
+    return { standardCards: std, reviewCardsByCategory: byCat }
+  }, [recs])
+
+  // CLIENT-CONFIRMED (2026-08-13): THE COMPANION HOLD. A Standard recommendation
+  // whose loan still has an UNDECIDED Loan Status recommendation is held out of
+  // the bulk control until that Loan Status is decided.
+  //
+  // Why: approving a loan's delinquency figure in bulk while its Loan Status is
+  // contradicted is exactly the split judgement the grouped loan card exists to
+  // prevent. The item stays CLASSIFIED Standard — the 77/50 counts are unchanged
+  // by this — stays listed, and stays individually approvable. Only the bulk sweep
+  // declines it, and it becomes eligible the moment the Loan Status is decided
+  // either way.
+  //
+  // Keyed on Loan Status specifically, per the client's wording, which is also the
+  // fully general condition here rather than a narrower one: a Standard
+  // recommendation is always a Delinquency Status recommendation, and ids are
+  // (servicer, gp, field), so the only companion a loan can have is a Loan Status
+  // recommendation — every one of which is Review Required.
+  const loanStatusUndecided = (rec) =>
+    recs.some(
+      (other) =>
+        loanKeyOf(other) === loanKeyOf(rec) &&
+        other.field === 'Loan Status' &&
+        !decisionOf(other.id).decision
+    )
+
+  const bulkEligible = useMemo(
+    () => standardRecs.filter((r) => !decisionOf(r.id).decision && !loanStatusUndecided(r)),
+    [recs, decisions]
+  )
+  const bulkHeld = useMemo(
+    () => standardRecs.filter((r) => !decisionOf(r.id).decision && loanStatusUndecided(r)),
+    [recs, decisions]
+  )
+
+  // Populates the EXISTING client-side decision state for the eligible Standard
+  // recommendations and does nothing else. It does not submit, does not call any
+  // endpoint, does not overwrite a decision already recorded, and never touches a
+  // Review Required recommendation — bulkEligible is filtered on `standard`, which
+  // the server computed. The reviewer still types their name and still presses
+  // Record, and every pre-filled decision stays individually editable until they do.
+  const approveAllStandard = () =>
+    setDecisions((cur) => {
+      const out = { ...cur }
+      bulkEligible.forEach((r) => {
+        if (!(out[r.id] && out[r.id].decision)) {
+          out[r.id] = { ...out[r.id], decision: 'approve' }
+        }
+      })
+      return out
+    })
+
+  const jumpToNextUndecided = () => {
+    const next = recs.find((r) => !decisionOf(r.id).decision)
+    if (!next) return
+    const el = document.getElementById(`rec-${next.id}`)
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' })
+  }
+
+  const rejectAllRemaining = () =>
+    setDecisions((cur) => {
+      const out = { ...cur }
+      recs.forEach((r) => {
+        if (!(out[r.id] && out[r.id].decision)) {
+          out[r.id] = { ...out[r.id], decision: 'reject' }
+        }
+      })
+      return out
+    })
+
   // D4 (CLIENT-CONFIRMED 2026-08-13): submission is deliberately NOT gated on
   // pendingCount. Corrected workbooks and Correction Logs are PER-DECISION
   // artifacts and are explicitly not gated, so a reviewer must be able to record
@@ -215,18 +728,22 @@ export default function CorrectionReview({ recommendations, sessionId }) {
     }
   }
 
+  const decidedIn = (cards) =>
+    cards.reduce((n, g) => n + g.recs.filter((r) => decisionOf(r.id).decision).length, 0)
+  const countIn = (cards) => cards.reduce((n, g) => n + g.recs.length, 0)
+
   // D4 (CLIENT-CONFIRMED 2026-08-13): a clean month must still be able to record
   // its review and produce its reports. This component previously returned null
   // when there was nothing to review, so the reviewer-name field and the submit
   // button never rendered at all -- there was no path from a clean audit to a
   // Monthly Servicer Report or a Final Audited Portfolio Summary. 0 of 0 is the
   // most complete review possible, and it is reporting-ready.
-  // NOTE: no early return here any more. `nothingToReview` drives the table and
+  // NOTE: no early return here any more. `nothingToReview` drives the sections and
   // the bulk controls instead, so the submit affordance is always present.
 
   return (
     <div className="card" style={{ marginBottom: 22 }}>
-      <h3 style={{ marginTop: 0 }}>Review corrections</h3>
+      <h3 style={{ marginTop: 0 }}>Human Review</h3>
       <p style={{ color: 'var(--text-secondary)', marginTop: 0 }}>
         These are <strong>recommendations</strong> — nothing is written until you approve it. For each
         one, approve (optionally substituting a value from the field&apos;s own list), reject, or
@@ -245,14 +762,20 @@ export default function CorrectionReview({ recommendations, sessionId }) {
         </div>
       )}
 
-      {/* D4 progress + bulk affordances. A gate tedious enough to route around is
-          not a control: at 121 recommendations and rising, "reject all remaining"
-          and "jump to next undecided" are what make finishing a review feasible. */}
+      {/* Workload summary + global affordances. Every figure is counted from the
+          classified response — nothing here is hard-coded. A gate tedious enough
+          to route around is not a control: at 127 recommendations and rising,
+          "reject all remaining" and "jump to next undecided" are what make
+          finishing a review feasible. */}
       {!nothingToReview && (
         <div className="map-row" style={{ gridTemplateColumns: '1.6fr 1fr', marginBottom: 12 }}>
           <div className="field-name">
-            {decidedCount} of {recs.length} reviewed
-            {pendingCount > 0 ? ` · ${pendingCount} pending` : ' · none pending'}
+            {recs.length} Recommendation{recs.length === 1 ? '' : 's'}
+            <div className="hint" style={{ marginTop: 2 }}>
+              {standardRecs.length} Standard Correction{standardRecs.length === 1 ? '' : 's'} ·{' '}
+              {reviewRecs.length} Review Required · {decidedCount} decided · {pendingCount}{' '}
+              pending
+            </div>
             <div className="hint" style={{ marginTop: 2 }}>
               {pendingCount > 0
                 ? 'Final reporting is blocked until every recommendation reaches a reportable disposition.'
@@ -260,214 +783,121 @@ export default function CorrectionReview({ recommendations, sessionId }) {
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button
-              className="btn"
-              disabled={pendingCount === 0}
-              onClick={() => {
-                const next = recs.find((r) => !decisionOf(r.id).decision)
-                if (!next) return
-                const el = document.getElementById(`rec-${next.id}`)
-                if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' })
-              }}
-            >
+            <button className="btn" disabled={pendingCount === 0} onClick={jumpToNextUndecided}>
               Jump to next undecided
             </button>
-            <button
-              className="btn"
-              disabled={pendingCount === 0}
-              onClick={() =>
-                setDecisions((cur) => {
-                  const out = { ...cur }
-                  recs.forEach((r) => {
-                    if (!(out[r.id] && out[r.id].decision)) {
-                      out[r.id] = { ...out[r.id], decision: 'reject' }
-                    }
-                  })
-                  return out
-                })
-              }
-            >
+            <button className="btn" disabled={pendingCount === 0} onClick={rejectAllRemaining}>
               Reject all remaining ({pendingCount})
             </button>
           </div>
         </div>
       )}
 
-      <table className="detail-table" style={{ width: '100%' }}>
-        <thead>
-          <tr>
-            <th>Loan</th>
-            <th>Field</th>
-            <th>Reported</th>
-            <th>Prior</th>
-            <th>Calculated</th>
-            <th>Payment evidence (BR-002)</th>
-            <th>Decision</th>
-            <th>Approved value</th>
-            <th>Notify</th>
-            <th>Note</th>
-          </tr>
-        </thead>
-        <tbody>
-          {recs.map((r) => {
-            const d = decisionOf(r.id)
-            const units = paymentUnits(r)
-            const reversal = reversalEvidence(r)
-            const currentPeriod = currentPeriodEvidence(r)
+      {standardRecs.length > 0 && (
+        <div style={{ marginBottom: 18 }}>
+          <h4 style={{ marginBottom: 4 }}>
+            STANDARD CORRECTIONS · {standardRecs.length} ·{' '}
+            {standardRecs.filter((r) => decisionOf(r.id).decision).length} decided
+          </h4>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Deterministic Delinquency Status corrections. The existing business rule already
+            determines the value: STAT-01 calculated it from missed-payment history, no
+            data-quality warning applies, and there is no reversal, negative posting, invalid
+            reported value, or terminal-status conflict. Every Loan Status recommendation is
+            Review Required and is never included here.
+          </p>
+          <div
+            style={{
+              display: 'flex',
+              gap: 10,
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              marginBottom: 8,
+            }}
+          >
+            <button
+              className="btn btn-teal"
+              disabled={bulkEligible.length === 0}
+              onClick={approveAllStandard}
+            >
+              Approve All Standard Corrections ({bulkEligible.length})
+            </button>
+            <span className="hint">
+              Pre-fills the decision for {bulkEligible.length} undecided Standard
+              recommendation{bulkEligible.length === 1 ? '' : 's'}. Nothing is submitted or
+              written until you enter your name and press Record — and every one stays
+              individually editable.
+            </span>
+          </div>
+          {bulkHeld.length > 0 && (
+            <div className="alert" style={{ marginBottom: 8 }}>
+              <strong>
+                {bulkHeld.length} Standard recommendation{bulkHeld.length === 1 ? '' : 's'} held
+                back from bulk approval.
+              </strong>
+              <div className="hint" style={{ marginTop: 4 }}>
+                {bulkHeld.map((r) => `loan ${r.gp} (${r.servicer})`).join(', ')} — this loan also
+                has an undecided <strong>Loan Status</strong> recommendation. Decide the Loan
+                Status on its loan card under Review Required and this becomes eligible, or
+                approve it individually there. It is still counted as a Standard correction.
+              </div>
+            </div>
+          )}
+          {standardCards.length > 0 ? (
+            <ReviewTable
+              cards={standardCards}
+              decisionOf={decisionOf}
+              onChange={setDecision}
+            />
+          ) : (
+            <p className="hint">
+              Every Standard correction belongs to a loan that also needs individual review — see
+              the loan cards under Review Required.
+            </p>
+          )}
+        </div>
+      )}
+
+      {reviewRecs.length > 0 && (
+        <div>
+          <h4 style={{ marginBottom: 4 }}>
+            REVIEW REQUIRED · {reviewRecs.length} ·{' '}
+            {reviewRecs.filter((r) => decisionOf(r.id).decision).length} decided
+          </h4>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Each of these needs individual judgement and none can be bulk-approved.
+          </p>
+          {REVIEW_REQUIRED_CATEGORIES.map((cat) => {
+            const cards = reviewCardsByCategory[cat] || []
+            // An empty category is not rendered at all — the sections come from the
+            // data, so a month with no reversals simply has no Reversal section.
+            if (cards.length === 0) return null
+            const isCollapsed = !!collapsed[cat]
             return (
-              <React.Fragment key={r.id}>
-                {/* id is the jump-to-next-undecided anchor. */}
-                <tr id={`rec-${r.id}`}>
-                  <td>
-                    <strong>{r.gp}</strong>
-                    <div className="hint">{r.servicer}{r.postings ? ` · ${r.postings} posting${r.postings === 1 ? '' : 's'}` : ''}</div>
-                  </td>
-                  <td>{r.field}</td>
-                  <td style={{ fontFamily: 'monospace' }}>{String(r.reported)}</td>
-                  <td style={{ fontFamily: 'monospace' }}>{r.prior == null ? '—' : String(r.prior)}</td>
-                  <td style={{ fontFamily: 'monospace' }}>{String(r.calculated)}</td>
-                  <td className="hint">
-                    {reversal ? (
-                      <>
-                        <strong>Reversal</strong> — net Received {money(r.paymentReceived)} / Sched{' '}
-                        {money(r.scheduledPayment)}
-                        <div>
-                          Deficiency {money(reversal.deficiency)} / {money(reversal.thresholdUnit)}{' '}
-                          (80% of sched) ={' '}
-                          <strong>
-                            {reversal.equivalents} payment
-                            {reversal.equivalents === 1 ? '' : 's'} removed
-                          </strong>
-                        </div>
-                        <div>Fee {money(r.servicingFee)} — excluded from this calculation</div>
-                      </>
-                    ) : (
-                      <>
-                        Received {money(r.paymentReceived)} + Fee {money(r.servicingFee)} / Sched{' '}
-                        {money(r.scheduledPayment)}
-                        {units != null && (
-                          <>
-                            {' '}= <strong>{units.toFixed(2)} units</strong>
-                          </>
-                        )}
-                        {/* An OFFSETTING reversal keeps the ratio above: its net
-                            really is $0.00 and the ordinary no-payment branch
-                            really did produce the calculated value, so unlike a
-                            net-negative reversal the figure on screen is the
-                            arithmetic that ran. What the $0.00 hides is that
-                            reversed postings are inside it — without this line a
-                            reviewer cannot tell this apart from a loan that
-                            simply paid nothing. */}
-                        {r.offsettingZeroNetReversal && (
-                          <div>
-                            <strong>Includes reversed postings</strong> offset to a net of exactly
-                            $0.00
-                          </div>
-                        )}
-                      </>
+              <div key={cat} style={{ marginBottom: 14 }}>
+                <button
+                  className="btn"
+                  aria-expanded={!isCollapsed}
+                  onClick={() => setCollapsed((c) => ({ ...c, [cat]: !c[cat] }))}
+                  style={{ marginBottom: 6 }}
+                >
+                  {isCollapsed ? '▶' : '▼'} {cat} · {countIn(cards)} · {decidedIn(cards)} decided
+                </button>
+                {!isCollapsed && (
+                  <>
+                    {CATEGORY_BLURB[cat] && (
+                      <p className="hint" style={{ marginTop: 0 }}>
+                        {CATEGORY_BLURB[cat]}
+                      </p>
                     )}
-                    <div>Balance {money(r.balance)}</div>
-                  </td>
-                  <td>
-                    <select
-                      aria-label={`Decision for loan ${r.gp}`}
-                      value={d.decision || ''}
-                      onChange={(e) => setDecision(r.id, { decision: e.target.value })}
-                    >
-                      <option value="">Not yet decided</option>
-                      {DECISIONS.map((opt) => (
-                        <option key={opt.v} value={opt.v}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td>
-                    {d.decision === 'approve' ? (
-                      <select
-                        aria-label={`Approved value for loan ${r.gp}`}
-                        value={d.approved_value || r.calculated}
-                        onChange={(e) => setDecision(r.id, { approved_value: e.target.value })}
-                      >
-                        {domainFor(r.field).map((v) => (
-                          <option key={v} value={v}>
-                            {v}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <span className="hint">—</span>
-                    )}
-                  </td>
-                  <td style={{ textAlign: 'center' }}>
-                    <input
-                      type="checkbox"
-                      aria-label={`Notify servicer for loan ${r.gp}`}
-                      checked={!!d.notify}
-                      onChange={(e) => setDecision(r.id, { notify: e.target.checked })}
-                    />
-                  </td>
-                  <td>
-                    <input
-                      type="text"
-                      aria-label={`Reviewer note for loan ${r.gp}`}
-                      value={d.note || ''}
-                      placeholder="optional"
-                      onChange={(e) => setDecision(r.id, { note: e.target.value })}
-                      style={{ width: 140 }}
-                    />
-                  </td>
-                </tr>
-                {currentPeriod && (
-                  <tr>
-                    <td colSpan={10} className="hint">
-                      <strong>Current-period evidence:</strong>{' '}
-                      Bankruptcy Date {dash(currentPeriod.bankruptcy)} · Paid-In-Full Date{' '}
-                      {dash(currentPeriod.paidInFull)} · Liquidation Date{' '}
-                      {dash(currentPeriod.liquidation)} · Ending Balance {money(r.balance)}
-                      {currentPeriod.contradiction && (
-                        <div style={{ color: 'var(--amber, #BA7517)', fontWeight: 600, marginTop: 4 }}>
-                          ⚠ CONTRADICTORY: a Liquidation Date of {currentPeriod.liquidation} is
-                          reported against an Ending Balance of {money(r.balance)} (greater than
-                          $0), with a reported Loan Status of {dash(r.servicerLoanStatus)}. The
-                          zero-balance exception does not apply — weigh both before approving.
-                        </div>
-                      )}
-                    </td>
-                  </tr>
+                    <ReviewTable cards={cards} decisionOf={decisionOf} onChange={setDecision} />
+                  </>
                 )}
-                {hasDeferralEvidence(r) && (
-                  <tr>
-                    <td colSpan={10} className="hint">
-                      <strong>Deferral evidence:</strong>{' '}
-                      <span style={{ color: EVIDENCE_COLORS[r.evidenceStatus] || 'inherit' }}>
-                        {r.evidenceStatus}
-                      </span>
-                      {EVIDENCE_MEANING[r.evidenceStatus] && (
-                        <> — {EVIDENCE_MEANING[r.evidenceStatus]}</>
-                      )}
-                      <div>
-                        Memo action {dash(r.memoSecuritizationAction)} · Window{' '}
-                        {dash(r.deferralStart)} → {dash(r.deferralEnd)} · Resume{' '}
-                        {dash(r.deferralResume)} · Prior (SOUP) Loan Status{' '}
-                        {dash(r.priorLoanStatus)} · Servicer Loan Status{' '}
-                        {dash(r.servicerLoanStatus)}
-                      </div>
-                    </td>
-                  </tr>
-                )}
-                {r.reviewFlag && (
-                  <tr>
-                    <td colSpan={10} style={{ color: 'var(--amber, #BA7517)' }}>
-                      ⚠ {r.reviewFlag}
-                    </td>
-                  </tr>
-                )}
-              </React.Fragment>
+              </div>
             )
           })}
-        </tbody>
-      </table>
+        </div>
+      )}
 
       <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <label>
