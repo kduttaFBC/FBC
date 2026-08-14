@@ -42,7 +42,7 @@ import os
 import unittest
 
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 import checks
 import file_readers
@@ -108,14 +108,30 @@ def _find(substring):
     return hits[0] if hits else None
 
 
+# The real Reference Tables remittance calendar, trimmed to the rows the tests
+# exercise: the SOUP2025_1 anchor (row 16) and the May/June/July 2026 reporting
+# months (rows 25/26/27). Dates and period numbers are verbatim from the June
+# and July 2026 SRFs -- the irregular days (21st vs 23rd) are real.
+SAMPLE_CALENDAR = {
+    "2024-06-21": 1,
+    "2025-09-23": 16,   # SOUP2025_1 first remittance -- the anchor
+    "2026-05-21": 24,
+    "2026-06-23": 25,   # client May 2026 MSR states Collection Period 10
+    "2026-07-23": 26,   # client June 2026 MSR states Collection Period 11
+    "2026-08-21": 27,   # July 2026 SRFs' own remittance date
+}
+
+
 def _servicer(name="Test Bank", frame=None, overrides=None, excluded=None,
-              note_series="2025 FBC-1", remittance_date=pd.Timestamp("2026-07-23")):
+              note_series="2025 FBC-1", remittance_date=pd.Timestamp("2026-07-23"),
+              calendar=SAMPLE_CALENDAR):
     issues = []
     rows = msr.build_servicer_rows(frame if frame is not None else SAMPLE, name,
                                    verified_overrides=overrides, excluded_gps=excluded,
                                    issues=issues)
     return {"servicer_name": name, "display_label": name, "rows": rows, "issues": issues,
-            "note_series": note_series, "remittance_date": remittance_date}
+            "note_series": note_series, "remittance_date": remittance_date,
+            "collection_period_calendar": calendar}
 
 
 def _render(report):
@@ -160,6 +176,8 @@ def _june():
             "issues": issues,
             "note_series": file_readers.read_note_series_label(raw),
             "remittance_date": file_readers.read_remittance_date(raw),
+            "collection_period_calendar":
+                file_readers.read_collection_period_calendar(raw),
         })
     reports = {deal: msr.build_deal_report(deal, servicers)
                for deal, servicers in by_deal.items()}
@@ -574,16 +592,22 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(report["note_series"], "2025 FBC-1")
         self.assertEqual(report["remittance_date"], pd.Timestamp("2026-07-23"))
 
-    def test_collection_period_is_always_blank(self):
+    def test_collection_period_is_derived_for_soup2025(self):
+        """SUPERSEDES test_collection_period_is_always_blank. HISTORICALLY
+        VALIDATED (2026-08-14): row 26 - row 16 + 1 = 11, the value the client's
+        own June 2026 MSR states."""
         report = msr.build_deal_report("SOUP2025_1", [_servicer()])
-        self.assertIsNone(report["collection_period"])
+        self.assertEqual(report["collection_period"], 11)
         ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
-        self.assertIsNone(ws["B4"].value)
+        self.assertEqual(ws["B4"].value, 11)
 
-    def test_collection_period_always_raises_a_validation_issue(self):
+    def test_collection_period_raises_no_issue_once_it_resolves(self):
+        """SUPERSEDES test_collection_period_always_raises_a_validation_issue.
+        The issue is now conditional: it fires only when the field cannot be
+        resolved, so a resolved period must not carry a stale warning."""
         report = msr.build_deal_report("SOUP2025_1", [_servicer()])
         codes = [i["code"] for i in report["validation_issues"]]
-        self.assertIn(msr.ISSUE_COLLECTION_PERIOD_UNAVAILABLE, codes)
+        self.assertNotIn(msr.ISSUE_COLLECTION_PERIOD_UNAVAILABLE, codes)
 
     def test_a_missing_note_series_is_an_issue_not_a_guess(self):
         report = msr.build_deal_report("SOUP2025_1", [_servicer(note_series=None)])
@@ -619,12 +643,311 @@ class RealMetadataTests(unittest.TestCase):
                 self.assertEqual(pd.Timestamp(report["remittance_date"]),
                                  pd.Timestamp("2026-07-23"))
 
-    def test_collection_period_is_blank_and_flagged_for_both_deals(self):
-        for deal, report in _june()["reports"].items():
-            with self.subTest(deal=deal):
-                self.assertIsNone(report["collection_period"])
-                self.assertIn(msr.ISSUE_COLLECTION_PERIOD_UNAVAILABLE,
-                              [i["code"] for i in report["validation_issues"]])
+    def test_collection_period_is_11_for_2025_and_blank_for_2024(self):
+        """SUPERSEDES test_collection_period_is_blank_and_flagged_for_both_deals.
+
+        The two deals now diverge by design: SOUP2025_1 has a
+        HISTORICALLY VALIDATED anchor and resolves to the client's stated 11,
+        while SOUP2024_1 has no established anchor and keeps EXACTLY the prior
+        behaviour -- blank, with the issue raised. Both halves asserted here so
+        neither can regress into the other."""
+        reports = _june()["reports"]
+        self.assertEqual(reports["SOUP2025_1"]["collection_period"], 11)
+        self.assertNotIn(msr.ISSUE_COLLECTION_PERIOD_UNAVAILABLE,
+                         [i["code"] for i in reports["SOUP2025_1"]["validation_issues"]])
+        self.assertIsNone(reports["SOUP2024_1"]["collection_period"])
+        self.assertIn(msr.ISSUE_COLLECTION_PERIOD_UNAVAILABLE,
+                      [i["code"] for i in reports["SOUP2024_1"]["validation_issues"]])
+
+    def test_the_rendered_2024_workbook_still_has_a_blank_b4(self):
+        ws = _render(_june()["reports"]["SOUP2024_1"])[msr.MONTHLY_SERVICER_REPORT_SHEET]
+        self.assertIsNone(ws["B4"].value)
+
+
+# ---------------------------------------------------------------------------
+# 13b -- Collection Period, HISTORICALLY VALIDATED (2026-08-14)
+# ---------------------------------------------------------------------------
+
+class CollectionPeriodRuleTests(unittest.TestCase):
+    """collection_period = calendar row of the report's Remittance Date
+    - calendar row of the deal's anchor + 1.
+
+    The anchor is DERIVED FROM CLIENT-PRODUCED REPORTS, not client-stated, so
+    every negative path below matters as much as the positive one: the rule must
+    fall back to blank-plus-issue rather than guess."""
+
+    def _period(self, deal="SOUP2025_1", **kw):
+        return msr.build_deal_report(deal, [_servicer(**kw)])
+
+    # ---- the three months, from the calendar rather than the month name ----
+
+    def test_may_2026_is_period_10(self):
+        self.assertEqual(
+            self._period(remittance_date=pd.Timestamp("2026-06-23"))["collection_period"], 10)
+
+    def test_june_2026_is_period_11(self):
+        self.assertEqual(
+            self._period(remittance_date=pd.Timestamp("2026-07-23"))["collection_period"], 11)
+
+    def test_july_2026_is_period_12(self):
+        self.assertEqual(
+            self._period(remittance_date=pd.Timestamp("2026-08-21"))["collection_period"], 12)
+
+    def test_the_anchor_month_itself_is_period_1(self):
+        self.assertEqual(
+            self._period(remittance_date=pd.Timestamp("2025-09-23"))["collection_period"], 1)
+
+    def test_no_month_name_is_hardcoded_anywhere_in_the_rule(self):
+        """The rule must be a calendar lookup, not a month lookup. A calendar
+        that renumbers every period moves the answer with it; a hardcoded month
+        table would not."""
+        shifted = {date: period + 100 for date, period in SAMPLE_CALENDAR.items()}
+        # Every row moved by the same amount, so the DIFFERENCE is unchanged.
+        self.assertEqual(self._period(calendar=shifted)["collection_period"], 11)
+        # Now move only the reporting row: the answer must follow.
+        moved = dict(SAMPLE_CALENDAR, **{"2026-07-23": 30})
+        self.assertEqual(self._period(calendar=moved)["collection_period"], 15)
+
+    # ---- negative paths: blank + issue, never a guess ----
+
+    def _assert_blank_and_flagged(self, report):
+        self.assertIsNone(report["collection_period"])
+        self.assertIn(msr.ISSUE_COLLECTION_PERIOD_UNAVAILABLE,
+                      [i["code"] for i in report["validation_issues"]])
+        ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
+        self.assertIsNone(ws["B4"].value)
+
+    def test_soup2024_has_no_anchor_and_stays_blank(self):
+        self._assert_blank_and_flagged(self._period(deal="SOUP2024_1"))
+
+    def test_an_unknown_deal_stays_blank(self):
+        self._assert_blank_and_flagged(self._period(deal="SOUP2099_7"))
+
+    def test_a_deal_of_none_stays_blank(self):
+        self._assert_blank_and_flagged(self._period(deal=None))
+
+    def test_a_missing_calendar_stays_blank(self):
+        self._assert_blank_and_flagged(self._period(calendar=None))
+
+    def test_an_empty_calendar_stays_blank(self):
+        self._assert_blank_and_flagged(self._period(calendar={}))
+
+    def test_a_remittance_date_absent_from_the_calendar_is_never_nearest_matched(self):
+        """2026-07-24 is one day off a real row. A nearest-match would return
+        11; the rule must return nothing."""
+        self._assert_blank_and_flagged(
+            self._period(remittance_date=pd.Timestamp("2026-07-24")))
+
+    def test_a_missing_remittance_date_stays_blank(self):
+        self._assert_blank_and_flagged(self._period(remittance_date=None))
+
+    def test_an_unreadable_remittance_date_stays_blank(self):
+        self._assert_blank_and_flagged(self._period(remittance_date="not a date"))
+
+    def test_a_calendar_without_the_anchor_row_stays_blank(self):
+        no_anchor = {d: p for d, p in SAMPLE_CALENDAR.items() if d != "2025-09-23"}
+        self._assert_blank_and_flagged(self._period(calendar=no_anchor))
+
+    def test_a_report_predating_the_anchor_stays_blank_not_zero_or_negative(self):
+        self._assert_blank_and_flagged(
+            self._period(remittance_date=pd.Timestamp("2024-06-21")))
+
+    def test_conflicting_calendars_blank_the_field_rather_than_pick_one(self):
+        """A calendar conflict is NOT resolved first-file-wins. The two
+        calendars may differ at exactly this report's reporting month, so
+        picking one would produce a confidently wrong period indistinguishable
+        from a correct one."""
+        other = dict(SAMPLE_CALENDAR, **{"2026-07-23": 99})
+        report = msr.build_deal_report("SOUP2025_1", [
+            _servicer(name="A", calendar=SAMPLE_CALENDAR),
+            _servicer(name="B", calendar=other)])
+        codes = [i["code"] for i in report["validation_issues"]]
+        self.assertIn(msr.ISSUE_COLLECTION_PERIOD_CALENDAR_CONFLICT, codes)
+        # Blank, and flagged as unavailable too, so a reviewer scanning for the
+        # unavailable code still learns that B4 needs entering by hand.
+        self.assertIn(msr.ISSUE_COLLECTION_PERIOD_UNAVAILABLE, codes)
+        self._assert_blank_and_flagged(report)
+
+    def test_the_conflict_message_names_the_disagreeing_servicers(self):
+        other = dict(SAMPLE_CALENDAR, **{"2026-07-23": 99})
+        report = msr.build_deal_report("SOUP2025_1", [
+            _servicer(name="A", calendar=SAMPLE_CALENDAR),
+            _servicer(name="B", calendar=other)])
+        message = next(i["message"] for i in report["validation_issues"]
+                       if i["code"] == msr.ISSUE_COLLECTION_PERIOD_CALENDAR_CONFLICT)
+        self.assertIn("A", message)
+        self.assertIn("B", message)
+        self.assertIn("left blank", message)
+
+    def test_identical_calendars_across_servicers_are_not_a_conflict(self):
+        report = msr.build_deal_report("SOUP2025_1", [
+            _servicer(name="A", calendar=dict(SAMPLE_CALENDAR)),
+            _servicer(name="B", calendar=dict(SAMPLE_CALENDAR))])
+        self.assertNotIn(msr.ISSUE_COLLECTION_PERIOD_CALENDAR_CONFLICT,
+                         [i["code"] for i in report["validation_issues"]])
+        self.assertEqual(report["collection_period"], 11)
+
+    def test_one_servicer_missing_its_calendar_does_not_defeat_the_deal(self):
+        report = msr.build_deal_report("SOUP2025_1", [
+            _servicer(name="A", calendar=None),
+            _servicer(name="B", calendar=SAMPLE_CALENDAR)])
+        self.assertEqual(report["collection_period"], 11)
+
+    def test_the_anchor_is_a_single_dated_constant_for_one_deal_only(self):
+        self.assertEqual(msr._DEAL_COLLECTION_PERIOD_ANCHOR,
+                         {"SOUP2025_1": "2025-09-23"})
+
+
+class CollectionPeriodCalendarReaderTests(unittest.TestCase):
+    """file_readers.read_collection_period_calendar -- returns None rather than
+    a partial or guessed calendar."""
+
+    @staticmethod
+    def _book(rows, sheet_name="Reference Tables"):
+        wb = Workbook()
+        wb.active.title = sheet_name
+        for row in rows:
+            wb.active.append(row)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def test_it_reads_the_period_to_remittance_due_schedule(self):
+        data = self._book([
+            [None, None, None],
+            ["Collection Period", "Report Due Date", "Remittance Due Date"],
+            [1, "2024-06-05", "2024-06-21"],
+            [2, "2024-07-08", "2024-07-23"],
+        ])
+        self.assertEqual(file_readers.read_collection_period_calendar(data),
+                         {"2024-06-21": 1, "2024-07-23": 2})
+
+    def test_it_ignores_the_trigger_tables_that_share_the_column_name(self):
+        """The real sheet carries THREE 'Collection Period' columns; only the
+        one paired with a Remittance Due Date is a calendar."""
+        data = self._book([
+            ["Collection Period", "Cumulative Realized Loss Level", None,
+             "Collection Period", "Report Due Date", "Remittance Due Date"],
+            [1, 0.0325, None, 1, "2024-06-05", "2024-06-21"],
+            [2, 0.0325, None, 2, "2024-07-08", "2024-07-23"],
+        ])
+        self.assertEqual(file_readers.read_collection_period_calendar(data),
+                         {"2024-06-21": 1, "2024-07-23": 2})
+
+    def test_a_shifted_template_still_resolves_because_columns_are_found_by_header(self):
+        data = self._book([
+            [None, None, None, None, None],
+            [None, None, "Collection Period", "Report Due Date", "Remittance Due Date"],
+            [None, None, 5, "2024-10-07", "2024-10-23"],
+        ])
+        self.assertEqual(file_readers.read_collection_period_calendar(data),
+                         {"2024-10-23": 5})
+
+    def test_a_missing_sheet_returns_none(self):
+        self.assertIsNone(file_readers.read_collection_period_calendar(
+            self._book([["Collection Period", "Report Due Date", "Remittance Due Date"],
+                        [1, "2024-06-05", "2024-06-21"]], sheet_name="Something Else")))
+
+    def test_no_remittance_due_column_returns_none(self):
+        self.assertIsNone(file_readers.read_collection_period_calendar(
+            self._book([["Collection Period", "Cumulative Realized Loss Level"],
+                        [1, 0.0325]])))
+
+    def test_unparseable_rows_are_skipped_not_guessed(self):
+        data = self._book([
+            ["Collection Period", "Report Due Date", "Remittance Due Date"],
+            ["n/a", "2024-06-05", "2024-06-21"],
+            [2, "2024-07-08", "not a date"],
+            [3, "2024-08-07", "2024-08-22"],
+        ])
+        self.assertEqual(file_readers.read_collection_period_calendar(data),
+                         {"2024-08-22": 3})
+
+    def test_an_all_unparseable_calendar_returns_none_not_an_empty_dict(self):
+        self.assertIsNone(file_readers.read_collection_period_calendar(
+            self._book([["Collection Period", "Report Due Date", "Remittance Due Date"],
+                        ["n/a", "x", "y"]])))
+
+    def test_garbage_bytes_return_none(self):
+        self.assertIsNone(file_readers.read_collection_period_calendar(b"not a workbook"))
+
+
+@unittest.skipUnless(REAL, "set FALCONBRIDGE_SOUP_XLSX / _MEMO_XLSX / _SRF_DIR")
+class RealCollectionPeriodTests(unittest.TestCase):
+    """The rule against the ACTUAL SRFs, not a fixture."""
+
+    def test_every_june_srf_publishes_the_same_calendar(self):
+        calendars = []
+        for substring, _key, display, _deal in JUNE_SERVICERS:
+            path = _find(substring)
+            if not path:
+                continue
+            cal = file_readers.read_collection_period_calendar(open(path, "rb").read())
+            with self.subTest(servicer=display):
+                self.assertIsNotNone(cal)
+                # Anchor and reporting row, verbatim from the real files.
+                self.assertEqual(cal.get("2025-09-23"), 16)
+                self.assertEqual(cal.get("2026-07-23"), 26)
+            calendars.append(tuple(sorted(cal.items())))
+        self.assertTrue(calendars, "no June SRFs found")
+        self.assertEqual(len(set(calendars)), 1,
+                         "the June SRFs publish differing remittance calendars")
+
+    def test_the_june_soup2025_report_states_the_client_value(self):
+        self.assertEqual(_june()["reports"]["SOUP2025_1"]["collection_period"], 11)
+
+    def test_the_rendered_june_2025_workbook_writes_11_to_b4(self):
+        ws = _render(_june()["reports"]["SOUP2025_1"])[msr.MONTHLY_SERVICER_REPORT_SHEET]
+        self.assertEqual(ws["B4"].value, 11)
+
+    def test_may_and_july_resolve_from_the_real_june_calendar(self):
+        """One real calendar, three reporting months -- 10 / 11 / 12 -- which is
+        the whole rule: only the Remittance Date changes."""
+        path = _find("Lendistry_SOUP 2025")
+        if not path:
+            self.skipTest("no Lendistry 2025 June SRF")
+        cal = file_readers.read_collection_period_calendar(open(path, "rb").read())
+        for date, expected in (("2026-06-23", 10), ("2026-07-23", 11)):
+            with self.subTest(remittance=date):
+                report = msr.build_deal_report("SOUP2025_1", [
+                    _servicer(remittance_date=pd.Timestamp(date), calendar=cal)])
+                self.assertEqual(report["collection_period"], expected)
+        # July's remittance date is NOT in the June calendar -- the June files
+        # end at row 26 -- so it must stay blank here rather than be
+        # extrapolated. July resolves only from July's own SRFs, which publish
+        # row 27; that is asserted in RealJulyCollectionPeriodTests below.
+        blank = msr.build_deal_report("SOUP2025_1", [
+            _servicer(remittance_date=pd.Timestamp("2026-08-21"), calendar=cal)])
+        self.assertIsNone(blank["collection_period"])
+
+
+@unittest.skipUnless(os.environ.get("FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX"),
+                     "set FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX")
+class RealJulyCollectionPeriodTests(unittest.TestCase):
+
+    def test_july_2026_resolves_to_12_from_the_july_srf_alone(self):
+        raw = open(os.environ["FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX"], "rb").read()
+        cal = file_readers.read_collection_period_calendar(raw)
+        remittance = file_readers.read_remittance_date(raw)
+        self.assertEqual(cal.get("2025-09-23"), 16)
+        self.assertEqual(pd.Timestamp(remittance), pd.Timestamp("2026-08-21"))
+        self.assertEqual(cal.get("2026-08-21"), 27)
+        report = msr.build_deal_report("SOUP2025_1", [
+            _servicer(remittance_date=remittance, calendar=cal)])
+        self.assertEqual(report["collection_period"], 12)
+
+    def test_the_july_calendar_extends_the_june_one_by_exactly_one_row(self):
+        july = file_readers.read_collection_period_calendar(
+            open(os.environ["FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX"], "rb").read())
+        if not REAL or not _find("Lendistry_SOUP 2025"):
+            self.skipTest("no June SRF to compare against")
+        june = file_readers.read_collection_period_calendar(
+            open(_find("Lendistry_SOUP 2025"), "rb").read())
+        self.assertEqual(len(july), len(june) + 1)
+        # Every June row survives unchanged -- periods are never renumbered.
+        for date, period in june.items():
+            with self.subTest(date=date):
+                self.assertEqual(july[date], period)
 
 
 # ---------------------------------------------------------------------------
