@@ -148,7 +148,12 @@ class PaymentUnitsSourceFingerprintTests(unittest.TestCase):
         # needs the numbers the calculated value actually came from.
         src = _jsx_source()
         self.assertIn("function reversalEvidence(rec)", src)
-        self.assertIn("reversalEvidence(r)", src)
+        # The CALL SITE, matched on the callee rather than on the caller's local
+        # variable name. It was `reversalEvidence(r)` until the 2026-08-13 Human
+        # Review reorganisation moved the row markup into a RecommendationRow
+        # component whose prop is `rec`; pinning the identifier made this test fail
+        # on a pure rename while the arithmetic it guards was untouched.
+        self.assertRegex(src, r"reversalEvidence\(\w+\)")
         self.assertIn("Math.abs(received)", src)   # scheduled + |negative amount|
         self.assertIn("sched * 0.8", src)          # measured in 80%-of-scheduled units
 
@@ -158,8 +163,16 @@ class PaymentUnitsSourceFingerprintTests(unittest.TestCase):
 
     def test_the_figure_is_rendered_next_to_the_decision_control(self):
         src = _jsx_source()
-        self.assertIn("paymentUnits(r)", src)
-        self.assertIn("units", src)
+        # Callee-matched, not caller-matched -- see the note on the reversal
+        # fingerprint above. The point of this test is that the ratio is COMPUTED
+        # for the row and RENDERED beside the decision control, which is asserted
+        # positionally below rather than by a variable name.
+        self.assertRegex(src, r"const units = paymentUnits\(\w+\)")
+        self.assertIn("units.toFixed(2)", src)
+        # ...and the figure precedes the decision <select> within the same row.
+        self.assertLess(src.index("units.toFixed(2)"),
+                        src.index("aria-label={`Decision for loan"),
+                        "the BR-002 figure must render before the decision control")
 
 
 class PositivePaymentParityTests(unittest.TestCase):

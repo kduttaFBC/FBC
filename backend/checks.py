@@ -166,6 +166,69 @@ def _cycle_terminal_event_dates(group):
     return out
 
 
+# CLIENT-CONFIRMED (2026-08-13): additional current-period REVIEW EVIDENCE
+# columns, carried for display on the Human Review loan card so a reviewer can
+# judge a Loan Status contradiction without opening the workbook alongside the
+# audit. DISPLAY EVIDENCE ONLY.
+#
+# Deliberately SEPARATE from _TERMINAL_EVENT_DATE_COLUMNS above, which is not
+# merely a different list but a different KIND of thing: corrections.py routes
+# Loan Status ELIGIBILITY on those (bankruptcy_date_populated is a write gate).
+# Nothing routes on these. Merging the two dicts would silently widen what the
+# eligibility layer could key on, so they stay apart.
+_REVIEW_EVIDENCE_DATE_COLUMNS = {
+    "Foreclosure Date": "foreclosure_date",
+    "REO Date": "reo_date",
+}
+
+# Money columns, SUMMED across every posting in the cycle with min_count=1 --
+# the same consolidation `received` / `principal` / `net_interest` already use,
+# so a loan whose proceeds arrive across two postings reports the cycle total
+# and an all-blank column stays None rather than becoming 0.00.
+_REVIEW_EVIDENCE_AMOUNT_COLUMNS = {
+    "Liquidation Proceeds": "liquidation_proceeds",
+    "Liquidation Loss": "liquidation_loss",
+    "Subsequent Recoveries/(Losses)": "subsequent_recoveries",
+}
+
+
+def _cycle_review_evidence(group):
+    """Returns the additional display-only review evidence for one loan's cycle:
+    {foreclosure_date, foreclosure_date_populated, reo_date, reo_date_populated,
+     liquidation_proceeds, liquidation_loss, subsequent_recoveries}.
+
+    Dates follow _cycle_terminal_event_dates exactly -- a PRESENCE test plus the
+    first posting that actually carries a value, never a date parse, because these
+    columns are as mixed-typed in real files as Liquidation Date is. Amounts are
+    summed across postings.
+
+    NOT inputs to any calculation. Nothing in the delinquency ladder,
+    payment-sufficiency/BR-002, the reversal deficiency formula,
+    expected_loan_status, consolidation, the Portfolio Summary, the Monthly
+    Servicer Report or corrections.py's eligibility allow-list reads any of them --
+    every existing consolidated value is byte-for-byte unchanged by their
+    presence, and a file lacking these columns behaves exactly as before. They
+    exist so the review page can SHOW the reviewer the evidence, and for nothing
+    else. Never feed one back into a calculation here."""
+    out = {}
+    for column, key in _REVIEW_EVIDENCE_DATE_COLUMNS.items():
+        display = ""
+        if column in group.columns:
+            for value in group[column]:
+                if not _is_blank_value(value):
+                    display = str(value).strip()
+                    break
+        out[key] = display
+        out[f"{key}_populated"] = bool(display)
+    for column, key in _REVIEW_EVIDENCE_AMOUNT_COLUMNS.items():
+        if column in group.columns:
+            total = pd.to_numeric(group[column], errors="coerce").sum(min_count=1)
+            out[key] = None if pd.isna(total) else _round2(total)
+        else:
+            out[key] = None
+    return out
+
+
 def consolidate_cycle_postings(servicer_inputs_df):
     """Returns one consolidated cycle record per SBA GP Number:
       posting_count, loan_status, dq_status (both from the LAST chronological
@@ -388,6 +451,12 @@ def consolidate_cycle_postings(servicer_inputs_df):
             # presence. They exist so corrections.py can route eligibility,
             # which is that module's job, not this one's.
             **_cycle_terminal_event_dates(group),
+            # CLIENT-CONFIRMED (2026-08-13): additional DISPLAY-ONLY review
+            # evidence -- Foreclosure/REO Date, Liquidation Proceeds/Loss and
+            # Subsequent Recoveries. Same additive posture as the block above and
+            # deliberately kept as its own helper: nothing routes eligibility on
+            # these. See _cycle_review_evidence.
+            **_cycle_review_evidence(group),
             "servicing_fee": group["Servicing Fee"].sum(min_count=1) if "Servicing Fee" in group.columns else None,
             "principal": group["Principal"].sum(min_count=1) if "Principal" in group.columns else None,
             "net_interest": group["Net Interest"].sum(min_count=1) if "Net Interest" in group.columns else None,
@@ -436,6 +505,9 @@ def consolidate_cycle_postings(servicer_inputs_df):
                  "bankruptcy_date", "bankruptcy_date_populated",
                  "paid_in_full_date", "paid_in_full_date_populated",
                  "liquidation_date", "liquidation_date_populated",
+                 "foreclosure_date", "foreclosure_date_populated",
+                 "reo_date", "reo_date_populated",
+                 "liquidation_proceeds", "liquidation_loss", "subsequent_recoveries",
                  "servicing_fee", "principal", "net_interest",
                  "scheduled", "scheduled_ambiguous", "scheduled_payment_updated_during_cycle",
                  "scheduled_distinct_values", "beginning_balance",
@@ -2736,6 +2808,36 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "paid_in_full_date_populated": bool(row.get("paid_in_full_date_populated")),
             "liquidation_date": row.get("liquidation_date") or "",
             "liquidation_date_populated": bool(row.get("liquidation_date_populated")),
+            # CLIENT-CONFIRMED (2026-08-13): DISPLAY-ONLY review evidence for the
+            # Human Review loan card. Passed straight through from
+            # consolidate_cycle_postings (_cycle_review_evidence); read by nothing
+            # in this module's calculation logic and by nothing in corrections.py's
+            # eligibility allow-list. A Loan Status contradiction is judged by a
+            # human, and this is the evidence that human is shown -- it is never
+            # an input to a rule.
+            "foreclosure_date": row.get("foreclosure_date") or "",
+            "reo_date": row.get("reo_date") or "",
+            "liquidation_proceeds": row.get("liquidation_proceeds"),
+            "liquidation_loss": row.get("liquidation_loss"),
+            "subsequent_recoveries": row.get("subsequent_recoveries"),
+            # CLIENT-CONFIRMED (2026-08-13): the PRIOR FINALISED reporting period's
+            # Ending Balance -- SOUP's last recorded "Ending Actual Balance" for
+            # this loan, off the SAME soup_latest row that already supplies
+            # soup_status and soup_dq_raw above. The client's confirmed
+            # PAID-IN-FULL / LIQUIDATION validity rule is keyed on this figure, so
+            # a reviewer judging a terminal-status contradiction needs it on screen.
+            #
+            # DISPLAY ONLY, and deliberately so: this is deliberately NOT wired into
+            # any terminal-status rule here. BAL-01 independently derives the same
+            # figure for its own continuity check (see prior_ending there); this is
+            # a second READ of one shared source, never a second derivation, and
+            # nothing about STAT-01's calculated values changes by its presence.
+            "prior_ending_balance": (
+                _round2(soup_latest.loc[gp].get("Ending Actual Balance"))
+                if gp in soup_latest.index
+                and "Ending Actual Balance" in soup_latest.columns
+                else None
+            ),
             # --- Read-only review evidence (NOT used in any calculation) ---
             # Exposed purely so the correction review page can show, per
             # recommendation, the prior recorded status and the BR-002
