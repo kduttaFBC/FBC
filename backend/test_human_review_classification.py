@@ -69,7 +69,8 @@ JSX = os.path.join(os.path.dirname(__file__), "..", "frontend", "src",
 # into a silent skip.
 #
 #   FALCONBRIDGE_SRF_DIR                    June SUBMITTED (pre-correction) SRFs
-#   FALCONBRIDGE_SOUP_XLSX                  SOUP performance dataset
+#   FALCONBRIDGE_SOUP_XLSX                  SOUP whose latest period is MAY 2026
+#   FALCONBRIDGE_JULY_SOUP_XLSX             SOUP whose latest period is JUNE 2026
 #   FALCONBRIDGE_MEMO_XLSX                  Servicer Memo Summary
 #   FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX   July 2026 Lendistry 2025 SRF
 #
@@ -78,8 +79,26 @@ JSX = os.path.join(os.path.dirname(__file__), "..", "frontend", "src",
 # applied; the accepted files have already had them applied and produce almost no
 # recommendations. The accepted set is what the LOCKED REPORTING BASELINE is
 # measured on, which is a different question and a different suite.
+#
+# THE TWO SOUP GENERATIONS ARE NOT INTERCHANGEABLE COPIES -- they are different
+# REPORTING PERIODS, and pairing a lender file with the wrong one silently
+# produces a plausible but wrong answer rather than an error:
+#
+#   a JUNE audit's prior finalized period is MAY   -> FALCONBRIDGE_SOUP_XLSX
+#   a JULY audit's prior finalized period is JUNE  -> FALCONBRIDGE_JULY_SOUP_XLSX
+#
+# CLIENT-CONFIRMED (2026-08-14). Measured cost of getting this wrong, on the real
+# July Lendistry 2025 file paired with the MAY-latest SOUP: 89 recommendations
+# instead of 91, of which 52 carried a delinquency value one rung understated
+# (60->90, 90->120, 120->150, 150->180, DELINQUENT->30 DAYS), 2 were false
+# positives against loans that had actually cured in June, and one real Loan
+# Status contradiction (GP 6666709108, a current-period Bankruptcy Date beside a
+# Liquidation Date on a live balance) never surfaced at all. The application also
+# dated every output June_2026. ReportingPeriodPairing below is what makes that
+# mistake fail loudly instead of quietly.
 SRF_DIR = os.environ.get("FALCONBRIDGE_SRF_DIR")
 SOUP_XLSX = os.environ.get("FALCONBRIDGE_SOUP_XLSX")
+JULY_SOUP_XLSX = os.environ.get("FALCONBRIDGE_JULY_SOUP_XLSX")
 MEMO_XLSX = os.environ.get("FALCONBRIDGE_MEMO_XLSX")
 JULY_LENDISTRY_2025_XLSX = os.environ.get("FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX")
 
@@ -750,13 +769,16 @@ class JulyLiquidationContradiction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import file_readers
-        reason = _require(JULY_LENDISTRY_2025_XLSX, SOUP_XLSX, MEMO_XLSX)
+        # FALCONBRIDGE_JULY_SOUP_XLSX, never FALCONBRIDGE_SOUP_XLSX: a July audit's
+        # prior finalized period is JUNE. See the module header for what pairing
+        # this file with the May-latest SOUP silently does to the answer.
+        reason = _require(JULY_LENDISTRY_2025_XLSX, JULY_SOUP_XLSX, MEMO_XLSX)
         if reason:
             raise unittest.SkipTest(
                 f"July Lendistry 2025 fixtures unavailable -- set "
-                f"FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX, FALCONBRIDGE_SOUP_XLSX, "
+                f"FALCONBRIDGE_JULY_LENDISTRY_2025_XLSX, FALCONBRIDGE_JULY_SOUP_XLSX, "
                 f"FALCONBRIDGE_MEMO_XLSX ({reason})")
-        soup = file_readers.read_soup_file(open(SOUP_XLSX, "rb").read())
+        soup = file_readers.read_soup_file(open(JULY_SOUP_XLSX, "rb").read())
         memo = file_readers.resolve_memo_attribution(
             file_readers.read_service_memo(open(MEMO_XLSX, "rb").read()),
             file_readers.build_memo_loan_index(soup))
@@ -770,6 +792,8 @@ class JulyLiquidationContradiction(unittest.TestCase):
         stat01 = next(r for r in res if r["id"].split("::")[0] == "STAT-01")
         cls.recs, cls.candidates, _ = corrections.build_recommendations(stat01, l)
         cls.loan = [r for r in cls.recs if str(r["gp"]) == cls.GP]
+        cls.cycle_month = stat01.get("_cycle_month")
+        cls.servicer = l
 
     def test_the_loan_produces_two_independent_recommendations(self):
         self.assertEqual(len(self.loan), 2)
@@ -808,7 +832,10 @@ class JulyLiquidationContradiction(unittest.TestCase):
         self.assertIsNotNone(ls["priorEndingBalance"])
         self.assertEqual(ls["bankruptcyDate"], "2026-03-12")
         self.assertEqual(dq["reported"], "120 DAYS")
-        self.assertEqual(dq["calculated"], "60 DAYS")
+        # 90 DAYS, corrected 2026-08-14 from 60 DAYS. With JUNE as the prior
+        # finalized period the ladder starts one rung further along; the May-latest
+        # pairing understated this and 51 other values by exactly one rung.
+        self.assertEqual(dq["calculated"], "90 DAYS")
         for key in ("foreclosureDate", "reoDate", "liquidationProceeds",
                     "liquidationLoss", "subsequentRecoveries", "paymentReceived"):
             self.assertIn(key, ls)
@@ -846,20 +873,182 @@ class JulyLiquidationContradiction(unittest.TestCase):
         self.assertNotIn("reviewer_approved", cand)
 
     def test_july_classification_totals(self):
-        std = [r for r in self.recs if r["standard"]]
-        self.assertEqual(len(self.recs), 89)
-        self.assertEqual(len(std), 57)
-        self.assertEqual(len(self.recs) - len(std), 32)
+        """CANONICAL July baseline, measured against the JUNE-inclusive SOUP.
 
-    def test_all_four_july_bankruptcy_loans_pair_with_a_delinquency_recommendation(self):
+        CORRECTED 2026-08-14 from 89/57/32. That earlier figure was produced by
+        pairing this July lender file with the MAY-latest SOUP -- the wrong prior
+        finalized period. It is not a smaller version of this answer: 52 of its
+        values were one delinquency rung understated, 2 were false positives
+        against loans that cured in June, and the GP 6666709108 Loan Status
+        contradiction was missing entirely. No business logic changed."""
+        std = [r for r in self.recs if r["standard"]]
+        self.assertEqual(len(self.recs), 91)
+        self.assertEqual(len(std), 57)
+        self.assertEqual(len(self.recs) - len(std), 34)
+
+    def test_july_category_breakdown(self):
+        from collections import Counter
+        got = Counter(r["category"] for r in self.recs)
+        self.assertEqual(got[corrections.STANDARD_CATEGORY], 57)
+        self.assertEqual(got[corrections.REVIEW_CATEGORY_REVERSAL], 29)
+        self.assertEqual(got[corrections.REVIEW_CATEGORY_LOAN_STATUS], 5)
+        # nothing lands anywhere else in this population
+        self.assertEqual(sum(got.values()), 91)
+
+    def test_the_july_cycle_month_is_july_2026(self):
+        """The reporting period the audit derived. Pairing this file with the
+        May-latest SOUP yields 2026-06 and dates every output June_2026, which is
+        the visible symptom of the wrong prior period."""
+        self.assertEqual(str(self.cycle_month)[:7], "2026-07")
+
+    def test_the_july_output_filenames_say_july_2026(self):
+        self.assertEqual(corrections._filename_month_label(self.cycle_month), "July_2026")
+        self.assertEqual(
+            corrections._build_corrected_filename(self.servicer, self.cycle_month),
+            "Lendistry_2025_July_2026_CORRECTED.xlsx")
+
+    def test_every_july_loan_status_loan_pairs_with_a_delinquency_recommendation(self):
+        """FIVE loans, corrected 2026-08-14 from four. 6666709108 is the one the
+        May-latest pairing hid: its prior finalized status only becomes BANKRUPTCY
+        once June is the prior period, and the current-period Bankruptcy Date
+        branch is gated on LOAN STATUS MISMATCH, so with prior == reported ACTIVE
+        no mismatch was raised and its populated Bankruptcy Date was never
+        consulted. See docs/OPEN_QUESTION_bankruptcy_date_gating.md -- recorded,
+        deliberately NOT fixed here."""
         from collections import defaultdict
         by_loan = defaultdict(set)
         for r in self.recs:
             by_loan[str(r["gp"])].add(r["field"])
         ls_loans = {gp for gp, fields in by_loan.items() if "Loan Status" in fields}
-        self.assertEqual(ls_loans, {"5917099105", "6288639102", "6649779105", "7126119101"})
+        self.assertEqual(ls_loans, {"5917099105", "6288639102", "6649779105",
+                                    "6666709108", "7126119101"})
         for gp in ls_loans:
             self.assertEqual(by_loan[gp], {"Loan Status", "Delinquency Status"})
+        # every one of them is Review Required, none bulk-approvable
+        for r in self.recs:
+            if r["field"] == "Loan Status":
+                self.assertFalse(r["standard"])
+                self.assertEqual(r["category"], corrections.REVIEW_CATEGORY_LOAN_STATUS)
+
+    def test_gp_6666709108_is_the_second_contradictory_evidence_case(self):
+        """A current-period Bankruptcy Date AND a Liquidation Date against a live
+        balance -- the same shape as GP 6649779105, surfaced only once June is the
+        prior finalized period."""
+        loan = [r for r in self.recs if str(r["gp"]) == "6666709108"]
+        self.assertEqual({r["field"] for r in loan},
+                         {"Loan Status", "Delinquency Status"})
+        ls = next(r for r in loan if r["field"] == "Loan Status")
+        self.assertEqual(ls["reported"], "ACTIVE")
+        self.assertEqual(ls["calculated"], "BANKRUPTCY")
+        self.assertEqual(ls["priorLoanStatus"], "BANKRUPTCY")   # June, not May's ACTIVE
+        self.assertEqual(ls["bankruptcyDate"], "2026-04-06")
+        self.assertEqual(ls["liquidationDate"], "05/26/2026")
+        self.assertGreater(float(ls["balance"]), 0.0)
+        self.assertFalse(ls["standard"])
+
+
+# ---------------------------------------------------------------------------
+class ReportingPeriodPairing(unittest.TestCase):
+    """THE GUARD. A lender file paired with the wrong SOUP generation does not
+    error -- it returns a plausible, wrong answer. This is what makes that
+    mistake detectable.
+
+    CLIENT-CONFIRMED (2026-08-14):
+        a JUNE audit's prior finalized period is MAY
+        a JULY audit's prior finalized period is JUNE
+
+    Asserted three ways, so no single accident defeats it:
+      1. each configured SOUP's own latest Payment Month is the period it claims
+         to be -- a swap of the two environment variables fails here immediately;
+      2. the two SOUP generations are genuinely different datasets, not copies;
+      3. the cycle month the audit DERIVES from the July file equals July only
+         with the June-inclusive SOUP, and is demonstrably June with the other --
+         which is the mispairing this suite previously shipped a baseline for.
+
+    Reads facts only. Changes no calculation and asserts nothing about the
+    reporting-period RULE itself, which has its own suite
+    (test_reporting_period_rule.py)."""
+
+    @staticmethod
+    def _latest_month(soup_path):
+        soup = file_readers_mod().read_soup_file(open(soup_path, "rb").read())
+        months = pd.to_datetime(soup["Payment Month"], errors="coerce").dropna()
+        return months.max(), len(soup)
+
+    def test_the_june_soup_latest_period_is_may_2026(self):
+        if _require(SOUP_XLSX):
+            self.skipTest("set FALCONBRIDGE_SOUP_XLSX")
+        latest, rows = self._latest_month(SOUP_XLSX)
+        self.assertEqual(str(latest)[:7], "2026-05",
+                         f"FALCONBRIDGE_SOUP_XLSX must be the MAY-latest dataset "
+                         f"(a June audit's prior period); got {latest} over {rows} rows")
+
+    def test_the_july_soup_latest_period_is_june_2026(self):
+        if _require(JULY_SOUP_XLSX):
+            self.skipTest("set FALCONBRIDGE_JULY_SOUP_XLSX")
+        latest, rows = self._latest_month(JULY_SOUP_XLSX)
+        self.assertEqual(str(latest)[:7], "2026-06",
+                         f"FALCONBRIDGE_JULY_SOUP_XLSX must be the JUNE-inclusive "
+                         f"dataset (a July audit's prior period); got {latest} "
+                         f"over {rows} rows")
+
+    def test_the_two_soup_generations_are_not_the_same_dataset(self):
+        """If they were interchangeable there would be nothing to get wrong."""
+        if _require(SOUP_XLSX, JULY_SOUP_XLSX):
+            self.skipTest("set FALCONBRIDGE_SOUP_XLSX and FALCONBRIDGE_JULY_SOUP_XLSX")
+        june_latest, june_rows = self._latest_month(SOUP_XLSX)
+        july_latest, july_rows = self._latest_month(JULY_SOUP_XLSX)
+        self.assertNotEqual(june_latest, july_latest)
+        self.assertLess(june_latest, july_latest)
+        self.assertLess(june_rows, july_rows)   # July's adds a period of history
+
+    def test_the_july_file_derives_july_only_with_the_june_inclusive_soup(self):
+        """The positive AND the negative case in one test: the correct pairing
+        derives 2026-07, and the WRONG pairing derives 2026-06. Asserting the
+        wrong case explicitly is the point -- it proves the mismatch is
+        detectable rather than merely undocumented."""
+        if _require(JULY_LENDISTRY_2025_XLSX, SOUP_XLSX, JULY_SOUP_XLSX, MEMO_XLSX):
+            self.skipTest("set the June and July SOUP fixtures plus the July SRF")
+        fr = file_readers_mod()
+        derived = {}
+        for tag, soup_path in (("june_inclusive", JULY_SOUP_XLSX),
+                               ("may_latest", SOUP_XLSX)):
+            soup = fr.read_soup_file(open(soup_path, "rb").read())
+            memo = fr.resolve_memo_attribution(
+                fr.read_service_memo(open(MEMO_XLSX, "rb").read()),
+                fr.build_memo_loan_index(soup))
+            k, l, lt, si, deal = fr.read_servicer_file(
+                open(JULY_LENDISTRY_2025_XLSX, "rb").read(),
+                filename="Lendistry||Lendistry 2025__"
+                         + os.path.basename(JULY_LENDISTRY_2025_XLSX))
+            res = checks.run_servicer_reconciliation(
+                l, lt, si, fr.filter_soup_by_servicer(soup, k),
+                memo_df=memo, memo_lender_key=k, deal=deal)
+            stat01 = next(r for r in res if r["id"].split("::")[0] == "STAT-01")
+            recs, _, _ = corrections.build_recommendations(stat01, l)
+            derived[tag] = {
+                "cycle": stat01.get("_cycle_month"),
+                "label": corrections._filename_month_label(stat01.get("_cycle_month")),
+                "total": len(recs),
+                "standard": sum(1 for r in recs if r["standard"]),
+            }
+        # correct pairing
+        self.assertEqual(str(derived["june_inclusive"]["cycle"])[:7], "2026-07")
+        self.assertEqual(derived["june_inclusive"]["label"], "July_2026")
+        self.assertEqual(derived["june_inclusive"]["total"], 91)
+        self.assertEqual(derived["june_inclusive"]["standard"], 57)
+        # wrong pairing -- must be DIFFERENT and must be visibly mis-dated
+        self.assertEqual(str(derived["may_latest"]["cycle"])[:7], "2026-06")
+        self.assertEqual(derived["may_latest"]["label"], "June_2026")
+        self.assertNotEqual(derived["may_latest"]["total"],
+                            derived["june_inclusive"]["total"])
+        self.assertNotEqual(derived["may_latest"]["label"],
+                            derived["june_inclusive"]["label"])
+
+
+def file_readers_mod():
+    import file_readers
+    return file_readers
 
 
 # ---------------------------------------------------------------------------
