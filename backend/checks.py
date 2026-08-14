@@ -65,13 +65,23 @@ def _result(check_id, name, category, severity, records, details_fn, issues_foun
 # on the same GP/cycle the way BAL-01 and STAT-01 (and STAT-01 and NEG-01)
 # previously could.
 #
-# Chronological order (needed before "first"/"last" mean anything) is
+# POSTING SEQUENCE (needed before "last"/"effective_last" mean anything) is
 # established by, in order of preference:
 #   1. Loan Payment Instance, if populated (an explicit 1, 2, 3... ordinal —
 #      more reliable than date, since same-day postings can't be
 #      distinguished by date alone)
 #   2. Payment Receipt Date
 #   3. original row order (stable sort preserves this as the final fallback)
+#
+# CLIENT-CONFIRMED (2026-08-14): the CYCLE OPENING is a SEPARATE question and
+# is resolved separately, by _cycle_opening_posting — the lender does not
+# guarantee that a loan's earliest-dated posting is written first, so the
+# first row of the sequence above is not reliably the row the cycle opened at.
+# The sequence itself is deliberately UNCHANGED: measured across 16 real
+# workbooks, Loan Payment Instance reproduces a coherent balance chain on more
+# multi-posting loans than Payment Receipt Date does (159 vs 158 of 160), so
+# the ordinal stays the sequencing mechanism and the date is used ONLY to find
+# the opening row. See _cycle_opening_posting for the full measurement.
 # ---------------------------------------------------------------------------
 
 def _resolve_scheduled_payment_step_pattern(group, sched_series):
@@ -132,6 +142,79 @@ def _is_blank_value(value):
     purely about detecting a genuinely EMPTY cell, not a legitimate zero
     balance or terminal status."""
     return pd.isna(value) or str(value).strip() == ""
+
+
+def _cycle_opening_posting(group):
+    """CLIENT-CONFIRMED (2026-08-14): the posting a loan's cycle OPENS at —
+    which is a different question from where that posting sits in the posting
+    SEQUENCE, and is resolved independently of it.
+
+    WHY THE TWO ARE SEPARATE. Postings are sequenced by Loan Payment Instance
+    (see the doctrine comment above consolidate_cycle_postings). In the SRF
+    template that column is the Excel formula COUNTIFS($A$10:A<row>,A<row>) --
+    it counts occurrences of the GP from the top of the sheet down, so it is an
+    exact re-encoding of PHYSICAL ROW POSITION and carries no transaction-time
+    information at all. Measured across 16 real workbooks, that is nonetheless
+    the BETTER sequence signal: the servicer's own posting ordinal reproduces a
+    coherent Beginning->Ending balance chain on 159 of 160 multi-posting loans,
+    against 158 for Payment Receipt Date, and on the single loan where the two
+    disagree (Lendistry 2024 July GP 4704259107) the ordinal is the UNIQUE
+    correct chain and the date order breaks it. So the sequence stays on the
+    ordinal and is deliberately NOT changed here.
+
+    What the ordinal cannot answer is which posting the cycle STARTED from,
+    because the lender does not guarantee that the earliest-dated payment is
+    written first. Measured on Lendistry 2025 July GP 5951029110: the earliest
+    posting (2026-06-29) is physically the SECOND row, so `group.iloc[0]`
+    returned the 2026-07-01 row and Beginning Balance came back 19,504.69
+    against a prior finalized SOUP Ending Actual Balance of 19,805.64 -- a
+    -300.95 BAL-01 exception that is purely an artifact of row placement. The
+    2026-06-29 posting carries Beginning Balance 19,805.64 and ties to the cent.
+
+    THE ORDER, exactly:
+        1. Payment Receipt Date ascending
+        2. blank / unparseable Payment Receipt Date LAST (never treated as
+           earliest -- an absent date must not win the cycle opening)
+        3. Loan Payment Instance ascending, the deterministic tie-breaker
+           (101 of 163 real multi-posting loans carry duplicate receipt dates,
+           overwhelmingly same-day reversal pairs, so a date-only comparison
+           would not be deterministic)
+        4. original row index ascending, then position, so the key is a TOTAL
+           order and the result cannot depend on dict/groupby iteration order
+
+    Because clause 3 reproduces today's answer for every same-date group, and
+    clause 1 only ever moves a loan whose earliest posting was written out of
+    place, this changes exactly one loan in the 16 available real workbooks.
+
+    Returns the opening posting as a Series. SCOPE: read ONLY for values that
+    genuinely describe the START of the cycle (Beginning Balance, Interest-From).
+    `last`/`effective_last` and every ending-state value -- Ending Balance, Loan
+    Status, Delinquency Status, the Payment Received/Principal/Net Interest/
+    Servicing Fee totals, reversal facts -- are untouched by this function."""
+    if len(group) == 1:
+        return group.iloc[0]
+
+    dates = (pd.to_datetime(group["Payment Receipt Date"], errors="coerce")
+             if "Payment Receipt Date" in group.columns
+             else pd.Series(pd.NaT, index=group.index))
+    instances = (pd.to_numeric(group["Loan Payment Instance"], errors="coerce")
+                 if "Loan Payment Instance" in group.columns
+                 else pd.Series(float("nan"), index=group.index))
+    index_values = list(group.index)
+
+    def opening_sort_key(position):
+        date = dates.iloc[position]
+        instance = instances.iloc[position]
+        return (
+            1 if pd.isna(date) else 0,           # blank/unparseable date sorts LAST
+            0 if pd.isna(date) else date.value,
+            1 if pd.isna(instance) else 0,       # blank instance sorts last within a date
+            0.0 if pd.isna(instance) else float(instance),
+            index_values[position],
+            position,
+        )
+
+    return group.iloc[min(range(len(group)), key=opening_sort_key)]
 
 
 # CLIENT-CONFIRMED (2026-08-12): the current-period terminal-event date columns
@@ -236,9 +319,10 @@ def consolidate_cycle_postings(servicer_inputs_df):
       scheduled (a
       single value — see below), scheduled_ambiguous (bool),
       scheduled_payment_updated_during_cycle (bool), scheduled_distinct_values
-      (list, diagnostic), beginning_balance (FIRST posting), ending_balance
-      (LAST posting), interest_from (FIRST), interest_to (LAST),
-      lender_loan_number (FIRST).
+      (list, diagnostic), beginning_balance (the CYCLE OPENING posting — see
+      _cycle_opening_posting; NOT necessarily the sequence's first posting),
+      ending_balance (LAST posting), interest_from (CYCLE OPENING),
+      interest_to (LAST), lender_loan_number (FIRST).
 
     Scheduled Payment is never summed — there is one scheduled obligation
     per cycle. If every nonzero Scheduled Payment value for a loan this
@@ -275,7 +359,7 @@ def consolidate_cycle_postings(servicer_inputs_df):
     for every affected loan.
 
     Beginning Balance is deliberately UNCHANGED by this fallback — it is
-    already sourced from the FIRST posting (`first`, below), never from
+    sourced from the CYCLE OPENING posting (`opening`, below), never from
     `last`, so a blank last posting was never able to affect it in the
     first place. Flagged explicitly here since it's easy to assume
     otherwise.
@@ -300,6 +384,12 @@ def consolidate_cycle_postings(servicer_inputs_df):
 
         first = group.iloc[0]
         last = group.iloc[-1]
+        # CLIENT-CONFIRMED (2026-08-14): the row the cycle OPENED at, resolved
+        # independently of the sequence above because the lender does not
+        # guarantee the earliest-dated posting is written first. Read ONLY for
+        # start-of-cycle values (Beginning Balance, Interest-From) below; `last`
+        # and `effective_last` are unaffected and keep every ending-state value.
+        opening = _cycle_opening_posting(group)
 
         # CLIENT-CONFIRMED (2026-08-06): narrow incomplete-final-posting
         # fallback -- see the function docstring above for the full
@@ -464,10 +554,17 @@ def consolidate_cycle_postings(servicer_inputs_df):
             "scheduled_ambiguous": scheduled_ambiguous,
             "scheduled_payment_updated_during_cycle": scheduled_payment_updated_during_cycle,
             "scheduled_distinct_values": distinct_nonzero,
-            "beginning_balance": first.get("Beginning Balance"),
+            # START-OF-CYCLE values come from the cycle OPENING posting
+            # (_cycle_opening_posting), not from the first row of the posting
+            # sequence -- see that function and the doctrine comment above.
+            "beginning_balance": opening.get("Beginning Balance"),
             "ending_balance": effective_last.get("Ending Balance"),
-            "interest_from": first.get("Interest-From", ""),
+            "interest_from": opening.get("Interest-From", ""),
             "interest_to": last.get("Interest-To", ""),
+            # Loan IDENTITY, not a start-of-cycle value: every posting for a
+            # loan carries the same Lender Loan Number, so this deliberately
+            # stays on the sequence's first row rather than moving with the
+            # cycle opening.
             "lender_loan_number": first.get("Lender Loan Number", ""),
             # Source-location metadata for the correction engine (backend/
             # corrections.py) only — these come from the SAME chronologically
@@ -3977,6 +4074,12 @@ def duplicate_postings_check(servicer_inputs_df):
 
         first = group.iloc[0]
         last = group.iloc[-1]
+        # CLIENT-CONFIRMED (2026-08-14): the SAME cycle-opening rule
+        # consolidate_cycle_postings uses, so DUP-01 and BAL-01 can never
+        # report different Beginning Balances for the same loan. This is the
+        # one value DUP-01 shares with the audit; the posting sequence above
+        # (and therefore Ending Balance and the payment list) is unchanged.
+        opening = _cycle_opening_posting(group)
         payment_parts = []
         total_received = 0.0
         for _, r in group.iterrows():
@@ -3992,7 +4095,7 @@ def duplicate_postings_check(servicer_inputs_df):
         records.append({
             "SBA GP Number": gp,
             "Lender Loan Number": first.get("Lender Loan Number", ""),
-            "Beginning Balance": first.get("Beginning Balance", ""),
+            "Beginning Balance": opening.get("Beginning Balance", ""),
             "Ending Balance": last.get("Ending Balance", ""),
             "Number of Postings": len(group),
             "Total Payment Received": round(total_received, 2),
