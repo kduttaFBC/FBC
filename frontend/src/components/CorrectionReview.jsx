@@ -103,6 +103,115 @@ function domainFor(field) {
   return field === 'Loan Status' ? LOAN_STATUS_DOMAIN : DQ_LADDER
 }
 
+// CLIENT-CONFIRMED (2026-08-15): the required balance decision that accompanies a
+// reviewer-approved LIQUIDATION -> ACTIVE reversal.
+//
+// TWO CHOICES, BOTH SERVER-SUPPLIED, NO FREE-FORM ENTRY. The values come from
+// rec.balanceChoices, which the backend derives from the loan's own Beginning
+// Balance; this component never computes an amount. The backend re-validates
+// every submission against the same two values (validate_approved_value), so
+// this is the UI floor, not the control.
+//
+// NEITHER OPTION IS PRE-SELECTED, and that is deliberate even when the evidence
+// agrees: restoring a balance is a financial decision and must be made, not
+// accepted by default.
+//
+// PRIOR MONTH ENDING BALANCE IS EVIDENCE ONLY. It is displayed, and when it
+// differs from the Beginning Balance the reviewer is warned -- but it is never
+// offered as a third option, because the client's rule restores to the current
+// month's Beginning Balance or to nothing.
+function BalanceDecision({ rec, decision, onChange }) {
+  const choices = rec.balanceChoices || []
+  // Compared as strings: the radio's value attribute is a string, and matching
+  // on Number() would make a chosen 0.00 indistinguishable from "no choice yet".
+  const chosen =
+    decision.approved_value === null || decision.approved_value === undefined
+      ? ''
+      : String(decision.approved_value)
+  const restore = choices.find((c) => c.action === 'restore')
+
+  return (
+    <div className="balance-decision">
+      <div className="balance-evidence">
+        <div>
+          <strong>Beginning Balance (this month)</strong> {money(rec.beginningBalance)}
+        </div>
+        {/* Rendered only when SOUP actually carried a prior figure -- an absent
+            prior period is shown as absent, never as 0.00. */}
+        {rec.priorEndingBalance !== null && rec.priorEndingBalance !== undefined && (
+          <div>
+            <strong>Prior Month Ending Balance</strong> {money(rec.priorEndingBalance)}{' '}
+            <span className="hint">(supporting evidence only)</span>
+          </div>
+        )}
+        <div>
+          <strong>Current Ending Balance (lender reported)</strong> {money(rec.reported)}
+        </div>
+        {rec.liquidationDate && (
+          <div>
+            <strong>Liquidation Date</strong> {dash(rec.liquidationDate)}
+          </div>
+        )}
+        {rec.liquidationLoss !== null && rec.liquidationLoss !== undefined && (
+          <div>
+            <strong>Liquidation Loss</strong> {money(rec.liquidationLoss)}
+          </div>
+        )}
+      </div>
+
+      {rec.balanceEvidenceConflict && (
+        <div className="balance-warning" role="alert">
+          ⚠ The Prior Month Ending Balance and this month's Beginning Balance{' '}
+          <strong>differ</strong>. Both are shown above. Neither option is
+          pre-selected — choose deliberately.
+        </div>
+      )}
+
+      <fieldset className="balance-choices">
+        <legend>Required Balance Decision</legend>
+        {choices.map((choice) => (
+          <label key={choice.action} className="balance-choice">
+            <input
+              type="radio"
+              name={`balance-${rec.id}`}
+              value={String(choice.value)}
+              checked={chosen === String(choice.value)}
+              onChange={() =>
+                onChange(rec.id, { decision: 'approve', approved_value: choice.value })
+              }
+            />
+            {choice.action === 'restore'
+              ? `Restore Ending Balance to ${money(choice.value)}`
+              : `Keep Ending Balance at ${money(choice.value)}`}
+          </label>
+        ))}
+      </fieldset>
+
+      {/* The consequences, shown BEFORE the decision is submitted. Silent
+          financial change is exactly what this rule exists to prevent. */}
+      {restore && chosen === String(restore.value) && (
+        <div className="balance-consequences">
+          <strong>This correction will also apply:</strong>
+          <div>
+            Ending Balance {money(rec.reported)} → {money(restore.value)}
+          </div>
+          <div>Liquidation Date {dash(rec.liquidationDate)} → (blank)</div>
+          <div>Liquidation Loss {money(rec.liquidationLoss)} → (blank)</div>
+        </div>
+      )}
+      {chosen === '0' && (
+        <div className="balance-consequences">
+          <strong>Liquidation Date and Liquidation Loss will be kept.</strong>{' '}
+          <span className="hint">
+            The loan will report ACTIVE at {money(0)} with its liquidation fields
+            intact; the contradiction stays visible for review.
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // BR-002 v1.0 payment units = (Payment Received + Servicing Fee) / Scheduled
 // Payment. Servicing Fee is part of the numerator — showing Payment Received
 // alone would contradict the application's own calculation.
@@ -450,7 +559,14 @@ function RecommendationRow({ rec, grouped, decision, onChange }) {
           </select>
         </td>
         <td>
-          {d.decision === 'approve' ? (
+          {/* The balance decision replaces the value dropdown entirely: there is
+              no free-form entry and no status domain here, only the two
+              server-supplied amounts. Rendered whenever the item requires a
+              balance decision, not only after "approve" is chosen, because
+              choosing an amount IS the approval. */}
+          {rec.requiresBalanceDecision ? (
+            <BalanceDecision rec={rec} decision={d} onChange={onChange} />
+          ) : d.decision === 'approve' ? (
             <select
               aria-label={`Approved value for loan ${rec.gp} ${rec.field}`}
               value={d.approved_value || rec.calculated || ''}
@@ -659,11 +775,15 @@ export default function CorrectionReview({ recommendations, sessionId }) {
   // recommendation is always a Delinquency Status recommendation, and ids are
   // (servicer, gp, field), so the only companion a loan can have is a Loan Status
   // recommendation — every one of which is Review Required.
+  // Companion hold. A Standard correction is not swept while the SAME loan still
+  // has an undecided Loan Status decision -- or, since 2026-08-15, an undecided
+  // REQUIRED BALANCE decision. Both are judgements about the same loan, and a
+  // bulk approval must not run ahead of either.
   const loanStatusUndecided = (rec) =>
     recs.some(
       (other) =>
         loanKeyOf(other) === loanKeyOf(rec) &&
-        other.field === 'Loan Status' &&
+        (other.field === 'Loan Status' || other.requiresBalanceDecision) &&
         !decisionOf(other.id).decision
     )
 
@@ -690,8 +810,27 @@ export default function CorrectionReview({ recommendations, sessionId }) {
   const approvalsMissingValue = useMemo(
     () => recs.filter((r) => {
       const d = decisionOf(r.id)
+      // A balance decision of 0.00 is a REAL answer, so the falsy check below
+      // would wrongly read it as "no value chosen". Balance items are judged on
+      // whether an amount was chosen at all.
+      if (r.requiresBalanceDecision) {
+        return (
+          d.decision === 'approve' &&
+          (d.approved_value === null || d.approved_value === undefined)
+        )
+      }
       return d.decision === 'approve' && !d.approved_value && !r.calculated
     }),
+    [recs, decisions]
+  )
+
+  // CLIENT-CONFIRMED (2026-08-15): a reviewer-approved LIQUIDATION -> ACTIVE is
+  // not fully resolved until its balance decision is made. The server enforces
+  // this for real -- the balance item is its own candidate, so D4's pending count
+  // already blocks reporting readiness -- and this is the matching UI floor, so
+  // the reviewer is stopped here rather than discovering it after submitting.
+  const balanceDecisionsPending = useMemo(
+    () => recs.filter((r) => r.requiresBalanceDecision && !decisionOf(r.id).decision),
     [recs, decisions]
   )
 
@@ -989,9 +1128,22 @@ export default function CorrectionReview({ recommendations, sessionId }) {
         )}
         {!submitting && approvalsMissingValue.length > 0 && (
           <span className="hint" style={{ color: 'var(--amber, #BA7517)', fontWeight: 600 }}>
-            Select a Loan Status for{' '}
-            {approvalsMissingValue.map((r) => `loan ${r.gp}`).join(', ')}. An approval
-            with no value cannot be applied, so final reporting would stay blocked.
+            Select a value for{' '}
+            {approvalsMissingValue.map((r) => `loan ${r.gp} ${r.field}`).join(', ')}. An
+            approval with no value cannot be applied, so final reporting would stay
+            blocked.
+          </span>
+        )}
+        {/* The balance decision is REQUIRED, so it is called out separately from
+            the generic missing-value hint: an undecided one leaves the liquidation
+            reversal unresolved and blocks final reporting. */}
+        {!submitting && balanceDecisionsPending.length > 0 && (
+          <span className="hint" style={{ color: 'var(--amber, #BA7517)', fontWeight: 600 }}>
+            A required balance decision is outstanding for{' '}
+            {balanceDecisionsPending.map((r) => `loan ${r.gp}`).join(', ')}. Choose
+            whether to restore the Ending Balance or keep it at 0.00 — until then the
+            liquidation reversal is not fully resolved and final reporting stays
+            blocked.
           </span>
         )}
         {/* D4: pending items do NOT block submission -- they block FINAL

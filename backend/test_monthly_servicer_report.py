@@ -330,12 +330,44 @@ class ReviewerDecisionTests(unittest.TestCase):
                 with self.subTest(gp=gp, column=column):
                     self.assertEqual(plain[gp][column], overridden[gp][column])
 
-    def test_only_loan_status_and_delinquency_status_can_be_overridden(self):
-        """The correction allow-list is not widened by this module."""
+    def test_this_module_does_not_widen_the_correction_allow_list(self):
+        """AMENDED 2026-08-15: the allow-list grew from two fields to five, for the
+        reviewer-approved liquidation-reversal balance decision. What this test
+        guards is unchanged and is the point of it -- THIS MODULE does not define
+        or widen the list; it consumes checks.py's."""
         self.assertEqual(set(checks._VERIFIED_OVERRIDE_COLUMNS),
-                         {"Loan Status", "Delinquency Status"})
+                         {"Loan Status", "Delinquency Status", "Ending Balance",
+                          "Liquidation Date", "Liquidation Loss"})
         source = inspect.getsource(msr)
         self.assertNotIn("_VERIFIED_OVERRIDE_COLUMNS =", source)
+
+    def test_the_raw_sourced_override_map_is_exactly_the_two_liquidation_fields(self):
+        """Liquidation Date and Liquidation Loss are read from the RAW postings, so
+        the consolidated override never reaches them and this module applies them
+        itself. That map must stay minimal: two fields, nothing else, or a source
+        column added later could silently become reviewer-writable."""
+        self.assertEqual(set(msr._OVERRIDABLE_SOURCE_COLUMNS),
+                         {"Liquidation Date", "Liquidation Loss"})
+
+    def test_a_liquidation_override_reaches_the_raw_sourced_columns(self):
+        rows = msr.build_servicer_rows(
+            SAMPLE, "T", verified_overrides={("1", "Liquidation Date"): "",
+                                             ("1", "Liquidation Loss"): None})
+        row = next(r for r in rows if str(r["SBA GP Number"]) == "1")
+        self.assertIn(row["Liquidation Date"], (None, ""))
+        self.assertIn(row["Liquidation Loss"], (None, ""))
+
+    def test_a_loan_with_no_decision_keeps_its_raw_liquidation_values(self):
+        untouched = msr.build_servicer_rows(SAMPLE, "T", verified_overrides={})
+        overridden = msr.build_servicer_rows(
+            SAMPLE, "T", verified_overrides={("1", "Liquidation Date"): ""})
+        by_gp = {str(r["SBA GP Number"]): r for r in untouched}
+        after = {str(r["SBA GP Number"]): r for r in overridden}
+        for gp in by_gp:
+            if gp == "1":
+                continue
+            self.assertEqual(by_gp[gp]["Liquidation Date"], after[gp]["Liquidation Date"],
+                             "loan %s was affected by another loan's decision" % gp)
 
     def test_the_source_frame_is_never_mutated(self):
         before = SAMPLE.copy(deep=True)
