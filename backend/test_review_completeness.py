@@ -436,7 +436,32 @@ class CorrectionsCounterTests(unittest.TestCase):
         # unrecognised-decision branch -- which must NOT increment this counter,
         # because such an item is not an approval and is handled as pending.
         self.assertEqual(src.count("approved_not_applied_count += 1"), 2)
-        self.assertEqual(src.count("corrections_not_applied.append"), 3)
+        # AMENDED 2026-08-15: 3 -> 4. The counter's behaviour is UNCHANGED -- still
+        # exactly the two approve-failure branches above. The fourth append is the
+        # liquidation cascade's failure path (an approved balance restoration was
+        # applied, but the dependent Liquidation Date/Loss clear could not be
+        # written). That is a PARTIAL SUCCESS, not a failed approval: the balance
+        # was written and counted as applied, so incrementing
+        # approved_not_applied_count there would double-count one decision and
+        # wrongly block reporting readiness. It reports through
+        # corrections_not_applied only, which is why this count moves and the
+        # counter's does not.
+        self.assertEqual(src.count("corrections_not_applied.append"), 4)
+
+    def test_the_cascade_failure_path_does_not_touch_the_counter(self):
+        """Pins the reasoning above against the source rather than a comment, so a
+        future edit that starts incrementing the counter there is caught."""
+        import inspect
+        src = inspect.getsource(corrections.generate_reviewed_workbook)
+        lines = src.splitlines()
+        for index, line in enumerate(lines):
+            if "corrections_not_applied.append" not in line:
+                continue
+            window = "\n".join(lines[index:index + 10])
+            if "could not be cleared" in window:
+                self.assertNotIn("approved_not_applied_count", window)
+                return
+        self.fail("the cascade-failure append was not found")
 
 
 class UnrecognisedDecisionTests(_Harness):

@@ -407,11 +407,30 @@ class EvidencePassthroughIsDisplayOnly(unittest.TestCase):
         self.assertEqual(set(checks._REVIEW_EVIDENCE_DATE_COLUMNS),
                          {"Foreclosure Date", "REO Date"})
 
-    def test_the_new_facts_are_not_verified_override_columns(self):
-        """Only Loan Status and Delinquency Status may ever be written over the
-        lender's value. Display evidence must never become an override target."""
+    def test_the_override_domain_is_the_five_permitted_fields(self):
+        """AMENDED 2026-08-15. Loan Status and Delinquency Status were the whole
+        domain until the reviewer-approved liquidation-reversal balance decision
+        added Ending Balance, Liquidation Date and Liquidation Loss.
+
+        The principle this test defends is unchanged: DISPLAY EVIDENCE MUST NEVER
+        BECOME AN OVERRIDE TARGET. The three additions are not display evidence --
+        they are the fields a reviewer explicitly decides on, gated in
+        corrections.py. The genuinely display-only facts are asserted absent
+        below, which is the half that actually guards the boundary."""
         self.assertEqual(set(checks._VERIFIED_OVERRIDE_COLUMNS),
-                         {"Loan Status", "Delinquency Status"})
+                         {"Loan Status", "Delinquency Status", "Ending Balance",
+                          "Liquidation Date", "Liquidation Loss"})
+
+    def test_display_only_evidence_is_still_never_an_override_target(self):
+        """The unchanged half. Foreclosure Date, REO Date, Liquidation Proceeds,
+        Subsequent Recoveries and the prior-period balance are shown to the
+        reviewer and can never be written."""
+        for field in ("Foreclosure Date", "REO Date", "Liquidation Proceeds",
+                      "Subsequent Recoveries/(Losses)", "Bankruptcy Date",
+                      "Paid-In-Full Date", "Beginning Balance",
+                      "Payment Received", "Scheduled Payment", "Servicing Fee"):
+            with self.subTest(field=field):
+                self.assertNotIn(field, checks._VERIFIED_OVERRIDE_COLUMNS)
 
 
 # ---------------------------------------------------------------------------
@@ -682,27 +701,89 @@ class RealJuneFixtures(unittest.TestCase):
             recs, _, _ = corrections.build_recommendations(stat01, l)
             cls.recs.extend(recs)
 
-    def test_the_locked_partition_is_127_equals_77_plus_50(self):
+    # AMENDED 2026-08-15: the locked partition moved 127 -> 129 and Loan Status
+    # 5 -> 7. VERIFIED, not assumed: the increase is EXACTLY 2 new required
+    # balance candidates, and every other figure is untouched.
+    #
+    #   total                       127 -> 129   (+2)
+    #   balance candidates            0 ->   2   (+2)
+    #   total minus balance         127 -> 127   ( 0)   <- the old baseline, intact
+    #   Standard — Delinquency       77 ->  77   ( 0)
+    #   Reversal / Transaction       39 ->  39   ( 0)
+    #   Data Domain / Exception       4 ->   4   ( 0)
+    #   Terminal Status Conflict      2 ->   2   ( 0)
+    #   Loan Status                   5 ->   7   (+2)  <- the 2 balance candidates
+    #
+    # The 2 loans, each a lender-reported LIQUIDATION whose reversal to ACTIVE is
+    # offered, whose cycle opened with a positive balance, AND whose reported
+    # Ending Balance the lender zeroed:
+    #   Lendistry 2025   GP 5886179101   restore 20,088.08   reported ending 0.00
+    #   Lendistry 2025   GP 5991379104   restore 20,203.66   reported ending 0.00
+    #
+    # Mission Valley GP 4778059109 is a LIQUIDATION -> ACTIVE reversal too, and is
+    # DELIBERATELY EXCLUDED: its reported Ending Balance is 276,702.10, not zero,
+    # so neither offered choice would be correct for it (see condition 4 in
+    # corrections.BALANCE_DECISION_FIELD). That exclusion is what keeps this
+    # baseline at +2 rather than +3.
+    #
+    # test_the_increase_is_exactly_the_balance_candidates below re-derives this on
+    # every run, so the baseline cannot drift without the reason being visible.
+    LOCKED_TOTAL = 129
+    LOCKED_STANDARD = 77
+    LOCKED_REVIEW = 52
+    LOCKED_BALANCE_CANDIDATES = 2
+    PRE_BALANCE_TOTAL = 127
+    PRE_BALANCE_LOAN_STATUS = 5
+
+    def test_the_locked_partition_is_129_equals_77_plus_52(self):
         std = [r for r in self.recs if r["standard"]]
         rev = [r for r in self.recs if not r["standard"]]
-        self.assertEqual(len(self.recs), 127)
-        self.assertEqual(len(std), 77)
-        self.assertEqual(len(rev), 50)
+        self.assertEqual(len(self.recs), self.LOCKED_TOTAL)
+        self.assertEqual(len(std), self.LOCKED_STANDARD)
+        self.assertEqual(len(rev), self.LOCKED_REVIEW)
         self.assertEqual(len(std) + len(rev), len(self.recs))
+
+    def test_the_increase_is_exactly_the_balance_candidates(self):
+        """The whole justification for moving a locked baseline, re-derived."""
+        balance = [r for r in self.recs
+                   if r["field"] == corrections.BALANCE_DECISION_FIELD]
+        self.assertEqual(len(balance), self.LOCKED_BALANCE_CANDIDATES)
+        self.assertEqual(len(self.recs) - len(balance), self.PRE_BALANCE_TOTAL)
+        # and every one of them is a real liquidation reversal with a positive
+        # restore value -- not an accidental emission
+        for rec in balance:
+            self.assertTrue(rec["requiresBalanceDecision"])
+            self.assertGreater(rec["balanceRestoreValue"], 0)
+            self.assertFalse(rec["standard"])
+
+    def test_the_standard_partition_did_not_move(self):
+        """The balance decision must never be sweepable by the bulk control."""
+        self.assertEqual(len([r for r in self.recs if r["standard"]]),
+                         self.LOCKED_STANDARD)
 
     def test_the_review_required_category_breakdown(self):
         from collections import Counter
         got = Counter(r["category"] for r in self.recs if not r["standard"])
         self.assertEqual(dict(got), {
             corrections.REVIEW_CATEGORY_REVERSAL: 39,
-            corrections.REVIEW_CATEGORY_LOAN_STATUS: 5,
+            # 5 pre-existing Loan Status items + 2 balance decisions, which are
+            # deliberately classified WITH their Loan Status sibling so the
+            # reviewer reads the pair as one judgement.
+            corrections.REVIEW_CATEGORY_LOAN_STATUS: 7,
             corrections.REVIEW_CATEGORY_DATA_DOMAIN: 4,
             corrections.REVIEW_CATEGORY_TERMINAL: 2,
         })
 
+    def test_the_non_loan_status_categories_are_untouched(self):
+        from collections import Counter
+        got = Counter(r["category"] for r in self.recs if not r["standard"])
+        self.assertEqual(got[corrections.REVIEW_CATEGORY_REVERSAL], 39)
+        self.assertEqual(got[corrections.REVIEW_CATEGORY_DATA_DOMAIN], 4)
+        self.assertEqual(got[corrections.REVIEW_CATEGORY_TERMINAL], 2)
+
     def test_every_loan_status_recommendation_is_review_required(self):
         ls = [r for r in self.recs if r["field"] == "Loan Status"]
-        self.assertEqual(len(ls), 5)
+        self.assertEqual(len(ls), self.PRE_BALANCE_LOAN_STATUS)
         for r in ls:
             self.assertFalse(r["standard"])
             self.assertEqual(r["category"], corrections.REVIEW_CATEGORY_LOAN_STATUS)

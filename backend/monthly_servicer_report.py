@@ -36,8 +36,12 @@ therefore built from ONE verified layer -- the same
 `verified_overrides_by_servicer` map the Final Audited Portfolio Summary
 consumes -- which is what makes the two reconcile by construction.
 
-Only Loan Status and Delinquency Status can carry an override. That is the
-existing correction allow-list and this module does not widen it.
+Loan Status, Delinquency Status, Ending Balance, Liquidation Date and Liquidation
+Loss can carry an override. That is the existing correction allow-list and this
+module does not widen it -- the last three were added 2026-08-15 for the
+reviewer-approved liquidation-reversal balance decision ONLY, gated in
+corrections.py (see BALANCE_DECISION_FIELD), and are not general reviewer
+editing of balances or dates.
 
 POPULATION
 ----------
@@ -184,6 +188,18 @@ _SOURCE_COLUMNS = {
     "Liquidation Loss": "Liquidation Loss",
     "Modification  Date": "Modification  Date",
     "Modification Comments": "Modification Comments (Free-form)",
+}
+
+# CLIENT-CONFIRMED (2026-08-15): the raw-sourced columns a reviewer decision may
+# override. MSR output column -> the verified_overrides field name.
+#
+# Deliberately a SEPARATE, two-entry map rather than a flag on _SOURCE_COLUMNS:
+# only the liquidation-reversal cascade may reach a raw-sourced column, and
+# keeping the set explicit here means widening it is a visible edit rather than a
+# side effect of adding a source column above.
+_OVERRIDABLE_SOURCE_COLUMNS = {
+    "Liquidation Date": "Liquidation Date",
+    "Liquidation Loss": "Liquidation Loss",
 }
 
 # CLIENT-CONFIRMED (2026-08-11): fields with NO source in the uploaded lender
@@ -337,9 +353,12 @@ def build_servicer_rows(servicer_inputs_df, servicer_name, verified_overrides=No
     Trust-West Georgia" and would not match.
 
     verified_overrides is {(gp, field): approved_value} exactly as
-    corrections.generate_reviewed_workbook returns it -- only Loan Status and
-    Delinquency Status are mapped, by checks._VERIFIED_OVERRIDE_COLUMNS. A
-    rejected recommendation contributes no entry, so the lender's submitted
+    corrections.generate_reviewed_workbook returns it. Loan Status, Delinquency
+    Status and Ending Balance are mapped onto the consolidated frame by
+    checks._VERIFIED_OVERRIDE_COLUMNS; Liquidation Date and Liquidation Loss are
+    applied separately below, because they are read from the RAW postings and the
+    consolidated override never reaches them (see _OVERRIDABLE_SOURCE_COLUMNS).
+    A rejected recommendation contributes no entry, so the lender's submitted
     value stands untouched.
     """
     issues = issues if issues is not None else []
@@ -376,6 +395,23 @@ def build_servicer_rows(servicer_inputs_df, servicer_name, verified_overrides=No
                 if output_column in _DATE_COLUMNS:
                     value = _coerce_date(value)
                 row[output_column] = value
+
+        # CLIENT-CONFIRMED (2026-08-15): the columns above are read from the RAW
+        # postings, which _apply_verified_overrides never sees -- it operates on
+        # the consolidated frame. Without this, a reviewer-approved liquidation
+        # reversal would produce the exact contradiction the rule exists to
+        # prevent: Loan Status ACTIVE with a restored Ending Balance sitting
+        # beside a surviving Liquidation Date and Liquidation Loss.
+        #
+        # Applied HERE, after the standard sourcing, so the override is visibly a
+        # reviewer decision layered over the lender's submission rather than a
+        # change to how anything is calculated. Only the fields the reviewer
+        # actually decided are present in the map, so a loan with no decision is
+        # untouched.
+        for output_column, source_column in _OVERRIDABLE_SOURCE_COLUMNS.items():
+            if (key, source_column) in (verified_overrides or {}):
+                value = (verified_overrides or {})[(key, source_column)]
+                row[output_column] = None if value in (None, "") else value
 
         for column in UNSOURCED_COLUMNS:
             row[column] = None

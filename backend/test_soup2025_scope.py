@@ -104,8 +104,19 @@ ACCEPTED_FLAGGED_COUNT = 1
 # because it is an acceptance target.
 RAW_CBT_LOAN_COUNT = 156
 RAW_TOTAL_PAYMENT_RECEIVED = 2805017.90
-RAW_RECOMMENDATION_COUNT = 95
-RAW_FLAGGED_COUNT = 34
+# AMENDED 2026-08-15: 95 -> 97 and 34 -> 36. VERIFIED as exactly the 2 new
+# required balance candidates raised on the raw SOUP 2025 population -- Lendistry
+# 2025 GP 5886179101 and GP 5991379104, both lender-reported LIQUIDATION loans
+# whose reversal to ACTIVE is offered and whose cycle opened with a positive
+# balance. Both are review-flagged, which is why RAW_FLAGGED_COUNT moves by the
+# same 2. Nothing else in this population changed:
+#   97 - 2 balance candidates = 95, the prior baseline, intact.
+# Re-derived on every run by test_the_increase_is_exactly_the_balance_candidates.
+RAW_RECOMMENDATION_COUNT = 97
+RAW_FLAGGED_COUNT = 36
+RAW_BALANCE_CANDIDATES = 2
+PRE_BALANCE_RAW_RECOMMENDATION_COUNT = 95
+PRE_BALANCE_RAW_FLAGGED_COUNT = 34
 
 # Every lender token that must NOT appear in deal-routing logic.
 LENDER_NAME_TOKENS = (
@@ -423,6 +434,24 @@ class RawSubmissionsAreAStressPopulationTests(unittest.TestCase):
         self.assertEqual(len(recs), RAW_RECOMMENDATION_COUNT)
         self.assertEqual(len(flagged), RAW_FLAGGED_COUNT)
         self.assertNotEqual(len(recs), ACCEPTED_RECOMMENDATION_COUNT)
+
+    def test_the_increase_is_exactly_the_balance_candidates(self):
+        """The justification for moving this recorded baseline, re-derived on every
+        run so it cannot drift silently."""
+        import corrections
+        loaded = self._raw()
+        recs = [r for _s, _k, d in LENDERS_2025 for r in loaded[d]["recs"]]
+        balance = [r for r in recs
+                   if r["field"] == corrections.BALANCE_DECISION_FIELD]
+        self.assertEqual(len(balance), RAW_BALANCE_CANDIDATES)
+        self.assertEqual(len(recs) - len(balance),
+                         PRE_BALANCE_RAW_RECOMMENDATION_COUNT)
+        flagged = [r for r in recs if r.get("reviewFlag")]
+        self.assertEqual(len(flagged) - len(balance),
+                         PRE_BALANCE_RAW_FLAGGED_COUNT)
+        for rec in balance:
+            self.assertTrue(rec["requiresBalanceDecision"])
+            self.assertGreater(rec["balanceRestoreValue"], 0)
 
 
 if __name__ == "__main__":

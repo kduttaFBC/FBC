@@ -468,8 +468,112 @@ _PERMITTED_LOAN_STATUS = {
     "BANKRUPTCY", "SUBSTITUTION-IN", "SUBSTITUTION-OUT", "LIQUIDATION",
 }
 
+# CLIENT-CONFIRMED (2026-08-15): the required companion decision when a reviewer
+# reverses a lender-reported LIQUIDATION back to ACTIVE.
+#
+# THE PROBLEM IT SOLVES. Approving LIQUIDATION -> ACTIVE changed Loan Status and
+# nothing else, so the loan kept the lender's $0.00 Ending Balance: it entered
+# Outstanding by COUNT while contributing $0, and a Liquidation Date and
+# Liquidation Loss survived beside a status of ACTIVE. Silent, and invisible on
+# the review page.
+#
+# THE GATE. This decision is raised only when ALL FOUR hold:
+#   1. the lender's reported Loan Status is LIQUIDATION
+#   2. the Loan Status the reviewer is being offered is ACTIVE
+#   3. the current cycle's Beginning Balance is greater than zero
+#   4. the lender's reported Ending Balance is EXACTLY 0.00
+# Anything else -- a zero or blank beginning balance, a reviewer who keeps the
+# loan LIQUIDATED, an ordinary ACTIVE loan, any other field's correction -- gets
+# no balance decision at all.
+#
+# CONDITION 4 ADDED 2026-08-15, and it is a correctness requirement rather than a
+# refinement. This workflow exists for one thing: to stop a LIQUIDATION -> ACTIVE
+# reversal leaving the loan at a ZEROED Ending Balance. A reversal whose Ending
+# Balance is already positive has no such problem, and offering the decision there
+# is actively dangerous, because NEITHER choice is correct for it:
+#
+#   measured on Mission Valley GP 4778059109 (June 2026)
+#       reported Beginning Balance   279,150.10
+#       reported Ending Balance      276,702.10   <- real, non-zero, and correct
+#       "restore to Beginning"    -> 279,150.10   WRONG, moves it by +2,448.00
+#       "keep 0.00"               ->       0.00   WRONG, destroys 276,702.10
+#       the client's own vF        -> 276,702.10   left exactly as submitted
+#
+# So the gate requires a zeroed Ending Balance, which is the only state the two
+# offered choices can correctly describe. A reversal on a positively-balanced loan
+# now gets its Loan Status decision alone, exactly as before this feature existed.
+#
+# BLANK IS NOT ZERO. Condition 4 requires a value that is PRESENT and equal to
+# 0.00. A missing Ending Balance means the cycle's closing figure is unknown --
+# often the incomplete-final-posting case -- and a restore decision must not be
+# offered against an unknown, so it is excluded like any other non-zero.
+#
+# EXACTLY TWO PERMITTED VALUES, and no free-form entry: the Beginning Balance, or
+# 0.00. The allow-list is built from the SERVER-SIDE candidate in
+# validate_approved_value, so a payload cannot widen it. Prior Month Ending
+# Balance is SUPPORTING EVIDENCE ONLY -- displayed, warned about when it differs
+# from the Beginning Balance, and never selectable.
+BALANCE_DECISION_FIELD = "Ending Balance"
+REVIEW_REASON_LIQUIDATION_BALANCE = (
+    "LIQUIDATION REVERSAL — REQUIRED BALANCE DECISION"
+)
+BALANCE_DECISION_RULE = (
+    "Reviewer-approved liquidation reversal — balance restoration decision"
+)
+# The two fields a restore -- and ONLY an explicit restore -- also clears.
+LIQUIDATION_CASCADE_FIELDS = ("Liquidation Date", "Liquidation Loss")
+_LIQUIDATION_CASCADE_CLEARED = {"Liquidation Date": "", "Liquidation Loss": None}
 
-def validate_approved_value(field, value, substituted=True, evidence_marker=None):
+
+def _positive_balance(value):
+    """The Beginning Balance as a 2dp float when it is genuinely positive, else
+    None. Blank, NaN, zero and negative all return None -- each means "no
+    balance decision", never "restore to nothing"."""
+    if value is None:
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount != amount or amount in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    if amount <= 0:
+        return None
+    return round(amount, 2)
+
+
+def _reported_balance_is_zero(value):
+    """True only when the lender's reported Ending Balance is PRESENT and exactly
+    0.00. Blank, NaN and any non-zero amount all return False -- see condition 4
+    above for why a blank must not be read as a zero."""
+    if value is None:
+        return False
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return False
+    if amount != amount or amount in (float("inf"), float("-inf")):
+        return False
+    return round(amount, 2) == 0.0
+
+
+def _cents(value):
+    """A comparable integer-cents form, or None when not numeric. Used so a
+    reviewer's value is matched to the permitted domain exactly rather than by
+    float equality."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount != amount or amount in (float("inf"), float("-inf")):
+        return None
+    return int(round(amount * 100))
+
+
+def validate_approved_value(field, value, substituted=True, evidence_marker=None,
+                            balance_restore_value=None):
     """The approved-value domain restriction. A reviewer's substituted value
     must come only from the target field's own domain, so a substitution can
     never reintroduce a cross-domain value (the exact defect that flags a
@@ -482,6 +586,31 @@ def validate_approved_value(field, value, substituted=True, evidence_marker=None
 
     Returns (True, normalized_value) if the value is writable for this field,
     else (False, reason)."""
+    # CLIENT-CONFIRMED (2026-08-15): the balance decision is checked FIRST and on
+    # the RAW value, before the uppercase-string coercion below -- an amount is
+    # not a status string, and 0.00 must not be rejected as "blank".
+    #
+    # balance_restore_value comes off the SERVER-SIDE candidate, exactly as
+    # evidence_marker does. With no restore value there is no domain and nothing
+    # is writable, so a payload cannot mint one. Compared in integer cents so a
+    # near-miss amount is refused rather than accepted by float tolerance.
+    if field == BALANCE_DECISION_FIELD:
+        restore = _positive_balance(balance_restore_value)
+        if restore is None:
+            return False, (
+                "No reviewer balance decision is available for this loan — "
+                "the approved value was not written."
+            )
+        offered = _cents(value)
+        permitted = {_cents(restore), 0}
+        if offered is None or offered not in permitted:
+            return False, (
+                f"'{value}' is not one of the two permitted balance decisions "
+                f"(restore to {restore:.2f}, or keep 0.00) — there is no free-form "
+                f"balance entry."
+            )
+        return True, round(offered / 100.0, 2)
+
     v = str(value if value is not None else "").strip().upper()
     if not v:
         return False, "Approved value is blank."
@@ -580,7 +709,34 @@ CORRECTION_LOG_HEADERS = [
     "Calculated Value", "Reviewer Approved Value", "Decision",
     "Reviewer Note", "Reviewed By (self-declared)", "Reviewed On",
     "Source File SHA-256", "Notify Servicer",
+    # CLIENT-CONFIRMED (2026-08-15): the liquidation-reversal balance decision's
+    # own audit trail. APPENDED, never interleaved -- every existing column keeps
+    # its position, so any consumer reading the log by index is unaffected.
+    #
+    # Original/Approved Loan Status are already carried by "Original Value" and
+    # "Reviewer Approved Value" above; these add the financial values and the two
+    # evidence balances the reviewer actually saw, so the correction is
+    # attributable to a HUMAN DECISION rather than looking like an automatic
+    # system-generated balance calculation. Blank on every other correction.
+    "Beginning Balance (Evidence)", "Prior Month Ending Balance (Evidence)",
+    "Original Ending Balance", "Approved Ending Balance",
+    "Original Liquidation Date", "Approved Liquidation Date",
+    "Original Liquidation Loss", "Approved Liquidation Loss",
 ]
+
+# Log-row keys -> the appended headers above. Kept beside the headers so the two
+# cannot drift.
+_BALANCE_LOG_START = 22   # the 22 pre-existing columns keep their positions
+_BALANCE_LOG_FIELDS = {
+    "Beginning Balance (Evidence)": "beginning_balance_evidence",
+    "Prior Month Ending Balance (Evidence)": "prior_ending_balance_evidence",
+    "Original Ending Balance": "original_ending_balance",
+    "Approved Ending Balance": "approved_ending_balance",
+    "Original Liquidation Date": "original_liquidation_date",
+    "Approved Liquidation Date": "approved_liquidation_date",
+    "Original Liquidation Loss": "original_liquidation_loss",
+    "Approved Liquidation Loss": "approved_liquidation_loss",
+}
 
 
 def _norm(s):
@@ -747,7 +903,7 @@ def build_eligible_corrections(correction_data):
 
         def _emit(field, corrected_value, eligibility_rule,
                   review_required=False, review_reason=None,
-                  evidence_marker=None):
+                  evidence_marker=None, balance_restore_value=None):
             _emitted_fields.add(field)
             eligible.append({
                 "gp": gp,
@@ -769,12 +925,20 @@ def build_eligible_corrections(correction_data):
                 # The value actually reported by the servicer, carried so the
                 # review page can show what needs reviewing without having
                 # opened the workbook to read the cells.
-                "reported_value": c.get("srf_dq") if field == "Delinquency Status"
-                                  else c.get("srf_status"),
+                # The balance decision reports the lender's own ENDING BALANCE --
+                # the value the reviewer is being asked to keep or replace. A
+                # status string would be meaningless on a financial field.
+                "reported_value": (
+                    c.get("srf_dq") if field == "Delinquency Status"
+                    else c.get("ending_balance") if field == BALANCE_DECISION_FIELD
+                    else c.get("srf_status")),
                 # Read-only review evidence, passed straight through from
                 # STAT-01's correction_data (see checks.py). Never used in any
                 # decision here — purely for display on the review page.
-                "prior_value": c.get("prior_dq") if field == "Delinquency Status" else c.get("soup_status"),
+                "prior_value": (
+                    c.get("prior_dq") if field == "Delinquency Status"
+                    else c.get("prior_ending_balance") if field == BALANCE_DECISION_FIELD
+                    else c.get("soup_status")),
                 "payment_received": c.get("payment_received"),
                 "scheduled_payment": c.get("scheduled_payment"),
                 "servicing_fee": c.get("servicing_fee"),
@@ -835,6 +999,21 @@ def build_eligible_corrections(correction_data):
                 "prior_loan_status": c.get("soup_status"),
                 "balance": c.get("ending_balance"),
                 "posting_count": c.get("posting_count"),
+                # --- liquidation-reversal balance decision (2026-08-15) -------
+                # Non-None ONLY on the balance decision itself: it is both the
+                # single restorable amount and the WRITE GATE
+                # validate_approved_value builds its two-value domain from. Every
+                # other recommendation carries None here and therefore cannot
+                # write this field at all.
+                "balance_restore_value": balance_restore_value,
+                # The one posting row a restored balance may be written to (see
+                # checks.py). Carried on every recommendation because it is a
+                # property of the loan's postings, not of this decision; read
+                # only by the balance write.
+                "balance_write_excel_row": c.get("balance_write_excel_row"),
+                # Both evidence balances, so the review page can show them side
+                # by side and warn when they disagree. Display only.
+                "beginning_balance": c.get("beginning_balance"),
                 # CLIENT-CONFIRMED (2026-08-12): the current-period evidence
                 # marker. None on every recommendation except one produced by the
                 # Bankruptcy Date branch below. This is what validate_approved_
@@ -885,13 +1064,43 @@ def build_eligible_corrections(correction_data):
         # contradictions stay visible as EVIDENCE on the loan card rather than
         # becoming further decision rules.
         if _is_liquidation_status(c.get("srf_status")):
+            _proposed_status = _canonical_proposable_loan_status(
+                c.get("expected_loan_status_effective"))
             _emit(
                 "Loan Status",
-                _canonical_proposable_loan_status(c.get("expected_loan_status_effective")),
+                _proposed_status,
                 "Lender-reported LIQUIDATION requires a human Loan Status decision",
                 review_required=True,
                 review_reason=REVIEW_REASON_LENDER_REPORTED_LIQUIDATION,
             )
+
+            # CLIENT-CONFIRMED (2026-08-15): the REQUIRED companion balance
+            # decision. Raised only when the reversal being offered is to ACTIVE
+            # and the cycle opened with a positive balance -- see
+            # BALANCE_DECISION_FIELD for the full gate and why.
+            #
+            # Emitted as its own CANDIDATE rather than as a sub-field of the Loan
+            # Status item, on purpose: D4's completeness gate already counts
+            # candidates, so an undecided balance decision blocks reporting
+            # readiness with no change to D4, and the Correction Log already
+            # writes one row per candidate so the decision is separately
+            # attributable. corrected_value is deliberately None -- there is no
+            # default, and the reviewer must choose.
+            _restore_value = _positive_balance(c.get("beginning_balance"))
+            if (_proposed_status == "ACTIVE"
+                    and _restore_value is not None
+                    # Condition 4: the reversal must actually have zeroed the
+                    # balance. A positively-balanced reversal is left alone --
+                    # neither offered choice would be correct for it.
+                    and _reported_balance_is_zero(c.get("ending_balance"))):
+                _emit(
+                    BALANCE_DECISION_FIELD,
+                    None,
+                    BALANCE_DECISION_RULE,
+                    review_required=True,
+                    review_reason=REVIEW_REASON_LIQUIDATION_BALANCE,
+                    balance_restore_value=_restore_value,
+                )
 
         # MOVED HERE 2026-08-14 (was the first statement in this loop). Any
         # data-quality warning still excludes this loan from EVERY OTHER correction
@@ -1270,6 +1479,12 @@ def classify_recommendation(eligible):
         return REVIEW_CATEGORY_REVERSAL, False
     if eligible.get("field") == "Loan Status":
         return REVIEW_CATEGORY_LOAN_STATUS, False
+    # CLIENT-CONFIRMED (2026-08-15): the liquidation-reversal balance decision
+    # is classified WITH its Loan Status sibling, so the two sit in the same
+    # section of the review page and the reviewer reads them as one judgement.
+    # Never Standard -- it can never be swept by the bulk control.
+    if eligible.get("field") == BALANCE_DECISION_FIELD:
+        return REVIEW_CATEGORY_LOAN_STATUS, False
     reason = eligible.get("review_reason") or ""
     if REVIEW_REASON_CROSS_DOMAIN in reason:
         return REVIEW_CATEGORY_DATA_DOMAIN, False
@@ -1402,6 +1617,28 @@ def build_recommendations(stat01_result, servicer):
             "liquidationLoss": e.get("liquidation_loss"),
             "subsequentRecoveries": e.get("subsequent_recoveries"),
             "priorEndingBalance": e.get("prior_ending_balance"),
+            # --- liquidation-reversal balance decision (2026-08-15) -----------
+            # requiresBalanceDecision is what the review page keys its REQUIRED
+            # control on; balanceChoices is the ONLY set of values it may offer --
+            # exactly two, both server-derived, so the page cannot invent a third
+            # and there is no free-form entry. balanceEvidenceConflict says the
+            # two evidence balances disagree, which the page must WARN about
+            # without pre-selecting either option: Prior Month Ending Balance is
+            # evidence, never a choice.
+            "requiresBalanceDecision": e.get("field") == BALANCE_DECISION_FIELD,
+            "balanceRestoreValue": e.get("balance_restore_value"),
+            "beginningBalance": e.get("beginning_balance"),
+            "balanceChoices": (
+                [{"value": e.get("balance_restore_value"), "action": "restore"},
+                 {"value": 0.0, "action": "keep_zero"}]
+                if e.get("field") == BALANCE_DECISION_FIELD
+                and e.get("balance_restore_value") is not None else None),
+            "balanceEvidenceConflict": bool(
+                e.get("field") == BALANCE_DECISION_FIELD
+                and e.get("balance_restore_value") is not None
+                and e.get("prior_ending_balance") is not None
+                and _cents(e.get("prior_ending_balance"))
+                != _cents(e.get("balance_restore_value"))),
             # CLIENT-CONFIRMED (2026-08-13): the raw negative-posting fact behind
             # the third reversal discriminator, exposed so the review page can SAY
             # why an otherwise unflagged recommendation sits in Reversal /
@@ -1522,10 +1759,39 @@ def _apply_one_correction(wb, corr):
             f"a Loan Status may only be written on an explicit reviewer approval."
         )
 
+    # CLIENT-CONFIRMED (2026-08-15): A BALANCE IS NOT A LOAN-LEVEL VALUE.
+    #
+    # Every other correctable field (Loan Status, Delinquency Status) describes
+    # the LOAN, so it is written to every posting row for the cycle -- which is
+    # what the loop below does and what must not change. An Ending Balance
+    # describes ONE POSTING: the row the cycle closed at. Writing a restored
+    # balance to all of them would overwrite each intermediate posting's real
+    # closing balance and destroy the beginning/ending chain the audit's own
+    # continuity checks depend on.
+    #
+    # Measured: 59 of 1,234 Lendistry SOUP 2025-1 loans (4.8%) carry more than
+    # one posting. The two June loans that surfaced this rule are both
+    # single-posting, so this narrowing is invisible on them -- exactly why it is
+    # stated here and tested separately rather than left to the acceptance case.
+    #
+    # The target is checks.py's balance_write_excel_row: the posting
+    # consolidate_cycle_postings actually took ending_balance from, honouring the
+    # incomplete-final-posting fallback. Absent or not among this loan's verified
+    # rows, nothing is written -- never a guess at which row to use.
+    target_rows = corr["excel_rows"]
+    if corr["field"] == BALANCE_DECISION_FIELD:
+        write_row = _coerce_excel_row(corr.get("balance_write_excel_row"))
+        if write_row is None or write_row not in corr["excel_rows"]:
+            return False, (
+                f"Could not identify the cycle's closing posting row for loan "
+                f"{corr['gp']} — the approved Ending Balance was not written."
+            )
+        target_rows = [write_row]
+
     updated_rows = []
     original_values = []
     skipped_rows = list(corr.get("skipped_row_refs") or [])  # invalid/duplicate refs already filtered out upstream
-    for excel_row in corr["excel_rows"]:
+    for excel_row in target_rows:
         actual_gp = _normalize_gp_scalar(ws.cell(row=excel_row, column=gp_col).value)
         if actual_gp != corr["gp"]:
             skipped_rows.append({
@@ -1606,6 +1872,15 @@ def _add_correction_log_sheet(wb, log_rows, institution, common):
             common["reviewed_on"],
             common["source_sha256"],
             r.get("notify_servicer") or "",
+        ] + [
+            # The appended liquidation-reversal columns, in header order and read
+            # from _BALANCE_LOG_FIELDS so the two cannot drift. Blank on every
+            # correction that is not part of a balance decision. A real 0.00 is
+            # preserved rather than blanked -- "keep 0.00" IS the decision, and
+            # writing "" there would erase the reviewer's answer.
+            ("" if r.get(key) is None else r.get(key))
+            for key in (_BALANCE_LOG_FIELDS[h]
+                        for h in CORRECTION_LOG_HEADERS[_BALANCE_LOG_START:])
         ]
         for r in log_rows
     ]
@@ -1823,6 +2098,9 @@ def generate_reviewed_workbook(
         ok, result = validate_approved_value(
             field, approved_input, substituted=substituted,
             evidence_marker=cand.get("evidence_marker"),
+            # From the SERVER-SIDE candidate, never from `d` -- a payload cannot
+            # widen the two-value balance domain. None on every other field.
+            balance_restore_value=cand.get("balance_restore_value"),
         )
         if not ok:
             # A substitution outside the field's domain is refused here — it
@@ -1855,6 +2133,17 @@ def generate_reviewed_workbook(
         written_ok, detail = _apply_one_correction(wb, corr)
         if written_ok:
             verified_overrides[(gp, field)] = approved_value
+            _balance_log = {}
+            if field == BALANCE_DECISION_FIELD:
+                # The evidence the reviewer actually saw, recorded beside the
+                # decision so the correction is attributable to a HUMAN and not
+                # mistakable for an automatic balance calculation.
+                _balance_log = {
+                    "beginning_balance_evidence": cand.get("balance_restore_value"),
+                    "prior_ending_balance_evidence": cand.get("prior_ending_balance"),
+                    "original_ending_balance": reported,
+                    "approved_ending_balance": approved_value,
+                }
             log_rows.append({
                 **detail,
                 "review_status": "Applied",
@@ -1864,8 +2153,60 @@ def generate_reviewed_workbook(
                 "reviewer_note": note,
                 "review_reason": review_reason,
                 "notify_servicer": notify,
+                **_balance_log,
             })
             applied_count += 1
+
+            # CLIENT-CONFIRMED (2026-08-15): the liquidation cascade. Reached
+            # ONLY from inside a successful, reviewer-approved Ending Balance
+            # write, and ONLY when the approved value is the RESTORE option --
+            # `_cents(approved_value) > 0`. Choosing "keep 0.00" falls through and
+            # deliberately leaves the Liquidation Date and Loss standing, so the
+            # remaining contradiction stays visible for reporting rather than
+            # being quietly tidied away.
+            #
+            # Each cleared field gets its OWN log row and its OWN override entry,
+            # so the audit trail is per-field and the reviewer's single decision
+            # is never expanded into an unattributable bulk edit.
+            if field == BALANCE_DECISION_FIELD and (_cents(approved_value) or 0) > 0:
+                for cascade_field in LIQUIDATION_CASCADE_FIELDS:
+                    cleared = _LIQUIDATION_CASCADE_CLEARED[cascade_field]
+                    cascade = dict(cand)
+                    cascade["field"] = cascade_field
+                    cascade["corrected_value"] = cleared
+                    cascade["reviewer_approved"] = True
+                    c_ok, c_detail = _apply_one_correction(wb, cascade)
+                    if not c_ok:
+                        # Surfaced, never silent: the balance stands, the field
+                        # did not clear, and the reviewer is told.
+                        corrections_not_applied.append({
+                            "gp": gp, "field": cascade_field,
+                            "reason": f"Approved balance restoration applied, but "
+                                      f"{cascade_field} could not be cleared — {c_detail}",
+                        })
+                        continue
+                    original = (c_detail.get("original_values") or [None])[0]
+                    log_rows.append({
+                        **c_detail,
+                        "review_status": "Applied",
+                        "decision": _DECISION_LABELS[_DECISION_APPROVE],
+                        "eligibility_rule": BALANCE_DECISION_RULE,
+                        "review_reason": REVIEW_REASON_LIQUIDATION_BALANCE,
+                        "calculated_value": "",
+                        "approved_value": "" if cleared is None else cleared,
+                        "reviewer_note": note,
+                        "notify_servicer": notify,
+                        "original_liquidation_date":
+                            original if cascade_field == "Liquidation Date" else "",
+                        "approved_liquidation_date":
+                            "" if cascade_field == "Liquidation Date" else "",
+                        "original_liquidation_loss":
+                            original if cascade_field == "Liquidation Loss" else "",
+                        "approved_liquidation_loss":
+                            "" if cascade_field == "Liquidation Loss" else "",
+                    })
+                    verified_overrides[(gp, cascade_field)] = cleared
+                    applied_count += 1
         else:
             # Approved, but could not be safely written (template drift / GP
             # mismatch / no verifiable row). Never counted as applied; the

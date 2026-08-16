@@ -155,23 +155,79 @@ class OverrideMapRobustnessTests(unittest.TestCase):
 
 
 class FinancialFieldsAreUnreachableTests(unittest.TestCase):
-    """CLIENT-CONFIRMED (2026-08-10): Manual Review may not edit financial
-    values. Two independent barriers; this asserts the second."""
+    """CLIENT-CONFIRMED (2026-08-10, AMENDED 2026-08-15): Manual Review may not
+    edit financial values GENERALLY.
 
-    def test_financial_fields_have_no_override_mapping(self):
-        for field in ("Ending Balance", "Beginning Balance", "Payment Received",
+    SUPERSEDED IN ONE NARROW CASE. The override domain widened from two fields to
+    five on 2026-08-15, for a reviewer-approved reversal of a lender-reported
+    LIQUIDATION back to ACTIVE: Ending Balance, Liquidation Date and Liquidation
+    Loss became writable, because approving the reversal without them left the
+    loan ACTIVE at $0.00 with a live Liquidation Date and understated the
+    Portfolio Summary's Outstanding Balance.
+
+    THE BARRIER DID NOT MOVE, IT MOVED LAYERS. Being in the mapping is no longer
+    what makes a field unreachable -- corrections.py's gate is. These tests now
+    assert BOTH halves: the mapping is exactly five fields, and the three new ones
+    are reachable ONLY through that gate. Everything genuinely financial and
+    unreviewable -- Beginning Balance, Payment Received, Scheduled Payment,
+    Servicing Fee -- is still absent from the mapping entirely."""
+
+    def test_genuinely_unreviewable_financial_fields_still_have_no_mapping(self):
+        """Unchanged from 2026-08-10. Ending Balance deliberately absent from this
+        list now; the four below remain unreachable by any path."""
+        for field in ("Beginning Balance", "Payment Received",
                       "Scheduled Payment", "Servicing Fee"):
             with self.subTest(field=field):
                 self.assertNotIn(field, checks._VERIFIED_OVERRIDE_COLUMNS)
 
-    def test_only_the_two_status_fields_are_mapped(self):
+    def test_the_override_domain_is_exactly_these_five_fields(self):
         self.assertEqual(set(checks._VERIFIED_OVERRIDE_COLUMNS),
-                         {"Loan Status", "Delinquency Status"})
+                         {"Loan Status", "Delinquency Status", "Ending Balance",
+                          "Liquidation Date", "Liquidation Loss"})
 
-    def test_a_financial_override_is_silently_ignored_not_applied(self):
+    def test_an_unreviewable_financial_override_is_still_silently_ignored(self):
         out = checks.verified_portfolio_summary_record(
-            SAMPLE, {("1", "Ending Balance"): 1.0, ("1", "Payment Received"): 0.0}, "T")
+            SAMPLE, {("1", "Payment Received"): 0.0,
+                     ("1", "Scheduled Payment"): 1.0,
+                     ("1", "Beginning Balance"): 1.0}, "T")
         self.assertEqual(out, checks.portfolio_summary_check(SAMPLE, "T")["records"][0])
+
+    def test_a_none_ending_balance_override_never_zeroes_a_real_balance(self):
+        """The defensive guard. None means NO DECISION WAS MADE, never "set to
+        nothing" -- so an override map assembled from undecided candidates cannot
+        destroy a balance. Liquidation Loss is deliberately the opposite: there,
+        None IS the cleared value."""
+        out = checks.verified_portfolio_summary_record(
+            SAMPLE, {("1", "Ending Balance"): None}, "T")
+        self.assertEqual(out, checks.portfolio_summary_check(SAMPLE, "T")["records"][0])
+
+    def test_none_still_clears_liquidation_loss(self):
+        grouped = checks.consolidate_cycle_postings(SAMPLE)
+        applied = checks._apply_verified_overrides(
+            grouped, {("1", "Liquidation Loss"): None})
+        self.assertIsNone(applied.loc["1"]["liquidation_loss"])
+
+    def test_the_three_new_fields_are_not_generally_reviewer_editable(self):
+        """Reachability, not mapping: on an ordinary loan the review page offers
+        no balance decision at all, so there is no id a reviewer could decide and
+        no path to these three fields."""
+        import corrections
+        results = checks.run_servicer_reconciliation(
+            "T", pd.DataFrame(), SAMPLE, pd.DataFrame(columns=["SBA GP Number"]),
+            memo_df=None, memo_lender_key="T")
+        stat01 = next(r for r in results if r["id"].split("::")[0] == "STAT-01")
+        recs, _cands, _skipped = corrections.build_recommendations(stat01, "T")
+        offered = [r for r in recs if r["field"] in
+                   ("Ending Balance", "Liquidation Date", "Liquidation Loss")]
+        self.assertEqual(offered, [])
+
+    def test_the_balance_field_is_only_writable_with_a_server_side_restore_value(self):
+        """corrections.py's gate, asserted here too so this file records where the
+        barrier actually lives now."""
+        import corrections
+        ok, _reason = corrections.validate_approved_value(
+            "Ending Balance", 1.0, balance_restore_value=None)
+        self.assertFalse(ok)
 
 
 class SuppressionTests(unittest.TestCase):
@@ -234,13 +290,40 @@ def _reconstruct_decisions(si_original, si_vf, candidates):
     a.index = a.index.astype(str).str.strip()
     b.index = b.index.astype(str).str.strip()
 
+    # AMENDED 2026-08-15. _VERIFIED_OVERRIDE_COLUMNS gained three fields, two of
+    # them MONEY (Ending Balance, Liquidation Loss). The original comparison below
+    # was a string compare, which is correct for a status label and WRONG for an
+    # amount: the initial submissions carry unrounded floats where the vF files
+    # carry 2dp values, so "276702.0999999" != "276702.1" was read as a client
+    # change on dozens of loans that the client never touched. Amounts are now
+    # compared to the CENT, which is what "did the client change this figure"
+    # actually means.
+    MONEY_FIELDS = {"Ending Balance", "Liquidation Loss"}
+
+    def _same(field, old_value, new_value):
+        if field in MONEY_FIELDS:
+            def cents(v):
+                if v is None:
+                    return None
+                try:
+                    amount = float(v)
+                except (TypeError, ValueError):
+                    return None
+                if amount != amount:            # NaN
+                    return None
+                return int(round(amount * 100))
+            return cents(old_value) == cents(new_value)
+        return (str(old_value or "").strip().upper()
+                == str(new_value or "").strip().upper())
+
     client = {}
     for gp in sorted(set(a.index) & set(b.index)):
         for field, column in checks._VERIFIED_OVERRIDE_COLUMNS.items():
-            old = str(a.loc[gp].get(column, "")).strip().upper()
-            new = str(b.loc[gp].get(column, "")).strip().upper()
-            if old != new:
-                client[(gp, field)] = str(b.loc[gp].get(column, "")).strip()
+            old_value = a.loc[gp].get(column)
+            new_value = b.loc[gp].get(column)
+            if not _same(field, old_value, new_value):
+                client[(gp, field)] = (new_value if field in MONEY_FIELDS
+                                       else str(new_value or "").strip())
 
     decisions, unexpressible = [], dict(client)
     for cand in candidates:
@@ -274,6 +357,9 @@ def _run_new_workflow(label):
     new = checks.verified_portfolio_summary_record(
         si, outcome["verified_overrides"], display, excluded_gps=excluded)
     reference = checks.portfolio_summary_check(si_vf, display)["records"][0]
+    # candidates returned too (2026-08-15) so a test can distinguish "no decision
+    # was offered" from "a decision was offered and the client did not take it".
+    outcome["_candidates"] = candidates
     return new, reference, unexpressible, excluded, outcome
 
 
@@ -286,9 +372,57 @@ class MissionValleyEquivalenceTests(unittest.TestCase):
     def setUpClass(cls):
         cls.new, cls.ref, cls.gap, cls.excluded, cls.outcome = _run_new_workflow("Mission Valley Bank")
 
-    def test_every_client_change_was_expressible_as_a_review_decision(self):
-        self.assertEqual(self.gap, {},
-                         f"Mission Valley must have no unexpressible changes; got {self.gap}")
+    # AMENDED 2026-08-15. One client change is NOT expressible, and that is the
+    # intended consequence of keeping the liquidation-reversal rule narrow.
+    #
+    # THE LOAN. GP 4778059109 is reported LIQUIDATION with Beginning Balance
+    # 279,150.10 and Ending Balance 276,702.10 -- a REAL, NON-ZERO closing
+    # balance. The client's vF set Loan Status ACTIVE, cleared the Liquidation
+    # Date, and LEFT THE ENDING BALANCE ALONE at 276,702.10.
+    #
+    # WHY IT CANNOT BE EXPRESSED. Liquidation Date is never a decision of its own;
+    # it is cleared only as a CONSEQUENCE of a reviewer explicitly restoring a
+    # ZEROED Ending Balance. This loan's balance is not zero, so it receives no
+    # balance decision at all (condition 4 of the gate -- deliberately, because
+    # neither "restore to 279,150.10" nor "keep 0.00" is correct for a loan whose
+    # 276,702.10 is right as submitted). No balance decision means no cascade,
+    # which means no way to clear the date.
+    #
+    # RECORDED, NOT FIXED. Whether a liquidation reversal that does NOT change the
+    # balance should still be able to clear the Liquidation Date is a separate
+    # business-rule question and a client decision. Reported as a future decision
+    # item; deliberately out of scope for this patch.
+    EXPECTED_UNEXPRESSIBLE = {("4778059109", "Liquidation Date")}
+
+    def test_the_only_unexpressible_change_is_the_documented_liquidation_date(self):
+        self.assertEqual(set(self.gap), self.EXPECTED_UNEXPRESSIBLE)
+
+    def test_the_gap_loan_correctly_receives_no_balance_decision(self):
+        """The narrow gate at work: a reversal whose Ending Balance is already
+        positive gets its Loan Status decision alone. Pins that the gap is a
+        deliberate scope boundary, not a decision the engine failed to offer."""
+        offered = {(str(c["gp"]).strip(), c["field"])
+                   for c in self.outcome["_candidates"]}
+        self.assertNotIn(("4778059109", "Ending Balance"), offered)
+        self.assertIn(("4778059109", "Loan Status"), offered)
+
+    def test_no_balance_decision_is_raised_anywhere_in_this_bank(self):
+        """Mission Valley has no zero-balance liquidation reversal, so the whole
+        feature must be inert here -- no candidate, no override, no cascade."""
+        fields = {c["field"] for c in self.outcome["_candidates"]}
+        self.assertNotIn("Ending Balance", fields)
+        written = {f for (_gp, f) in self.outcome["verified_overrides"]}
+        self.assertNotIn("Ending Balance", written)
+        self.assertNotIn("Liquidation Date", written)
+        self.assertNotIn("Liquidation Loss", written)
+
+    def test_that_loans_positive_ending_balance_is_never_touched(self):
+        """The hazard condition 4 removes: 276,702.10 must survive intact."""
+        grouped = checks._apply_verified_overrides(
+            checks.consolidate_cycle_postings(_load("Mission Valley Bank")[5]),
+            self.outcome["verified_overrides"])
+        self.assertAlmostEqual(
+            float(grouped.loc["4778059109"]["ending_balance"]), 276702.10, places=2)
 
     def test_no_closed_at_zero_loans_to_suppress(self):
         self.assertEqual(self.excluded, [])

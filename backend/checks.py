@@ -2994,6 +2994,25 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             "scheduled_payment": _round2(row.get("scheduled")) if has_payment_cols else None,
             "servicing_fee": _round2(row.get("servicing_fee")),
             "ending_balance": _round2(row.get("ending_balance")),
+            # CLIENT-CONFIRMED (2026-08-15): the current cycle's OPENING balance,
+            # carried so corrections.py can decide whether a reviewer-approved
+            # LIQUIDATION -> ACTIVE reversal needs a balance decision, and so the
+            # reviewer can see the figure the restore option would write. Read
+            # from the same consolidated row as ending_balance above -- the cycle
+            # opening posting, per consolidate_cycle_postings.
+            "beginning_balance": _round2(row.get("beginning_balance")),
+            # The ONE posting row a restored Ending Balance may be written to:
+            # the posting the cycle's ending_balance was actually taken from. A
+            # balance is NOT a loan-level value -- writing it to every posting
+            # row would corrupt the balance chain on a multi-posting loan (59 of
+            # 1,234 Lendistry 2025 loans carry more than one posting). Prefers
+            # effective_last_excel_row so the incomplete-final-posting fallback
+            # is honoured; _excel_row is the same row when no fallback fired.
+            "balance_write_excel_row": (
+                row.get("effective_last_excel_row")
+                if row.get("effective_last_excel_row") is not None
+                else row.get("_excel_row")
+            ),
             # consolidate_cycle_postings ALWAYS produces posting_count, so
             # None here should be unreachable. Defaulting to None (not 1) on
             # purpose: if it ever does go missing, the review page shows the
@@ -3625,9 +3644,29 @@ def audited_portfolio_summary_record(servicer_inputs_df, audited_status_by_loan,
 # through this feature. The correction allow-list (corrections.
 # build_eligible_corrections) never proposes a financial field in the first
 # place, so this is the second of two independent barriers.
+# CLIENT-CONFIRMED (2026-08-15): the reviewer-writable domain, widened from two
+# fields to five for ONE narrowly gated case -- a reviewer-approved reversal of a
+# lender-reported LIQUIDATION back to ACTIVE.
+#
+# WHY. Approving LIQUIDATION -> ACTIVE used to change Loan Status and nothing
+# else, so the loan kept the lender's $0.00 Ending Balance: it entered
+# Outstanding by COUNT but contributed $0, and a Liquidation Date and Loss
+# survived beside a status of ACTIVE. Measured on Lendistry SOUP 2025-1 June
+# 2026, that understated Outstanding by the two loans' beginning balances.
+#
+# THE THREE NEW FIELDS ARE NOT GENERALLY EDITABLE. corrections.py raises the
+# Ending Balance decision only when the reported status is LIQUIDATION, the
+# approved status is ACTIVE, and Beginning Balance > 0; its permitted values are
+# exactly two (the Beginning Balance, or 0.00) and are built from the
+# server-side candidate, never from the payload. Liquidation Date and
+# Liquidation Loss are cleared ONLY as a consequence of an explicit restore.
+# This mapping is the transport; the gate lives in corrections.py.
 _VERIFIED_OVERRIDE_COLUMNS = {
     "Loan Status": "loan_status",
     "Delinquency Status": "dq_status",
+    "Ending Balance": "ending_balance",
+    "Liquidation Date": "liquidation_date",
+    "Liquidation Loss": "liquidation_loss",
 }
 
 
@@ -3649,6 +3688,26 @@ def _apply_verified_overrides(si_grouped, verified_overrides):
         key = index.get(str(gp).strip())
         if column is None or key is None or column not in out.columns:
             continue
+        # A None ENDING BALANCE is not a decision to zero the balance -- it means
+        # no balance decision was made. Writing it would silently destroy a real
+        # figure, which is the opposite of what this whole mechanism is for.
+        # Ignored here as a defence in depth: corrections.validate_approved_value
+        # already refuses a blank balance, so production cannot reach this, but a
+        # caller assembling an override map from candidates (as several tests and
+        # any future tool might) would otherwise zero every undecided loan.
+        #
+        # Liquidation Date and Liquidation Loss are the opposite case: None IS the
+        # cleared value there, and clearing them is the whole point of the
+        # cascade. So this guard is deliberately scoped to the balance alone.
+        if field == "Ending Balance" and value is None:
+            continue
+        # A CLEARED value (None) cannot be assigned into a float64 column
+        # without pandas turning it into NaN -- the exact coercion _nan_to_none
+        # exists to undo. Widen the column to object first so a cleared
+        # Liquidation Loss stays a literal None all the way to the payload,
+        # rather than becoming a NaN that cannot be serialized.
+        if value is None and out[column].dtype != object:
+            out[column] = out[column].astype(object)
         out.at[key, column] = value
     return out
 
