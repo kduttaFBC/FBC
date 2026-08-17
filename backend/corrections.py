@@ -2046,6 +2046,19 @@ def generate_reviewed_workbook(
         # Always present, even on an early return, so every caller sees one
         # contract and never has to guess whether the key exists.
         "verified_overrides": {},
+        # The per-decision review record, on the same always-present contract
+        # as verified_overrides above and for the same reason. Each entry
+        # carries the submitted value (original_values), the engine's value
+        # (calculated_value), what the reviewer authorised (approved_value),
+        # the decision, its review reason and the reviewer's note -- for
+        # APPROVE, REJECT and RETURN alike, which verified_overrides cannot
+        # express because it holds only successfully applied approvals.
+        #
+        # EXPOSED, NOT PRODUCED. This list is already assembled to write the
+        # Correction Log sheet; returning it avoids a second, independent
+        # reconstruction of the same decision provenance elsewhere. It is read
+        # by nothing today.
+        "log_rows": [],
     }
 
     by_id = {c["id"]: c for c in (candidates or [])}
@@ -2297,4 +2310,11 @@ def generate_reviewed_workbook(
         "unknown_ids": unknown_ids,
         "skip_reason": None,
         "verified_overrides": verified_overrides,
+        # Constructed AFTER wb.save(buf) above, so exposing this list cannot
+        # reach the workbook bytes or the Correction Log sheet -- both are
+        # already serialised by the time this dict exists.
+        # _add_correction_log_sheet only READS these rows; it never mutates
+        # them. Purely additive: every existing caller accesses this dict by
+        # explicit named key, so an extra key is invisible to all of them.
+        "log_rows": log_rows,
     }
