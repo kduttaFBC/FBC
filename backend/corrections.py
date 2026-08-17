@@ -1422,6 +1422,53 @@ REVIEW_CATEGORY_TERMINAL = "Terminal Status Conflict"
 REVIEW_CATEGORY_OTHER = "Other — Flagged"
 
 # Display order for the REVIEW REQUIRED section. Mirrored by the review page.
+# CLIENT-CONFIRMED (2026-08-17): the categories a GLOBAL Approve All may
+# pre-fill. DATA ONLY -- this list changes no classification, no eligibility and
+# no write gate; classify_recommendation is untouched, and nothing here weakens
+# _apply_one_correction's reviewer_approved gate or validate_approved_value.
+# It exists so the review page's bulk scope has a backend counterpart a parity
+# test can hold it to, exactly as the category names already do.
+#
+# LOAN STATUS IS INCLUDED. Where the engine produced a recommended value, a bulk
+# pre-fill writes that value and nothing else -- the same thing it does for a
+# Delinquency Status recommendation. Every write still requires an explicit
+# submitted approval, and the server still re-validates the value against
+# _PERMITTED_LOAN_STATUS.
+#
+# CATEGORY MEMBERSHIP IS NOT SUFFICIENT ON ITS OWN. Two further conditions live
+# with the caller, and both are load-bearing:
+#
+#   1. BULK_EXCLUDED_FIELDS below. BALANCE_DECISION_FIELD classifies INTO
+#      REVIEW_CATEGORY_LOAN_STATUS (deliberately -- it sits beside its Loan
+#      Status sibling on the review page), so admitting that category would
+#      otherwise admit the balance decision with it. It must never be
+#      pre-filled: choosing between the two server-supplied balance options is a
+#      financial judgement, and pre-selecting one would invent a financial
+#      value. The client's rule is explicit -- a bulk action may approve
+#      LIQUIDATION -> ACTIVE and must leave the balance decision unresolved.
+#   2. A recommendation carrying NO engine value is not bulk-approvable. A
+#      mandatory lender-reported LIQUIDATION has no proposable status, so there
+#      is nothing to pre-fill; approving it in bulk would produce an approval
+#      the server would refuse (validate_approved_value -> "Approved value is
+#      blank."). Bulk must not manufacture that.
+#
+# WHY OTHER -- FLAGGED IS EXCLUDED. It is the fail-closed bucket. Any review
+# reason added upstream in future lands there by default, so excluding it means
+# a new rule is never silently swept into a bulk action before anyone has
+# classified it.
+BULK_APPROVABLE_CATEGORIES = (
+    STANDARD_CATEGORY,
+    REVIEW_CATEGORY_DATA_DOMAIN,
+    REVIEW_CATEGORY_TERMINAL,
+    REVIEW_CATEGORY_REVERSAL,
+    REVIEW_CATEGORY_LOAN_STATUS,
+)
+
+# Fields no bulk action may ever pre-fill, whatever their category. Currently the
+# required liquidation-reversal balance decision, which shares its sibling's
+# category by design.
+BULK_EXCLUDED_FIELDS = (BALANCE_DECISION_FIELD,)
+
 REVIEW_REQUIRED_CATEGORIES = (
     REVIEW_CATEGORY_LOAN_STATUS,
     REVIEW_CATEGORY_REVERSAL,

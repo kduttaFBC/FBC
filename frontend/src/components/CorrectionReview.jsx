@@ -55,6 +55,40 @@ const REVIEW_REQUIRED_CATEGORIES = [
   REVIEW_CATEGORY_OTHER,
 ]
 
+// CLIENT-CONFIRMED (2026-08-17): the categories a GLOBAL Approve All may
+// pre-fill. Mirrors corrections.BULK_APPROVABLE_CATEGORIES verbatim; the parity
+// test asserts the two agree, as it already does for the category names.
+//
+// Loan Status is included: where the engine produced a recommended value, the
+// bulk action pre-fills that value and nothing else. Category membership is not
+// sufficient on its own — globalHoldReason below also requires that the item is
+// not the required balance decision (which shares the Loan Status category by
+// design and must never be pre-selected, because choosing between the two
+// server-supplied options is a financial judgement) and that an engine value
+// exists to pre-fill.
+//
+// Other — Flagged is the fail-closed bucket: a review reason added upstream in
+// future must never be swept before anyone classifies it.
+const BULK_APPROVABLE_CATEGORIES = [
+  STANDARD_CATEGORY,
+  REVIEW_CATEGORY_DATA_DOMAIN,
+  REVIEW_CATEGORY_TERMINAL,
+  REVIEW_CATEGORY_REVERSAL,
+  REVIEW_CATEGORY_LOAN_STATUS,
+]
+
+// Mirrors corrections.BULK_EXCLUDED_FIELDS. Keyed on the recommendation's own
+// requiresBalanceDecision flag rather than on the field name, so the rule holds
+// even if the field is ever renamed server-side.
+const HOLD_REASON_BALANCE =
+  'Required balance decision — you must choose whether to restore the balance'
+const HOLD_REASON_NO_VALUE =
+  'No recommended value — select the correct status from the field’s own domain'
+const HOLD_REASON_OTHER_FLAGGED =
+  'Other — Flagged — always requires individual review'
+const HOLD_REASON_COMPANION =
+  'Held — this loan still has an undecided Loan Status or balance decision'
+
 // CLIENT-CONFIRMED (2026-08-14): the prefix of
 // corrections.REVIEW_REASON_LENDER_REPORTED_LIQUIDATION. Matched rather than
 // duplicated in full, so the backend stays the single source of the reason text.
@@ -796,6 +830,81 @@ export default function CorrectionReview({ recommendations, sessionId }) {
     [recs, decisions]
   )
 
+  // CLIENT-CONFIRMED (2026-08-17): GLOBAL Approve All.
+  //
+  // Pre-fills the engine's recommended value for every UNDECIDED recommendation
+  // in BULK_APPROVABLE_CATEGORIES, including Loan Status. Four conditions must
+  // all hold, and each exists for its own reason:
+  //
+  //   1. category is bulk-approvable      Other — Flagged is fail-closed and
+  //                                       never swept.
+  //   2. NOT requiresBalanceDecision      The required liquidation-reversal
+  //                                       balance decision shares the Loan
+  //                                       Status category by design. Choosing
+  //                                       between the two server-supplied
+  //                                       options is a financial judgement --
+  //                                       pre-selecting one would invent a
+  //                                       financial value. A loan may therefore
+  //                                       come out of this action with its Loan
+  //                                       Status approved and its balance still
+  //                                       unresolved, which is exactly the
+  //                                       intended outcome.
+  //   3. an engine value exists           A mandatory lender-reported
+  //                                       LIQUIDATION carries no proposable
+  //                                       status. Approving it would produce an
+  //                                       approval the server refuses
+  //                                       (validate_approved_value -> "Approved
+  //                                       value is blank."). Bulk must not
+  //                                       manufacture that.
+  //   4. the companion hold passes        Unchanged from the Standard action,
+  //                                       and deliberately NOT applied to Loan
+  //                                       Status itself: the balance decision
+  //                                       exists BECAUSE of the Loan Status
+  //                                       approval, so holding one on the other
+  //                                       would deadlock.
+  //
+  // Like the Standard action, this only populates client-side decision state. It
+  // submits nothing, calls no endpoint, and never overwrites a decision already
+  // recorded. Backend validation remains authoritative for every value.
+  const bulkApprovable = (rec) =>
+    BULK_APPROVABLE_CATEGORIES.includes(rec.standard ? STANDARD_CATEGORY : rec.category)
+
+  // Why this recommendation is not eligible, or null when it is. One function so
+  // the action and the "Still Requires Your Decision" panel cannot disagree.
+  const globalHoldReason = (rec) => {
+    if (rec.requiresBalanceDecision) return HOLD_REASON_BALANCE
+    if (!bulkApprovable(rec)) return HOLD_REASON_OTHER_FLAGGED
+    if (!rec.calculated) return HOLD_REASON_NO_VALUE
+    if (rec.field !== 'Loan Status' && loanStatusUndecided(rec)) return HOLD_REASON_COMPANION
+    return null
+  }
+
+  const globalEligible = useMemo(
+    () => recs.filter((r) => !decisionOf(r.id).decision && globalHoldReason(r) === null),
+    [recs, decisions]
+  )
+  const globalHeld = useMemo(
+    () =>
+      recs
+        .filter((r) => !decisionOf(r.id).decision && globalHoldReason(r) !== null)
+        .map((r) => ({ rec: r, reason: globalHoldReason(r) })),
+    [recs, decisions]
+  )
+
+  const approveAllGlobal = () =>
+    setDecisions((cur) => {
+      const out = { ...cur }
+      globalEligible.forEach((r) => {
+        if (!(out[r.id] && out[r.id].decision)) {
+          // The engine's own recommended value, never a computed or defaulted
+          // one. approved_value is left alone entirely for anything without a
+          // calculated value -- condition 3 above means we never get here.
+          out[r.id] = { ...out[r.id], decision: 'approve', approved_value: r.calculated }
+        }
+      })
+      return out
+    })
+
   // CLIENT-CONFIRMED (2026-08-14): an "approve" on a recommendation that carries NO
   // engine value -- a mandatory lender-reported LIQUIDATION with no proposable
   // status -- is INCOMPLETE until the reviewer picks one of the nine permitted
@@ -979,6 +1088,19 @@ export default function CorrectionReview({ recommendations, sessionId }) {
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {/* CLIENT-CONFIRMED (2026-08-17): the GLOBAL action lives HERE, with
+                the other whole-review affordances, not inside the Standard
+                section. It sweeps every eligible category including Loan Status,
+                so a month with no Standard corrections at all must still offer
+                it -- placing it in the Standard block would have hidden it
+                exactly when the review is entirely Review Required. */}
+            <button
+              className="btn btn-teal"
+              disabled={globalEligible.length === 0}
+              onClick={approveAllGlobal}
+            >
+              Approve All Recommendations ({globalEligible.length})
+            </button>
             <button className="btn" disabled={pendingCount === 0} onClick={jumpToNextUndecided}>
               Jump to next undecided
             </button>
@@ -986,6 +1108,45 @@ export default function CorrectionReview({ recommendations, sessionId }) {
               Reject all remaining ({pendingCount})
             </button>
           </div>
+        </div>
+      )}
+
+      {/* CLIENT-CONFIRMED (2026-08-17): what the global action did NOT
+          pre-fill, and why. Every undecided recommendation the bulk sweep
+          declined appears here with its reason, so a reviewer can answer
+          "what still needs me?" without reading the classification rules.
+          Grouped by reason so the balance decisions -- the ones that must
+          never be automated -- are visible as a set. */}
+      {globalHeld.length > 0 && (
+        <div className="alert" style={{ marginBottom: 8 }} data-testid="still-requires-decision">
+          <strong>
+            Still Requires Your Decision ({globalHeld.length})
+          </strong>
+          <div className="hint" style={{ marginTop: 4 }}>
+            Approve All Recommendations did not pre-fill these. Each needs your individual
+            judgement.
+          </div>
+          {[
+            HOLD_REASON_BALANCE,
+            HOLD_REASON_NO_VALUE,
+            HOLD_REASON_OTHER_FLAGGED,
+            HOLD_REASON_COMPANION,
+          ]
+            .map((reason) => ({
+              reason,
+              items: globalHeld.filter((h) => h.reason === reason),
+            }))
+            .filter((bucket) => bucket.items.length > 0)
+            .map((bucket) => (
+              <div key={bucket.reason} style={{ marginTop: 6 }}>
+                <strong>{bucket.reason}</strong>
+                <div className="hint">
+                  {bucket.items
+                    .map((h) => `loan ${h.rec.gp} (${h.rec.servicer}) · ${h.rec.field}`)
+                    .join(', ')}
+                </div>
+              </div>
+            ))}
         </div>
       )}
 
