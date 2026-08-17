@@ -12,6 +12,7 @@ asserts that separability explicitly.
 import ast
 import inspect
 import io
+import re
 import unittest
 
 import pandas as pd
@@ -491,9 +492,26 @@ class TestableWithoutMainTests(unittest.TestCase):
             with self.subTest(fn=fn.__name__):
                 self.assertEqual(params & {"request", "session", "session_id", "app"}, set())
 
-    def test_main_does_not_reference_the_module_yet(self):
+    def test_main_uses_only_this_module_s_public_entry_points(self):
+        """main.py IS the consumer as of Commit 3.
+
+        This replaces Commit 2's "main does not reference the module yet",
+        which pinned that commit's not-yet-wired claim and expired the moment
+        the consumer arrived. The invariant worth keeping is the direction of
+        the dependency: main reaches in only through the documented entry
+        points, so this module's internals stay free to change and the
+        separability the tests above assert is not quietly undone by a caller
+        binding to a private name."""
         import main
-        self.assertNotIn("mismatch_report", inspect.getsource(main))
+        source = _code_only(main)
+        used = set(re.findall(r"mismatch_mod\.(\w+)", source))
+        self.assertTrue(used)
+        self.assertEqual(used - {"build_mismatch_rows", "group_by_deal",
+                                 "generate_mismatch_report_bytes",
+                                 "mismatch_report_filename", "WORKSHEET_2024",
+                                 "WORKSHEET_2025", "WORKSHEETS",
+                                 "MISMATCH_FIELDS", "NO_MISMATCHES_TEXT"}, set())
+        self.assertEqual([n for n in used if n.startswith("_")], [])
 
 
 if __name__ == "__main__":

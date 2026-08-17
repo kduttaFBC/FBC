@@ -207,10 +207,20 @@ class NoCallerCanSeeTheDifferenceTests(unittest.TestCase):
                 with self.subTest(module=module.__name__, pattern=pattern):
                     self.assertNotIn(pattern, source)
 
-    def test_nothing_reads_the_new_key_yet(self):
-        """This commit is additive only; Commit 2 introduces the consumer."""
+    def test_the_consumer_reads_log_rows_by_explicit_named_key(self):
+        """main.py IS the consumer now -- the mismatch report quotes the same
+        review_reason the servicer's own Correction Log carries.
+
+        The assertion this replaces ("nothing reads the new key yet") pinned
+        Commit 1's additive-only claim and expired when that consumer arrived.
+        The invariant that actually matters outlives it and is asserted here:
+        the key is read by explicit name, exactly once, off `outcome` -- so the
+        dict is still never iterated or unpacked (see the test above), and a
+        future key still cannot be seen by any existing caller."""
         import main
-        self.assertNotIn("log_rows", inspect.getsource(main))
+        source = inspect.getsource(main)
+        self.assertIn('outcome.get("log_rows")', source)
+        self.assertEqual(source.count('outcome.get("log_rows")'), 1)
 
 
 if __name__ == "__main__":
