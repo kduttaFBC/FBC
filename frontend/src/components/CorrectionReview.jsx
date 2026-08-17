@@ -1345,6 +1345,69 @@ export default function CorrectionReview({ recommendations, sessionId }) {
               </button>
             </div>
           ))}
+          {/* Submitted Information vs. FBC Determination — CLIENT-CONFIRMED
+              (2026-08-17). The reconciliation artifact for the third party
+              reviewing the lender submissions: where what was submitted to FBC
+              differs from FBC's final determination after Human Review.
+
+              PLACED FIRST among the population-level downloads, before the
+              Monthly Servicer Reports and the Final Audited Portfolio Summary,
+              matching the client's stated post-review sequence.
+
+              Its gate is DIFFERENT from theirs and deliberately weaker: the
+              server produces it once Human Review is COMPLETE, not once
+              reporting is READY. So in the "complete but not ready" state this
+              download legitimately appears while the two below do not, and the
+              blocked-reporting panel further down still shows. Nothing is
+              decided here — `generated` is read, never inferred from the
+              presence of bytes. */}
+          {result.mismatch_report_status &&
+            result.mismatch_report_status.generated &&
+            result.mismatch_report_b64 && (
+              <div
+                className="map-row"
+                style={{ gridTemplateColumns: '1.4fr 1fr', marginTop: 10 }}
+              >
+                <div className="field-name">
+                  Submitted Information vs. FBC Determination
+                  <div className="hint" style={{ marginTop: 2 }}>
+                    {result.mismatch_report_status.mismatch_count === 0
+                      ? 'No mismatches identified — both deal worksheets state this explicitly'
+                      : `${result.mismatch_report_status.mismatch_count} mismatch${
+                          result.mismatch_report_status.mismatch_count === 1 ? '' : 'es'
+                        } across SOUP 2024 FBC1 and SOUP 2025 FBC1`}
+                  </div>
+                </div>
+                <button
+                  className="btn btn-teal"
+                  onClick={() =>
+                    downloadBase64File(
+                      result.mismatch_report_b64,
+                      result.mismatch_report_filename ||
+                        'Submitted_vs_FBC_Mismatch_Report.xlsx'
+                    )
+                  }
+                >
+                  Download Submitted Information vs. FBC Mismatch Report
+                </button>
+              </div>
+            )}
+          {/* Blocked instead of generated. NO download control is rendered --
+              a button that cannot produce a file is worse than its absence.
+              The server's blocked_reason is already written for a reader and
+              names servicers at worst; it is shown verbatim rather than
+              reworded, and the detailed provenance-gap and unassigned records
+              behind it never leave the server. */}
+          {result.mismatch_report_status &&
+            !result.mismatch_report_status.generated &&
+            result.mismatch_report_status.blocked_reason && (
+              <div className="hint" style={{ marginTop: 10 }}>
+                <strong>
+                  Submitted Information vs. FBC Mismatch Report not generated.
+                </strong>{' '}
+                {result.mismatch_report_status.blocked_reason}
+              </div>
+            )}
           {/* The FINAL AUDITED Portfolio Summary — the third layer, available
               only after Manual Review. Built from the same verified values as
               the corrected workbooks above: original lender data + the

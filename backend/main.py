@@ -38,6 +38,7 @@ import corrections as corrections_mod
 import preflight as preflight_mod
 import memo_audit as memo_audit_mod
 import monthly_servicer_report as msr_mod
+import mismatch_report as mismatch_mod
 import reporting_exceptions
 
 
@@ -913,6 +914,13 @@ async def corrections_review(payload: dict):
         # {servicer: {(gp, field): approved_value}} -- the VERIFIED layer, the
         # single source both post-review artifacts are built from.
         verified_overrides_by_servicer = {}
+        # {servicer: [log row]} -- the per-decision review record corrections.py
+        # already assembled for the Correction Log sheet. Retained (rather than
+        # reconstructed) so the mismatch report's Comments quote the SAME
+        # review_reason the servicer's own Correction Log carries; a second
+        # derivation could disagree with the artifact already in their hands.
+        # Read-only from here on: nothing below writes into these rows.
+        log_rows_by_servicer = {}
 
         for servicer, servicer_decisions in decisions_by_servicer.items():
             entry = correction_state[servicer]
@@ -929,6 +937,7 @@ async def corrections_review(payload: dict):
             )
 
             verified_overrides_by_servicer[servicer] = outcome.get("verified_overrides") or {}
+            log_rows_by_servicer[servicer] = outcome.get("log_rows") or []
 
             applied_total += outcome["applied_count"]
             rejected_total += outcome["rejected_count"]
@@ -1092,6 +1101,19 @@ async def corrections_review(payload: dict):
         portfolio_summary_final_counts = []
         portfolio_summary_final_deals = []
         final_cycle_months = set()
+        # ---- Submitted Information vs. FBC Determination Mismatch Report ----
+        # CLIENT-CONFIRMED (2026-08-17). Parallel lists in upload order, the
+        # same call shape group_portfolio_summary_by_deal already takes.
+        # Populated ONLY for a servicer whose whole body succeeded, so coverage
+        # is a set comparison against correction_state below -- never a count.
+        mismatch_rows_by_servicer = []
+        mismatch_deals = []
+        mismatch_servicers = []
+        # Diagnostics, deliberately SERVER-SIDE ONLY. Both carry loan-level
+        # detail (SBA GP Numbers, whole rows) that the client has no use for;
+        # the response exposes counts and a safe reason, nothing more.
+        mismatch_provenance_gaps = []
+        mismatch_failures = []
         # {deal: [servicer payload, ...]} in upload order, for the Monthly
         # Servicer Reports -- one workbook per SOUP deal, never combined.
         msr_servicers_by_deal = {}
@@ -1223,6 +1245,57 @@ async def corrections_review(payload: dict):
             if entry.get("cycle_month") is not None:
                 final_cycle_months.add(entry["cycle_month"])
             reported_by_deal.setdefault(deal, []).append(servicer)
+
+            # ---- Submitted Information vs. FBC Determination ---------------
+            # CLIENT-CONFIRMED (2026-08-17). The two frames the report compares,
+            # built HERE because main.py has never held either: the consolidated
+            # frame is produced two levels down inside
+            # checks._verified_population and msr.build_servicer_rows, and
+            # neither returns it. These are the SAME two calls those consumers
+            # make, on the same frame, in the same iteration -- not a second
+            # derivation of anything.
+            #
+            # D2 (CLIENT-CONFIRMED 2026-08-17): excluded_gps is deliberately NOT
+            # applied. Closed-at-zero suppression is a PORTFOLIO MEASUREMENT
+            # rule, not a determination rule. If a reviewer approved a change on
+            # a suppressed loan, that value was written into the corrected
+            # workbook the servicer now holds; omitting it here would deny a
+            # change they can see in their own file. This report's population is
+            # therefore intentionally WIDER than the Monthly Servicer Report's
+            # and the Final Audited Portfolio Summary's.
+            #
+            # ITS OWN try. A failure here must never reach the outer handler's
+            # `continue`, which would drop this servicer from the MSR and the
+            # Final Audited Portfolio Summary -- letting a fault in the newest,
+            # least critical artifact discard two established ones. It blocks
+            # only the mismatch report, and is named.
+            try:
+                mismatch_submitted = checks_mod.consolidate_cycle_postings(servicer_inputs_df)
+                # D1 (CLIENT-CONFIRMED 2026-08-17): the private
+                # _apply_verified_overrides is called directly rather than
+                # adding a public wrapper, so checks.py stays untouched. Same
+                # precedent as checks_mod._deal_sort_key below.
+                mismatch_final = checks_mod._apply_verified_overrides(
+                    mismatch_submitted,
+                    verified_overrides_by_servicer.get(servicer) or {},
+                )
+                mismatch_rows_by_servicer.append(mismatch_mod.build_mismatch_rows(
+                    mismatch_submitted, mismatch_final, soup_key,
+                    # A servicer the reviewer made no decisions on has no review
+                    # records AND no overrides, so it correctly yields no rows
+                    # and no provenance gaps -- the two are consistent by
+                    # construction, not by coincidence.
+                    log_rows=log_rows_by_servicer.get(servicer) or [],
+                    provenance_gaps=mismatch_provenance_gaps,
+                ))
+                mismatch_deals.append(deal)
+                mismatch_servicers.append(servicer)
+            except Exception as exc:
+                traceback.print_exc()
+                mismatch_failures.append({
+                    "servicer": servicer, "deal": deal,
+                    "error_type": type(exc).__name__, "error_detail": str(exc),
+                })
 
             # CLIENT-CONFIRMED (2026-08-11): the Monthly Servicer Report is a
             # CONSOLIDATION of this same verified layer -- the lender's own
@@ -1399,6 +1472,120 @@ async def corrections_review(payload: dict):
         _blocked_deals = sorted(set(deal_status) - _complete_deals,
                                 key=checks_mod._deal_sort_key)
 
+        # ---- Submitted Information vs. FBC Determination Mismatch Report ----
+        # CLIENT-CONFIRMED (2026-08-17). A reconciliation artifact for the third
+        # party reviewing the lender submissions: where does what was submitted
+        # to FBC differ from FBC's final determination after Human Review?
+        #
+        # THE GATE IS review_complete, NOT reporting_ready, and the difference is
+        # deliberate. reporting_ready withholds an artifact whose FIGURES are not
+        # final; this report states no figure of its own -- it states, for each
+        # field, what was submitted and what FBC determined, and both of those
+        # are known the moment every recommendation has a decision. So the
+        # "complete but NOT ready" state (everything decided, one returned) --
+        # which withholds the Monthly Servicer Report and the Final Audited
+        # Portfolio Summary -- still produces this one. Read off the response
+        # dict rather than the local, so the gate and what the response reports
+        # cannot drift.
+        #
+        # D3 FAIL-SAFE POLICY (CLIENT-CONFIRMED 2026-08-17). This workbook has
+        # exactly two worksheets and no third destination, and it leaves the
+        # building. So the question for every degraded condition is only ever:
+        # WOULD A REAL MISMATCH BE OMITTED WITHOUT SAYING SO?
+        #
+        #   provenance gap        WARN.  The row IS in the workbook with both
+        #                         values shown; only its provenance sentence
+        #                         degrades. Nothing is omitted, so withholding a
+        #                         complete report over a missing explanation
+        #                         would cost more than it protects.
+        #   unassignable servicer BLOCKS, but ONLY when it actually carries
+        #                         mismatch rows. Rows that belong to neither
+        #                         approved deal cannot be filed without guessing,
+        #                         and shipping the workbook without them
+        #                         understates the reconciliation. Carrying ZERO
+        #                         rows costs no coverage, so it warns instead --
+        #                         a parsing quirk must not withhold a correct
+        #                         report.
+        #   unreadable servicer   BLOCKS, named. If the file could not be read or
+        #                         consolidated its mismatches are UNKNOWABLE, and
+        #                         an incomplete reconciliation presented as a
+        #                         complete one is the failure this policy exists
+        #                         to prevent.
+        #
+        # ZERO MISMATCHES IS NOT A BLOCK. A clean month generates the workbook,
+        # both worksheets present, each stating explicitly that no mismatches
+        # were identified. Absence of an artifact is not a finding of no
+        # differences; the artifact has to say so.
+        mismatch_report_b64 = None
+        mismatch_report_filename_value = None
+        mismatch_generated = False
+        mismatch_blocked_reason = None
+        mismatch_count = 0
+        mismatch_unassigned = []
+
+        if not review_completeness["review_complete"]:
+            mismatch_blocked_reason = (
+                f"Human Review is not yet complete: "
+                f"{review_completeness['pending']} recommendation(s) still pending."
+            )
+        else:
+            # Coverage is a SET comparison against the roster, never a count: a
+            # count cannot tell "all present" from "one swapped for another".
+            _mismatch_missing = [s for s in correction_state
+                                 if s not in set(mismatch_servicers)]
+            # Grouped BEFORE the block decisions so `unassigned` is known -- the
+            # unassignable test below is about what those rows contain, which
+            # cannot be answered without grouping first. Grouping writes no
+            # file and decides nothing on its own.
+            mismatch_blocks = mismatch_mod.group_by_deal(
+                mismatch_rows_by_servicer, mismatch_deals,
+                unassigned=mismatch_unassigned,
+            )
+            if _mismatch_missing:
+                # WHICH failure it was, not just THAT one happened. A file that
+                # could not be read and a file that broke while being compared
+                # are different problems with different fixes, and one message
+                # covering both would misdescribe one of them.
+                _built_failures = {f["servicer"] for f in mismatch_failures}
+                _unreadable = sorted(s for s in _mismatch_missing
+                                     if s not in _built_failures)
+                _uncomparable = sorted(s for s in _mismatch_missing
+                                       if s in _built_failures)
+                _parts = []
+                if _unreadable:
+                    _parts.append(", ".join(_unreadable)
+                                  + " could not be read or consolidated")
+                if _uncomparable:
+                    _parts.append(", ".join(_uncomparable)
+                                  + " could not be compared against the final "
+                                    "FBC determination")
+                mismatch_blocked_reason = (
+                    "The mismatch report was not generated because "
+                    + "; and ".join(_parts)
+                    + ". An incomplete reconciliation would understate the "
+                      "differences."
+                )
+            elif mismatch_unassigned:
+                # Named by SERVICER only. Those names are already in `deals`;
+                # the SBA GP Numbers on these rows are not, and do not go into a
+                # client-facing reason.
+                mismatch_blocked_reason = (
+                    "The mismatch report was not generated because mismatches for "
+                    + ", ".join(sorted({str(u.get("servicer") or "unknown servicer")
+                                        for u in mismatch_unassigned}))
+                    + " could not be assigned to SOUP 2024 FBC1 or SOUP 2025 FBC1. "
+                      "They are not guessed into a deal and would otherwise be omitted."
+                )
+            else:
+                mismatch_count = sum(len(r) for r in mismatch_blocks.values())
+                mismatch_buffer = io.BytesIO()
+                mismatch_mod.generate_mismatch_report_bytes(mismatch_blocks, mismatch_buffer)
+                mismatch_report_b64 = base64.b64encode(
+                    mismatch_buffer.getvalue()).decode("utf-8")
+                mismatch_report_filename_value = mismatch_mod.mismatch_report_filename(
+                    msr_cycle_month)
+                mismatch_generated = True
+
         # ---- Final Audited Portfolio Summary, from those same verdicts -------
         # CLIENT-CONFIRMED (2026-08-13): ONLY complete deals contribute numeric
         # blocks. A blocked deal's figures were computed above, but once the deal
@@ -1487,6 +1674,20 @@ async def corrections_review(payload: dict):
             "reporting_readiness": reporting_readiness,
             "portfolio_summary_final_b64": portfolio_summary_final_b64,
             "portfolio_summary_final_filename": portfolio_summary_final_filename_value,
+            # CLIENT-CONFIRMED (2026-08-17): MINIMAL BY DESIGN. The detailed
+            # provenance_gaps and unassigned records exist and are used above,
+            # but they carry loan-level detail (SBA GP Numbers, whole rows) that
+            # no client needs to render a download. They stay server-side; only
+            # counts and a reason that names servicers -- already public in
+            # `deals` -- cross the boundary.
+            "mismatch_report_b64": mismatch_report_b64,
+            "mismatch_report_filename": mismatch_report_filename_value,
+            "mismatch_report_status": {
+                "generated": mismatch_generated,
+                "blocked_reason": mismatch_blocked_reason,
+                "mismatch_count": mismatch_count,
+                "provenance_gap_count": len(mismatch_provenance_gaps),
+            },
             "summary": {
                 "applied": applied_total,
                 "rejected": rejected_total,
