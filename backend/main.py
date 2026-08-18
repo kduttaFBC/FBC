@@ -1287,6 +1287,16 @@ async def corrections_review(payload: dict):
                     # construction, not by coincidence.
                     log_rows=log_rows_by_servicer.get(servicer) or [],
                     provenance_gaps=mismatch_provenance_gaps,
+                    # CLIENT-CONFIRMED (2026-08-17): READ-ONLY reporting context
+                    # for the Comments column -- documented Servicer Memo
+                    # deferral dates, current-period liquidation evidence, and
+                    # the single restorable balance. This authorises DISPLAY
+                    # only. These fields do not participate in any calculation,
+                    # Human Review decision, validation, eligibility rule or FBC
+                    # determination, all of which were settled upstream. The
+                    # session's own candidate list is passed unchanged and is
+                    # never mutated.
+                    candidates=entry.get("candidates") or [],
                 ))
                 mismatch_deals.append(deal)
                 mismatch_servicers.append(servicer)
