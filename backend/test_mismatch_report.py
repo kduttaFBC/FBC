@@ -10,6 +10,7 @@ asserts that separability explicitly.
 """
 
 import ast
+import copy
 import inspect
 import io
 import re
@@ -59,9 +60,28 @@ def _log(gp, field, reason=None, note=None):
     return {"gp": gp, "field": field, "review_reason": reason, "reviewer_note": note}
 
 
-def _rows(postings, overrides=None, log_rows=None, gaps=None, soup_key="Lendistry"):
+def _cand(gp="1000000001", field="Loan Status", **evidence):
+    """One session review candidate, carrying only the read-only evidence the
+    Comments column may consult. Defaults are a loan with NO evidence at all --
+    every scenario opts in to exactly what it means to test."""
+    row = {"gp": gp, "field": field}
+    row.update(evidence)
+    return row
+
+
+def _rows(postings, overrides=None, log_rows=None, gaps=None, soup_key="Lendistry",
+          candidates=None):
     submitted, final = _frames(postings, overrides)
-    return mr.build_mismatch_rows(submitted, final, soup_key, log_rows, gaps)
+    return mr.build_mismatch_rows(submitted, final, soup_key, log_rows, gaps,
+                                  candidates=candidates)
+
+
+def _comment_for(field, postings, overrides, candidates=None, **kw):
+    """The Comment on the row for `field`, or None when no such row exists."""
+    for row in _rows(postings, overrides, candidates=candidates, **kw):
+        if row["Mismatch Type"] == field:
+            return row["Comments"]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -242,22 +262,189 @@ class IdentityTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class CommentTests(unittest.TestCase):
+    """CLIENT-CONFIRMED (2026-08-17), revised: BLANK BY DEFAULT.
 
-    def test_the_comparison_sentence_format(self):
-        rows = _rows([_si(**{"Loan Status": "LIQUIDATION"})],
-                     {("1000000001", "Loan Status"): "ACTIVE"})
+    The Submitted Information and FBC Determination columns already show the
+    mismatch, so a Comment appears only where it carries context those two
+    columns cannot. Nothing is inferred, nothing is restated, and no internal
+    Human Review prose reaches the workbook.
+
+    Replaces four tests of the superseded design -- the submitted-vs-FBC
+    comparison sentence, NO_REVIEW_RECORD, ABSENT_DISPLAY, and verbatim
+    review_reason -- all of which asserted behaviour this redesign removes."""
+
+    # -- blank by default --------------------------------------------------
+    def test_a_delinquency_status_mismatch_is_always_blank(self):
         self.assertEqual(
-            rows[0]["Comments"],
-            "Submitted Loan Status: LIQUIDATION. FBC Determination: ACTIVE. "
-            + mr.NO_REVIEW_RECORD)
+            _comment_for("Delinquency Status", [_si()],
+                         {("1000000001", "Delinquency Status"): "30 DAYS"}), "")
 
-    def test_an_existing_review_reason_is_appended_verbatim(self):
+    def test_a_delinquency_status_mismatch_stays_blank_even_with_full_evidence(self):
+        """Evidence on the loan does not license a Comment on a field the
+        client confirmed must stay blank."""
+        self.assertEqual(
+            _comment_for("Delinquency Status", [_si()],
+                         {("1000000001", "Delinquency Status"): "30 DAYS"},
+                         candidates=[_cand(evidence_status=checks.EVIDENCE_DOCUMENTED,
+                                           deferral_start="2026-05-05",
+                                           deferral_end="2026-07-05",
+                                           liquidation_date="05/26/2026")]), "")
+
+    def test_an_ordinary_loan_status_change_is_blank(self):
+        """ACTIVE -> BANKRUPTCY, the real July Lendistry case. The columns say
+        it; no deterministic context exists to add."""
+        self.assertEqual(
+            _comment_for("Loan Status", [_si()],
+                         {("1000000001", "Loan Status"): "BANKRUPTCY"}), "")
+
+    def test_an_ordinary_ending_balance_change_is_blank(self):
+        self.assertEqual(
+            _comment_for("Ending Balance", [_si()],
+                         {("1000000001", "Ending Balance"): 850.0}), "")
+
+    # -- unsupported liquidation -------------------------------------------
+    def test_liquidation_to_non_terminal_with_no_evidence_states_it_exactly(self):
+        self.assertEqual(
+            _comment_for("Loan Status", [_si(**{"Loan Status": "LIQUIDATION"})],
+                         {("1000000001", "Loan Status"): "ACTIVE"},
+                         candidates=[_cand()]),
+            "No supporting data found for reported liquidation.")
+
+    def test_it_holds_with_no_candidate_at_all(self):
+        """No candidate is no evidence, which is exactly the condition."""
+        self.assertEqual(
+            _comment_for("Loan Status", [_si(**{"Loan Status": "LIQUIDATION"})],
+                         {("1000000001", "Loan Status"): "ACTIVE"}),
+            "No supporting data found for reported liquidation.")
+
+    def test_any_one_populated_evidence_field_leaves_it_blank(self):
+        """STRICTLY ASYMMETRIC. Absence of evidence is observable; a reviewer's
+        alternative rationale is not. Each of the five, tested alone."""
+        for field in mr.LIQUIDATION_EVIDENCE_FIELDS:
+            with self.subTest(evidence=field):
+                self.assertEqual(
+                    _comment_for("Loan Status", [_si(**{"Loan Status": "LIQUIDATION"})],
+                                 {("1000000001", "Loan Status"): "ACTIVE"},
+                                 candidates=[_cand(**{field: "present"})]), "")
+
+    def test_all_five_evidence_fields_are_checked(self):
+        self.assertEqual(
+            set(mr.LIQUIDATION_EVIDENCE_FIELDS),
+            {"liquidation_date", "liquidation_proceeds", "liquidation_loss",
+             "foreclosure_date", "reo_date"})
+
+    def test_a_non_liquidation_submitted_status_never_says_unsupported(self):
+        self.assertEqual(
+            _comment_for("Loan Status", [_si(**{"Loan Status": "FORECLOSURE"})],
+                         {("1000000001", "Loan Status"): "ACTIVE"},
+                         candidates=[_cand()]), "")
+
+    # -- deferral dates ----------------------------------------------------
+    DEFER = {("1000000001", "Loan Status"): "DEFERRED"}
+
+    def _deferral(self, **dates):
+        return _comment_for("Loan Status", [_si()], self.DEFER,
+                            candidates=[_cand(evidence_status=checks.EVIDENCE_DOCUMENTED,
+                                              **dates)])
+
+    def test_start_plus_end(self):
+        self.assertEqual(
+            self._deferral(deferral_start="2026-05-05", deferral_end="2026-07-05"),
+            "Servicer Memo records a deferral from 2026-05-05 to 2026-07-05.")
+
+    def test_start_plus_end_plus_resume(self):
+        self.assertEqual(
+            self._deferral(deferral_start="2026-05-05", deferral_end="2026-07-05",
+                           deferral_resume="2026-08-05"),
+            "Servicer Memo records a deferral from 2026-05-05 to 2026-07-05; "
+            "regular payments resume 2026-08-05.")
+
+    def test_only_start(self):
+        self.assertEqual(self._deferral(deferral_start="2026-05-05"),
+                         "Servicer Memo records a deferral beginning 2026-05-05.")
+
+    def test_only_end(self):
+        self.assertEqual(self._deferral(deferral_end="2026-07-05"),
+                         "Servicer Memo records a deferral ending 2026-07-05.")
+
+    def test_no_dates_is_blank(self):
+        """A documented deferral with no date on record adds nothing the FBC
+        Determination column does not already say."""
+        self.assertEqual(self._deferral(), "")
+
+    def test_undocumented_evidence_is_blank_even_with_dates(self):
+        self.assertEqual(
+            _comment_for("Loan Status", [_si()], self.DEFER,
+                         candidates=[_cand(evidence_status="no-deferral",
+                                           deferral_start="2026-05-05",
+                                           deferral_end="2026-07-05")]), "")
+
+    def test_no_date_is_ever_inferred_from_another(self):
+        """Only the dates that exist appear. An end date is never derived from
+        a start, nor a resume from an end."""
+        for dates in ({"deferral_start": "2026-05-05"},
+                      {"deferral_end": "2026-07-05"},
+                      {"deferral_resume": "2026-08-05"}):
+            with self.subTest(dates=dates):
+                comment = self._deferral(**dates)
+                present = set(dates.values())
+                for absent in {"2026-05-05", "2026-07-05", "2026-08-05"} - present:
+                    self.assertNotIn(absent, comment)
+
+    # -- cascade clearing --------------------------------------------------
+    def test_liquidation_date_cleared_under_an_unsupported_liquidation(self):
+        self.assertEqual(
+            _comment_for("Liquidation Date",
+                         [_si(**{"Loan Status": "LIQUIDATION",
+                                 "Liquidation Date": "2026-05-26"})],
+                         {("1000000001", "Loan Status"): "ACTIVE",
+                          ("1000000001", "Liquidation Date"): None},
+                         candidates=[_cand()]),
+            "Cleared because the reported liquidation was not supported.")
+
+    def test_liquidation_loss_cleared_under_an_unsupported_liquidation(self):
+        self.assertEqual(
+            _comment_for("Liquidation Loss",
+                         [_si(**{"Loan Status": "LIQUIDATION",
+                                 "Liquidation Loss": 5000.0})],
+                         {("1000000001", "Loan Status"): "ACTIVE",
+                          ("1000000001", "Liquidation Loss"): None},
+                         candidates=[_cand()]),
+            "Cleared because the reported liquidation was not supported.")
+
+    def test_a_liquidation_loss_that_merely_changes_is_blank(self):
+        """Changed, not cleared. Nothing was reversed, so nothing is explained."""
+        self.assertEqual(
+            _comment_for("Liquidation Loss",
+                         [_si(**{"Loan Status": "LIQUIDATION",
+                                 "Liquidation Loss": 5000.0})],
+                         {("1000000001", "Loan Status"): "ACTIVE",
+                          ("1000000001", "Liquidation Loss"): 4000.0},
+                         candidates=[_cand()]), "")
+
+    # -- restored balance ---------------------------------------------------
+    def test_a_balance_restored_to_the_prior_period_value(self):
+        self.assertEqual(
+            _comment_for("Ending Balance", [_si(**{"Ending Balance": 0.0})],
+                         {("1000000001", "Ending Balance"): 145729.87},
+                         candidates=[_cand(balance_restore_value=145729.87)]),
+            "Restored to the prior period ending balance.")
+
+    def test_a_balance_that_is_not_the_restore_value_is_blank(self):
+        self.assertEqual(
+            _comment_for("Ending Balance", [_si(**{"Ending Balance": 0.0})],
+                         {("1000000001", "Ending Balance"): 999.99},
+                         candidates=[_cand(balance_restore_value=145729.87)]), "")
+
+    # -- no internal prose, ever -------------------------------------------
+    def test_review_reason_never_reaches_a_comment(self):
         rows = _rows([_si(**{"Loan Status": "LIQUIDATION"})],
                      {("1000000001", "Loan Status"): "ACTIVE"},
                      log_rows=[_log("1000000001", "Loan Status",
-                                    reason="LENDER REPORTED LIQUIDATION")])
-        self.assertIn("LENDER REPORTED LIQUIDATION", rows[0]["Comments"])
-        self.assertNotIn(mr.NO_REVIEW_RECORD, rows[0]["Comments"])
+                                    reason="LENDER REPORTED LIQUIDATION — HUMAN "
+                                           "LOAN STATUS DECISION REQUIRED.")])
+        self.assertNotIn("LENDER REPORTED", rows[0]["Comments"])
+        self.assertNotIn("review_reason", _code_only(mr))
 
     def test_the_reviewer_note_is_never_included(self):
         """Internal free-form text stays internal; this report goes to a third
@@ -268,21 +455,63 @@ class CommentTests(unittest.TestCase):
                                     reason="LENDER REPORTED LIQUIDATION",
                                     note="spoke to servicer, confirmed by email")])
         self.assertNotIn("spoke to servicer", rows[0]["Comments"])
-        self.assertNotIn("reviewer_note", inspect.getsource(mr.build_mismatch_rows))
+        self.assertNotIn("reviewer_note", _code_only(mr))
 
-    def test_an_absent_value_reads_as_none_in_the_sentence(self):
-        rows = _rows([_si(**{"Liquidation Loss": 100.0})],
-                     {("1000000001", "Liquidation Loss"): None})
-        self.assertIn(f"FBC Determination: {mr.ABSENT_DISPLAY}", rows[0]["Comments"])
+    def test_no_comment_ever_restates_the_two_comparison_columns(self):
+        for postings, overrides, cands in (
+            ([_si()], {("1000000001", "Delinquency Status"): "30 DAYS"}, None),
+            ([_si(**{"Loan Status": "LIQUIDATION"})],
+             {("1000000001", "Loan Status"): "ACTIVE"}, [_cand()]),
+            ([_si()], {("1000000001", "Loan Status"): "DEFERRED"},
+             [_cand(evidence_status=checks.EVIDENCE_DOCUMENTED,
+                    deferral_start="2026-05-05")]),
+        ):
+            for row in _rows(postings, overrides, candidates=cands):
+                with self.subTest(field=row["Mismatch Type"]):
+                    self.assertNotIn("Submitted", row["Comments"])
+                    self.assertNotIn("FBC Determination", row["Comments"])
 
+    # -- provenance gaps are unaffected by the redesign --------------------
     def test_a_missing_review_record_still_emits_the_row_and_reports_the_gap(self):
+        """The gap is still detected and still counted server-side -- it simply
+        adds no client-facing prose any more."""
         gaps = []
         rows = _rows([_si(**{"Loan Status": "LIQUIDATION"})],
-                     {("1000000001", "Loan Status"): "ACTIVE"}, log_rows=[], gaps=gaps)
+                     {("1000000001", "Loan Status"): "ACTIVE"}, log_rows=[], gaps=gaps,
+                     candidates=[_cand()])
         self.assertEqual(len(rows), 1)
-        self.assertIn(mr.NO_REVIEW_RECORD, rows[0]["Comments"])
         self.assertEqual(len(gaps), 1)
         self.assertEqual(gaps[0]["field"], "Loan Status")
+        # The Comment is decided by EVIDENCE, not by whether a record was found.
+        self.assertEqual(rows[0]["Comments"],
+                         "No supporting data found for reported liquidation.")
+
+    def test_a_present_review_record_produces_the_same_comment(self):
+        """Proves the two are independent: same evidence, same Comment, with or
+        without a review record."""
+        args = ([_si(**{"Loan Status": "LIQUIDATION"})],
+                {("1000000001", "Loan Status"): "ACTIVE"})
+        without = _rows(*args, log_rows=[], candidates=[_cand()])
+        with_record = _rows(*args, candidates=[_cand()],
+                            log_rows=[_log("1000000001", "Loan Status",
+                                           reason="anything at all")])
+        self.assertEqual(without[0]["Comments"], with_record[0]["Comments"])
+
+    # -- candidates are read-only ------------------------------------------
+    def test_the_candidate_list_is_not_mutated(self):
+        candidates = [
+            _cand(field="Loan Status", evidence_status=checks.EVIDENCE_DOCUMENTED,
+                  deferral_start="2026-05-05", deferral_end="2026-07-05",
+                  balance_restore_value=145729.87),
+            _cand(field="Delinquency Status", liquidation_date="05/26/2026"),
+        ]
+        before = copy.deepcopy(candidates)
+        _rows([_si(**{"Loan Status": "LIQUIDATION", "Ending Balance": 0.0})],
+              {("1000000001", "Loan Status"): "DEFERRED",
+               ("1000000001", "Ending Balance"): 145729.87},
+              candidates=candidates)
+        self.assertEqual(candidates, before)
+        self.assertEqual(len(candidates), 2)
 
 
 # ---------------------------------------------------------------------------

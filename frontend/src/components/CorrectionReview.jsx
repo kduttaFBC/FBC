@@ -1408,6 +1408,66 @@ export default function CorrectionReview({ recommendations, sessionId }) {
                 {result.mismatch_report_status.blocked_reason}
               </div>
             )}
+          {/* Delinquency Information Request Form — CLIENT-CONFIRMED
+              (2026-08-18). Sent TO the lenders: the loans FBC needs additional
+              servicing information about, one worksheet per lender and deal.
+
+              Ordered AFTER the mismatch report and BEFORE the Monthly Servicer
+              Reports, matching the client's stated post-review sequence.
+
+              Shares the mismatch report's gate -- the server produces both once
+              Human Review is COMPLETE, not once reporting is READY -- so in the
+              "complete but not ready" state both downloads appear while the two
+              below do not. Nothing is decided here: `generated` is read, and
+              the bytes are required alongside it, so a payload that claims one
+              without the other offers no download. */}
+          {result.delinquency_request_form_status &&
+            result.delinquency_request_form_status.generated &&
+            result.delinquency_request_form_b64 && (
+              <div
+                className="map-row"
+                style={{ gridTemplateColumns: '1.4fr 1fr', marginTop: 10 }}
+              >
+                <div className="field-name">
+                  Delinquency Information Request Form
+                  <div className="hint" style={{ marginTop: 2 }}>
+                    {result.delinquency_request_form_status.loan_count === 0
+                      ? 'No loans requiring additional information'
+                      : `${result.delinquency_request_form_status.loan_count} loan${
+                          result.delinquency_request_form_status.loan_count === 1 ? '' : 's'
+                        } across ${
+                          result.delinquency_request_form_status.lender_count
+                        } lender worksheet${
+                          result.delinquency_request_form_status.lender_count === 1 ? '' : 's'
+                        }`}
+                  </div>
+                </div>
+                <button
+                  className="btn btn-teal"
+                  onClick={() =>
+                    downloadBase64File(
+                      result.delinquency_request_form_b64,
+                      result.delinquency_request_form_filename ||
+                        'Delinquency_Information_Request_Form.xlsx'
+                    )
+                  }
+                >
+                  Download Delinquency Information Request Form
+                </button>
+              </div>
+            )}
+          {/* Blocked instead of generated. NO download control is rendered, and
+              the server's blocked_reason is shown verbatim -- it names servicers
+              at worst, and the per-lender failure records behind it never leave
+              the server. */}
+          {result.delinquency_request_form_status &&
+            !result.delinquency_request_form_status.generated &&
+            result.delinquency_request_form_status.blocked_reason && (
+              <div className="hint" style={{ marginTop: 10 }}>
+                <strong>Delinquency Information Request Form not generated.</strong>{' '}
+                {result.delinquency_request_form_status.blocked_reason}
+              </div>
+            )}
           {/* The FINAL AUDITED Portfolio Summary — the third layer, available
               only after Manual Review. Built from the same verified values as
               the corrected workbooks above: original lender data + the

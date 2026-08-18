@@ -334,17 +334,55 @@ class WiringTests(_Harness):
         _, body, _ = self.run_review(spec)
         self.assertEqual(self.data_rows(body, SHEET_2025)[0][3], "60 DAYS")
 
-    def test_the_review_reason_reaches_the_comments(self):
+    def test_the_review_reason_never_reaches_the_comments(self):
+        """CLIENT-CONFIRMED (2026-08-17): internal Human Review prose is out.
+
+        Replaces the superseded assertion that review_reason was appended
+        verbatim. A Delinquency Status mismatch -- the ordinary case, and the
+        bulk of every month -- now carries no Comment at all."""
         gp = "1000000001"
         spec = {"CBT 2025": _one(D2025, gp, name="CBT 2025")}
         cid = spec["CBT 2025"]["candidates"][0]["id"]
         _, body, _ = self.run_review(spec, log_rows_for={cid: "Deferral confirmed by memo"})
-        self.assertIn("Deferral confirmed by memo",
-                      self.data_rows(body, SHEET_2025)[0][6])
+        comment = self.data_rows(body, SHEET_2025)[0][6] or ""
+        self.assertNotIn("Deferral confirmed by memo", comment)
+        self.assertEqual(comment, "")
 
     def test_the_reviewer_note_never_reaches_the_comments(self):
         _, body, _ = self.run_review({"CBT 2025": _one(D2025, "1000000001", name="CBT 2025")})
-        self.assertNotIn("INTERNAL NOTE", self.data_rows(body, SHEET_2025)[0][6])
+        # `or ""` because a blank Comment is now the norm and openpyxl reads an
+        # empty cell as None.
+        self.assertNotIn("INTERNAL NOTE", self.data_rows(body, SHEET_2025)[0][6] or "")
+
+    def test_a_documented_deferral_carries_its_dates_end_to_end(self):
+        """The one Comment that must survive the whole endpoint path: the
+        Servicer Memo's own dates, read from the session candidate."""
+        gp = "1000000001"
+        spec = {"CBT 2025": _one(D2025, gp, overrides={(gp, "Loan Status"): "DEFERRED"},
+                                 field="Loan Status", corrected="DEFERRED",
+                                 name="CBT 2025")}
+        spec["CBT 2025"]["candidates"][0].update({
+            "evidence_status": checks.EVIDENCE_DOCUMENTED,
+            "deferral_start": "2026-05-05", "deferral_end": "2026-07-05",
+            "deferral_resume": "2026-08-05",
+        })
+        _, body, _ = self.run_review(spec)
+        rows = self.data_rows(body, SHEET_2025)
+        self.assertEqual(rows[0][5], "Loan Status")
+        self.assertEqual(
+            rows[0][6],
+            "Servicer Memo records a deferral from 2026-05-05 to 2026-07-05; "
+            "regular payments resume 2026-08-05.")
+
+    def test_an_unsupported_liquidation_is_stated_end_to_end(self):
+        gp = "1000000001"
+        spec = {"CBT 2025": _one(D2025, gp, overrides={(gp, "Loan Status"): "ACTIVE"},
+                                 field="Loan Status", corrected="ACTIVE",
+                                 name="CBT 2025",
+                                 postings=[_posting(gp, **{"Loan Status": "LIQUIDATION"})])}
+        _, body, _ = self.run_review(spec)
+        rows = self.data_rows(body, SHEET_2025)
+        self.assertEqual(rows[0][6], "No supporting data found for reported liquidation.")
 
     def test_a_servicer_with_no_decisions_contributes_nothing(self):
         gp_a, gp_b = "1000000001", "2000000002"
@@ -470,7 +508,12 @@ class BlockingPolicyTests(_Harness):
 
     def test_a_provenance_gap_warns_but_never_blocks(self):
         """An override with no matching review record. The row is real and
-        stays; only its provenance sentence degrades."""
+        stays, and the gap is still counted server-side.
+
+        Since 2026-08-17 the gap adds NO client-facing prose -- the Comment is
+        governed by evidence alone, so a reader cannot tell a gap occurred. That
+        is deliberate: provenance is an internal control, not a servicer's
+        business."""
         gp = "1000000001"
         spec = {"CBT 2025": _one(D2025, gp, name="CBT 2025")}
         # Override a field the reviewer has no log row for.
@@ -480,7 +523,9 @@ class BlockingPolicyTests(_Harness):
         self.assertGreaterEqual(self.status(body)["provenance_gap_count"], 1)
         rows = self.data_rows(body, SHEET_2025)
         self.assertTrue(any(r[5] == "Loan Status" for r in rows))
-        self.assertTrue(any(mr.NO_REVIEW_RECORD in (r[6] or "") for r in rows))
+        # No candidate evidence documents a deferral here, so the Comment is
+        # blank -- not an explanation of the missing record.
+        self.assertTrue(all((r[6] or "") == "" for r in rows if r[5] == "Loan Status"))
 
     def test_a_blocked_reason_is_never_absent_when_generation_failed(self):
         for kwargs in ({"read_failures": {"Lendistry 2025"}},):
@@ -590,6 +635,13 @@ class ResponseSurfaceTests(_Harness):
     }
     NEW_KEYS = {"mismatch_report_b64", "mismatch_report_filename",
                 "mismatch_report_status"}
+    # Added by a LATER commit (the Delinquency Information Request Form,
+    # 2026-08-18) and therefore not this report's business. Named here rather
+    # than folded into EXISTING_KEYS so the two commits' additions stay
+    # attributable and this suite keeps asserting exactly its own three.
+    OTHER_LATER_KEYS = {"delinquency_request_form_b64",
+                        "delinquency_request_form_filename",
+                        "delinquency_request_form_status"}
 
     def setUp(self):
         _, self.body, _ = self.run_review(
@@ -598,8 +650,10 @@ class ResponseSurfaceTests(_Harness):
     def test_every_pre_existing_key_survives(self):
         self.assertTrue(self.EXISTING_KEYS <= set(self.body))
 
-    def test_exactly_three_keys_were_added(self):
-        self.assertEqual(set(self.body) - self.EXISTING_KEYS, self.NEW_KEYS)
+    def test_exactly_three_keys_were_added_by_this_report(self):
+        self.assertEqual(
+            set(self.body) - self.EXISTING_KEYS - self.OTHER_LATER_KEYS,
+            self.NEW_KEYS)
 
     def test_the_status_object_carries_exactly_four_fields(self):
         self.assertEqual(set(self.status(self.body)),

@@ -4,8 +4,14 @@ A simple reconciliation artifact for the third party reviewing the lender
 submissions: where does the information submitted to FBC differ from FBC's
 final determination after Human Review?
 
-THIS IS NOT ANOTHER AUDIT REPORT. It carries no evidence, no calculation and no
-explanation beyond the comparison itself.
+THIS IS NOT ANOTHER AUDIT REPORT. It performs no calculation and reaches no
+conclusion of its own. Comments are BLANK BY DEFAULT and carry supporting
+context only where the two comparison columns cannot: an unsupported
+liquidation, a documented Servicer Memo deferral's own dates, a cascade
+clearing, a restored prior-period balance. That context is read from evidence
+the application already computed -- read-only reporting context, which
+CLIENT-CONFIRMED (2026-08-17) never participates in a calculation, a Human
+Review decision, validation, eligibility or an FBC determination.
 
 A PURE REPORTING CONSUMER
 -------------------------
@@ -25,11 +31,17 @@ Review, existing final values -- and this reads the end of it.
 
 SCOPE: exactly the five fields a reviewer-approved correction can change.
 DEFERRED, FORECLOSURE and LIQUIDATION are VALUES of Loan Status, not fields of
-their own, so they are reported as Loan Status with the transition in Comments.
-Audit findings that detect a submitted-data problem WITHOUT producing a
-corrected value (POP-01, BAL-01/02, PAY-01/02, DUP-01, DQ-01, CONT-01, MEMO-01)
-are deliberately out of scope for version 1 and are reserved for a separate
-Submitted Data Defects Report.
+their own, so they are reported as Loan Status -- the transition itself is shown
+by the Submitted Information and FBC Determination columns, never restated in
+Comments. Audit findings that detect a submitted-data problem WITHOUT producing
+a corrected value (POP-01, BAL-01/02, PAY-01/02, DUP-01, DQ-01, CONT-01,
+MEMO-01) are out of scope for version 1.
+
+POP-01 Missing Loan is a PLANNED requirement, deliberately PARKED
+(CLIENT-CONFIRMED 2026-08-17): its findings ranged from 360 across the June
+submissions to a single July record that was a reader artifact (a stray "," read
+as an SBA GP Number), so it must be established as reliably representing genuine
+missing loans before it may enter a client-facing reconciliation.
 
 CASCADE CHANGES ARE NOT COLLAPSED. One reviewer decision may legitimately move
 Loan Status, Ending Balance, Liquidation Date and Liquidation Loss. Each is a
@@ -75,12 +87,6 @@ WORKSHEET_2025 = "SOUP 2025 FBC1"
 WORKSHEETS = (WORKSHEET_2024, WORKSHEET_2025)
 
 NO_MISMATCHES_TEXT = "No mismatches were identified for this deal."
-
-# Shown in place of a value that is absent, so a blank cell is never mistaken
-# for a zero or an empty string in the comparison sentence.
-ABSENT_DISPLAY = "(none)"
-
-NO_REVIEW_RECORD = "No review record was found for this field."
 
 _STATUS_FIELDS = ("Loan Status", "Delinquency Status")
 _MONEY_FIELDS = ("Ending Balance", "Liquidation Loss")
@@ -158,8 +164,9 @@ def _comparable(field, value):
 def _display(field, value):
     """The value as the reader sees it. Never the comparison key.
 
-    An absent value renders as "" in the cell and ABSENT_DISPLAY in the
-    sentence, so it stays distinguishable from 0.00 in both places."""
+    An absent value renders as an empty cell. It stays distinguishable from 0.00
+    because _comparable -- not this function -- decides equality, and there
+    absence and zero never compare equal."""
     if _is_absent(value):
         return ""
     if field in _MONEY_FIELDS:
@@ -175,27 +182,149 @@ def _display(field, value):
     return str(value).strip()
 
 
-def _comment(field, submitted_display, final_display, log_row):
-    """The deterministic comparison sentence, plus the existing review reason.
+# ---------------------------------------------------------------------------
+# Comments -- CLIENT-CONFIRMED (2026-08-17), revised
+#
+# BLANK BY DEFAULT. Submitted Information and FBC Determination already show the
+# mismatch, so restating them in prose is noise in a seven-column table. A
+# Comment appears ONLY where it carries context those two columns cannot.
+#
+# Nothing here is generated, summarised or inferred. Every Comment is a fixed
+# sentence selected by a deterministic test over evidence the application has
+# ALREADY computed, and every date printed is a value that already exists --
+# rendered exactly as held, never parsed, reformatted or derived.
+#
+# DELIBERATELY REMOVED: the submitted-vs-FBC restatement, and review_reason.
+# Those reasons run 299-524 characters of prose written to instruct an FBC
+# REVIEWER ("select the Loan Status you believe is correct"), addressed to
+# someone who is not the reader of this report.
+# ---------------------------------------------------------------------------
 
-    CLIENT-CONFIRMED (2026-08-17): reviewer_note is NOT included. It is
-    internal free-form text and this report goes to a third party. Nothing here
-    is generated, summarised or rewritten -- review_reason is copied verbatim
-    from the review record the application already wrote."""
-    sentence = (f"Submitted {field}: {submitted_display or ABSENT_DISPLAY}. "
-                f"FBC Determination: {final_display or ABSENT_DISPLAY}.")
-    parts = [sentence]
-    if log_row is None:
-        parts.append(NO_REVIEW_RECORD)
+COMMENT_UNSUPPORTED_LIQUIDATION = "No supporting data found for reported liquidation."
+COMMENT_CLEARED_UNSUPPORTED = "Cleared because the reported liquidation was not supported."
+COMMENT_BALANCE_RESTORED = "Restored to the prior period ending balance."
+
+# The five fields whose presence constitutes support for a reported liquidation.
+# ALL must be absent before this report will say none was found. Read-only
+# reporting context (CLIENT-CONFIRMED 2026-08-17): these never participate in a
+# calculation, a Human Review decision, validation, eligibility, or an FBC
+# determination -- STAT-01 decided all of that long before this module runs.
+LIQUIDATION_EVIDENCE_FIELDS = (
+    "liquidation_date", "liquidation_proceeds", "liquidation_loss",
+    "foreclosure_date", "reo_date",
+)
+
+_LIQUIDATION = "LIQUIDATION"
+_DEFERRED = "DEFERRED"
+
+
+def _text(value):
+    """Upper-cased comparison form, or "" when absent."""
+    return "" if _is_absent(value) else str(value).strip().upper()
+
+
+def _deferral_sentence(evidence):
+    """The Servicer Memo's own deferral dates, or "".
+
+    Dates are printed EXACTLY as the application holds them. A date that does
+    not exist is simply not mentioned -- nothing is calculated, inferred or
+    manufactured to fill a gap, and a documented deferral carrying no date at
+    all yields no Comment rather than an empty claim."""
+    if str(evidence.get("evidence_status") or "").strip() != checks.EVIDENCE_DOCUMENTED:
+        return ""
+    start = "" if _is_absent(evidence.get("deferral_start")) else str(evidence["deferral_start"]).strip()
+    end = "" if _is_absent(evidence.get("deferral_end")) else str(evidence["deferral_end"]).strip()
+    resume = "" if _is_absent(evidence.get("deferral_resume")) else str(evidence["deferral_resume"]).strip()
+
+    if start and end:
+        base = f"Servicer Memo records a deferral from {start} to {end}"
+    elif start:
+        base = f"Servicer Memo records a deferral beginning {start}"
+    elif end:
+        base = f"Servicer Memo records a deferral ending {end}"
+    elif resume:
+        # The only date on record. Reported on its own rather than dropped.
+        return f"Servicer Memo records regular payments resuming {resume}."
     else:
-        reason = log_row.get("review_reason")
-        if reason is not None and str(reason).strip():
-            parts.append(str(reason).strip())
-    return " ".join(parts)
+        return ""
+    return f"{base}; regular payments resume {resume}." if resume else f"{base}."
+
+
+def _comment(field, submitted_value, final_value, unsupported_liquidation, evidence):
+    """The Comment for one mismatch row, or "" -- which is the normal case.
+
+    unsupported_liquidation is computed ONCE per loan by the caller, so the
+    Loan Status row and the Liquidation Date / Liquidation Loss rows it cascades
+    into cannot describe the same liquidation differently."""
+    if field == "Loan Status":
+        if unsupported_liquidation:
+            return COMMENT_UNSUPPORTED_LIQUIDATION
+        # A deferral FBC established. Blank when the memo documents no dates:
+        # "FBC Determination: DEFERRED" already says the rest.
+        if _text(final_value) == _DEFERRED:
+            return _deferral_sentence(evidence)
+        return ""
+
+    if field in ("Liquidation Date", "Liquidation Loss"):
+        # Cleared as a CASCADE of the Loan Status decision. Says why the value
+        # went away rather than repeating the value that went away.
+        if unsupported_liquidation and _is_absent(final_value) and not _is_absent(submitted_value):
+            return COMMENT_CLEARED_UNSUPPORTED
+        return ""
+
+    if field == "Ending Balance":
+        # The reviewer restored the balance the liquidation reversal had zeroed.
+        # Recognised by equality with the server's own single restorable amount
+        # -- never by re-deriving what the balance "should" be.
+        restore = evidence.get("balance_restore_value")
+        if not _is_absent(restore) and _comparable(field, final_value) == _comparable(field, restore):
+            return COMMENT_BALANCE_RESTORED
+        return ""
+
+    # Delinquency Status, and anything added later: blank.
+    return ""
+
+
+_EVIDENCE_KEYS = LIQUIDATION_EVIDENCE_FIELDS + (
+    "evidence_status", "deferral_start", "deferral_end", "deferral_resume",
+    "balance_restore_value",
+)
+
+
+def _index_evidence(candidates):
+    """{gp: {evidence key: value}}, merged per LOAN rather than per field.
+
+    Keyed by SBA GP Number on purpose. Liquidation Date and Liquidation Loss are
+    cleared as a CASCADE of the Loan Status decision, so no candidate exists
+    carrying `field == "Liquidation Date"` -- those rows can only find their
+    context under the loan.
+
+    Merging is safe because these values are per-loan facts STAT-01 passes
+    through onto every candidate for that loan, not per-field ones. The first
+    non-absent value wins, so a candidate that happens to omit a key cannot
+    blank out one that carries it."""
+    index = {}
+    for cand in candidates or []:
+        gp = str(cand.get("gp") or "").strip()
+        if not gp:
+            continue
+        bucket = index.setdefault(gp, {})
+        for key in _EVIDENCE_KEYS:
+            if key not in bucket or _is_absent(bucket.get(key)):
+                value = cand.get(key)
+                if not _is_absent(value):
+                    bucket[key] = value
+    return index
 
 
 def _index_log_rows(log_rows):
-    """{(gp, field): row}. Later rows win, matching write order."""
+    """{(gp, field): row}. Later rows win, matching write order.
+
+    PROVENANCE DETECTION ONLY. Since 2026-08-17 nothing on these rows reaches
+    the workbook: Comments no longer carry review_reason, and never carried
+    reviewer_note. The lookup survives solely to answer "does a review record
+    exist for this change", which the caller surfaces as a server-side
+    diagnostic. A missing record changes no cell."""
     index = {}
     for row in log_rows or []:
         gp = str(row.get("gp") or "").strip()
@@ -210,7 +339,7 @@ def _index_log_rows(log_rows):
 # ---------------------------------------------------------------------------
 
 def build_mismatch_rows(submitted, final, soup_key, log_rows=None,
-                        provenance_gaps=None):
+                        provenance_gaps=None, candidates=None):
     """One row per (loan, field) where the submitted value differs from FBC's
     final determination, for ONE servicer.
 
@@ -230,11 +359,20 @@ def build_mismatch_rows(submitted, final, soup_key, log_rows=None,
     its provenance, and suppressing it would hide a genuine mismatch. This
     module only reports the gap; how it surfaces is the caller's decision.
 
+    candidates are the session's own review candidates, read ONLY for Comment
+    context (deferral dates, liquidation evidence, the restorable balance).
+    CLIENT-CONFIRMED (2026-08-17): reporting context only -- nothing here feeds
+    a calculation, a Human Review decision, validation, eligibility or an FBC
+    determination, all of which were settled upstream before this runs.
+
     Rows are sorted by SBA GP Number then MISMATCH_FIELDS order, so output is
     fully determined by the inputs."""
     provenance_gaps = provenance_gaps if provenance_gaps is not None else []
     index = _index_log_rows(log_rows)
+    evidence_index = _index_evidence(candidates)
     rows = []
+
+    status_column = checks._VERIFIED_OVERRIDE_COLUMNS["Loan Status"]
 
     for gp in submitted.index:
         key = str(gp).strip()
@@ -242,6 +380,26 @@ def build_mismatch_rows(submitted, final, soup_key, log_rows=None,
             continue
         lender_loan_number = submitted.at[gp, "lender_loan_number"] \
             if "lender_loan_number" in submitted.columns else None
+        evidence = evidence_index.get(key, {})
+
+        # Computed ONCE per loan, so the Loan Status row and every row its
+        # decision cascades into cannot describe the same liquidation
+        # differently.
+        #
+        # STRICTLY ASYMMETRIC (CLIENT-CONFIRMED 2026-08-17). Absence of evidence
+        # is observable; a reviewer's alternative rationale is not. So this says
+        # "no supporting data" only when the servicer reported LIQUIDATION, FBC
+        # determined otherwise, and EVERY supporting field is absent. If any
+        # evidence exists the Comment stays blank rather than inferring why the
+        # reviewer decided as they did. Scoped to LIQUIDATION alone -- no
+        # general terminal-status rule is created here.
+        unsupported_liquidation = False
+        if status_column in submitted.columns and status_column in final.columns:
+            unsupported_liquidation = (
+                _text(submitted.at[gp, status_column]) == _LIQUIDATION
+                and _text(final.at[gp, status_column]) != _LIQUIDATION
+                and all(_is_absent(evidence.get(f)) for f in LIQUIDATION_EVIDENCE_FIELDS)
+            )
 
         for field in MISMATCH_FIELDS:
             column = checks._VERIFIED_OVERRIDE_COLUMNS[field]
@@ -274,7 +432,11 @@ def build_mismatch_rows(submitted, final, soup_key, log_rows=None,
                 "Submitted Information": submitted_display,
                 "FBC Determination": final_display,
                 "Mismatch Type": field,
-                "Comments": _comment(field, submitted_display, final_display, log_row),
+                # Built from the RAW values and the loan's evidence, never from
+                # the display strings -- a Comment must not depend on how a cell
+                # happens to be rendered.
+                "Comments": _comment(field, submitted_value, final_value,
+                                     unsupported_liquidation, evidence),
             })
 
     rows.sort(key=lambda r: (r["SBA GP Number"],
