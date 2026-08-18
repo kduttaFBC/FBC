@@ -39,6 +39,7 @@ import preflight as preflight_mod
 import memo_audit as memo_audit_mod
 import monthly_servicer_report as msr_mod
 import mismatch_report as mismatch_mod
+import delinquency_request_form as drf_mod
 import reporting_exceptions
 
 
@@ -1114,6 +1115,19 @@ async def corrections_review(payload: dict):
         # the response exposes counts and a safe reason, nothing more.
         mismatch_provenance_gaps = []
         mismatch_failures = []
+        # ---- Delinquency Information Request Form ---------------------------
+        # CLIENT-CONFIRMED (2026-08-18). SEPARATE accumulators from the mismatch
+        # report's above -- no shared list, dict or counter, so neither report
+        # can disturb the other's state.
+        #
+        # blocks is [(display_label, rows), ...] in UPLOAD ORDER: correction_state
+        # is built in upload order at /api/audit and dicts preserve insertion
+        # order, the same property the Final Audited Portfolio Summary already
+        # relies on. No sort step exists or is needed.
+        delinquency_blocks = []
+        delinquency_servicers = []
+        # Server-side only: carries per-lender failure detail no client needs.
+        delinquency_failures = []
         # {deal: [servicer payload, ...]} in upload order, for the Monthly
         # Servicer Reports -- one workbook per SOUP deal, never combined.
         msr_servicers_by_deal = {}
@@ -1246,14 +1260,45 @@ async def corrections_review(payload: dict):
                 final_cycle_months.add(entry["cycle_month"])
             reported_by_deal.setdefault(deal, []).append(servicer)
 
-            # ---- Submitted Information vs. FBC Determination ---------------
-            # CLIENT-CONFIRMED (2026-08-17). The two frames the report compares,
-            # built HERE because main.py has never held either: the consolidated
+            # ---- THE SHARED POST-REVIEW REPORTING FRAMES --------------------
+            # CLIENT-CONFIRMED (2026-08-18). Built ONCE per servicer and OWNED BY
+            # NEITHER report that reads them.
+            #
+            # They live here, in the success branch, rather than inside either
+            # report's own try, so that the Mismatch Report and the Delinquency
+            # Information Request Form consume the same two objects and cannot
+            # disagree about what the lender submitted or what FBC determined.
+            # Hoisted from the mismatch block on 2026-08-18; the calls, their
+            # order and their values are unchanged.
+            #
+            # main.py has never held either frame otherwise: the consolidated
             # frame is produced two levels down inside
-            # checks._verified_population and msr.build_servicer_rows, and
-            # neither returns it. These are the SAME two calls those consumers
-            # make, on the same frame, in the same iteration -- not a second
-            # derivation of anything.
+            # checks._verified_population and monthly_servicer_report.
+            # build_servicer_rows, and neither returns it. These are the SAME two
+            # calls those consumers already make, on the same frame, in the same
+            # iteration -- not a second derivation of anything.
+            #
+            # D1 (CLIENT-CONFIRMED 2026-08-17): the private
+            # _apply_verified_overrides is called directly rather than adding a
+            # public wrapper, so checks.py stays untouched. Same precedent as
+            # checks_mod._deal_sort_key below.
+            #
+            # NEITHER IS FILTERED HERE. Closed-at-zero suppression is applied by
+            # each consumer that wants it, exactly once, so a shared pre-filtered
+            # frame can never double-apply it or impose one report's population on
+            # the other. (The Mismatch Report deliberately does NOT suppress; the
+            # request form does.)
+            report_submitted = checks_mod.consolidate_cycle_postings(servicer_inputs_df)
+            report_final = checks_mod._apply_verified_overrides(
+                report_submitted,
+                verified_overrides_by_servicer.get(servicer) or {},
+            )
+
+            # ---- Submitted Information vs. FBC Determination ---------------
+            # CLIENT-CONFIRMED (2026-08-17). Compares the two SHARED frames built
+            # above -- report_submitted and report_final. It does not build them
+            # and does not own them; they were hoisted out of this block on
+            # 2026-08-18 so the request form reads the same objects.
             #
             # D2 (CLIENT-CONFIRMED 2026-08-17): excluded_gps is deliberately NOT
             # applied. Closed-at-zero suppression is a PORTFOLIO MEASUREMENT
@@ -1270,17 +1315,8 @@ async def corrections_review(payload: dict):
             # least critical artifact discard two established ones. It blocks
             # only the mismatch report, and is named.
             try:
-                mismatch_submitted = checks_mod.consolidate_cycle_postings(servicer_inputs_df)
-                # D1 (CLIENT-CONFIRMED 2026-08-17): the private
-                # _apply_verified_overrides is called directly rather than
-                # adding a public wrapper, so checks.py stays untouched. Same
-                # precedent as checks_mod._deal_sort_key below.
-                mismatch_final = checks_mod._apply_verified_overrides(
-                    mismatch_submitted,
-                    verified_overrides_by_servicer.get(servicer) or {},
-                )
                 mismatch_rows_by_servicer.append(mismatch_mod.build_mismatch_rows(
-                    mismatch_submitted, mismatch_final, soup_key,
+                    report_submitted, report_final, soup_key,
                     # A servicer the reviewer made no decisions on has no review
                     # records AND no overrides, so it correctly yields no rows
                     # and no provenance gaps -- the two are consistent by
@@ -1303,6 +1339,42 @@ async def corrections_review(payload: dict):
             except Exception as exc:
                 traceback.print_exc()
                 mismatch_failures.append({
+                    "servicer": servicer, "deal": deal,
+                    "error_type": type(exc).__name__, "error_detail": str(exc),
+                })
+
+            # ---- Delinquency Information Request Form -----------------------
+            # CLIENT-CONFIRMED (2026-08-18). The loans FBC needs additional
+            # servicing information about, on the SAME shared final frame.
+            #
+            # INDEPENDENT OF THE MISMATCH REPORT BY CONSTRUCTION: its own try,
+            # its own accumulators, its own response keys, and it reads none of
+            # the mismatch block's state. Either report can fail while the other
+            # is produced -- asserted in both directions.
+            #
+            # excluded_gps is applied EXACTLY ONCE, inside build_lender_rows. The
+            # frame passed in is deliberately unfiltered, so suppression cannot
+            # be applied twice, and the set itself is the audit's own -- read
+            # verbatim off the session entry, never recomputed.
+            #
+            # servicer_inputs_df is passed for ONE purpose: Last Payment Receipt
+            # Date, read off the posting consolidation ALREADY selected as
+            # authoritative (the frame's own _excel_row). No date is
+            # recalculated, and nothing reaches back into an earlier cycle.
+            #
+            # Appended EVEN WHEN THE ROW LIST IS EMPTY -- a lender with nothing
+            # outstanding gets a worksheet saying so. Filtering here would drop
+            # the lender silently, which is the failure the explicit sheet
+            # exists to prevent.
+            try:
+                delinquency_blocks.append((servicer, drf_mod.build_lender_rows(
+                    report_final, servicer_inputs_df,
+                    excluded_gps=entry.get("excluded_gps") or [],
+                )))
+                delinquency_servicers.append(servicer)
+            except Exception as exc:
+                traceback.print_exc()
+                delinquency_failures.append({
                     "servicer": servicer, "deal": deal,
                     "error_type": type(exc).__name__, "error_detail": str(exc),
                 })
@@ -1596,6 +1668,78 @@ async def corrections_review(payload: dict):
                     msr_cycle_month)
                 mismatch_generated = True
 
+        # ---- Delinquency Information Request Form ---------------------------
+        # CLIENT-CONFIRMED (2026-08-18). Sent TO the lenders: the loans FBC needs
+        # additional servicing information about, one worksheet per lender and
+        # deal.
+        #
+        # SAME GATE AS THE MISMATCH REPORT, and for the same reason -- eligibility
+        # rests on FBC's final Loan Status and Delinquency Status, both known the
+        # moment every recommendation has a decision. So the "complete but NOT
+        # ready" state still produces this form while the Monthly Servicer Report
+        # and the Final Audited Portfolio Summary are withheld. Read off the
+        # response dict rather than a second local, so the gate and what the
+        # response reports cannot drift.
+        #
+        # FAIL-SAFE, AND STRICTER IN SPIRIT THAN THE MISMATCH REPORT'S: this
+        # workbook LEAVES THE BUILDING addressed to the lenders. A short form
+        # would ask some lenders for information while silently omitting
+        # another's loans, so ANY servicer that did not produce a block blocks the
+        # whole form, named. Coverage is a SET comparison against the roster,
+        # never a count -- a count cannot tell "all present" from "one swapped
+        # for another".
+        #
+        # INDEPENDENT OF THE MISMATCH REPORT: this block reads none of its state,
+        # and a blocked mismatch report does not block this one.
+        delinquency_form_b64 = None
+        delinquency_form_filename_value = None
+        delinquency_generated = False
+        delinquency_blocked_reason = None
+        delinquency_loan_count = 0
+        delinquency_lender_count = 0
+
+        if not review_completeness["review_complete"]:
+            delinquency_blocked_reason = (
+                f"Human Review is not yet complete: "
+                f"{review_completeness['pending']} recommendation(s) still pending."
+            )
+        else:
+            _delinquency_missing = [s for s in correction_state
+                                    if s not in set(delinquency_servicers)]
+            if _delinquency_missing:
+                # WHICH failure it was, not just THAT one happened. A file that
+                # could not be read and a file that broke while being evaluated
+                # are different problems with different fixes.
+                _built = {f["servicer"] for f in delinquency_failures}
+                _unreadable = sorted(s for s in _delinquency_missing if s not in _built)
+                _unevaluated = sorted(s for s in _delinquency_missing if s in _built)
+                _parts = []
+                if _unreadable:
+                    _parts.append(", ".join(_unreadable)
+                                  + " could not be read or consolidated")
+                if _unevaluated:
+                    _parts.append(", ".join(_unevaluated)
+                                  + " could not be evaluated for additional-"
+                                    "information requests")
+                delinquency_blocked_reason = (
+                    "The Delinquency Information Request Form was not generated "
+                    "because " + "; and ".join(_parts)
+                    + ". An incomplete form would omit loans the lenders need to "
+                      "report on."
+                )
+            else:
+                delinquency_loan_count = sum(len(rows) for _label, rows
+                                             in delinquency_blocks)
+                delinquency_lender_count = len(delinquency_blocks)
+                delinquency_buffer = io.BytesIO()
+                drf_mod.generate_delinquency_request_form_bytes(
+                    delinquency_blocks, delinquency_buffer, msr_cycle_month)
+                delinquency_form_b64 = base64.b64encode(
+                    delinquency_buffer.getvalue()).decode("utf-8")
+                delinquency_form_filename_value = (
+                    drf_mod.delinquency_request_form_filename(msr_cycle_month))
+                delinquency_generated = True
+
         # ---- Final Audited Portfolio Summary, from those same verdicts -------
         # CLIENT-CONFIRMED (2026-08-13): ONLY complete deals contribute numeric
         # blocks. A blocked deal's figures were computed above, but once the deal
@@ -1697,6 +1841,19 @@ async def corrections_review(payload: dict):
                 "blocked_reason": mismatch_blocked_reason,
                 "mismatch_count": mismatch_count,
                 "provenance_gap_count": len(mismatch_provenance_gaps),
+            },
+            # CLIENT-CONFIRMED (2026-08-18): MINIMAL, and deliberately parallel
+            # to the mismatch report's shape above so the client has one pattern
+            # for both. Per-lender counts and failure detail stay server-side;
+            # blocked_reason names servicers -- already public in `deals` -- and
+            # never an SBA GP Number.
+            "delinquency_request_form_b64": delinquency_form_b64,
+            "delinquency_request_form_filename": delinquency_form_filename_value,
+            "delinquency_request_form_status": {
+                "generated": delinquency_generated,
+                "blocked_reason": delinquency_blocked_reason,
+                "loan_count": delinquency_loan_count,
+                "lender_count": delinquency_lender_count,
             },
             "summary": {
                 "applied": applied_total,

@@ -635,6 +635,13 @@ class ResponseSurfaceTests(_Harness):
     }
     NEW_KEYS = {"mismatch_report_b64", "mismatch_report_filename",
                 "mismatch_report_status"}
+    # Added by a LATER commit (the Delinquency Information Request Form,
+    # 2026-08-18) and therefore not this report's business. Named here rather
+    # than folded into EXISTING_KEYS so the two commits' additions stay
+    # attributable and this suite keeps asserting exactly its own three.
+    OTHER_LATER_KEYS = {"delinquency_request_form_b64",
+                        "delinquency_request_form_filename",
+                        "delinquency_request_form_status"}
 
     def setUp(self):
         _, self.body, _ = self.run_review(
@@ -643,8 +650,10 @@ class ResponseSurfaceTests(_Harness):
     def test_every_pre_existing_key_survives(self):
         self.assertTrue(self.EXISTING_KEYS <= set(self.body))
 
-    def test_exactly_three_keys_were_added(self):
-        self.assertEqual(set(self.body) - self.EXISTING_KEYS, self.NEW_KEYS)
+    def test_exactly_three_keys_were_added_by_this_report(self):
+        self.assertEqual(
+            set(self.body) - self.EXISTING_KEYS - self.OTHER_LATER_KEYS,
+            self.NEW_KEYS)
 
     def test_the_status_object_carries_exactly_four_fields(self):
         self.assertEqual(set(self.status(self.body)),

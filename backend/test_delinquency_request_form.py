@@ -648,10 +648,24 @@ class IsolationTests(unittest.TestCase):
                 self.assertEqual(params & {"request", "session", "session_id", "app"},
                                  set())
 
-    def test_main_does_not_reference_the_module_yet(self):
-        """This commit is the isolated module only; wiring is a later commit."""
+    def test_main_uses_only_this_module_s_public_entry_points(self):
+        """main.py IS the consumer as of Step 2.
+
+        This replaces Step 1's "main does not reference the module yet", which
+        pinned that commit's not-yet-wired claim and expired the moment the
+        wiring arrived. The invariant worth keeping is the DIRECTION of the
+        dependency: main reaches in only through the documented entry points, so
+        this module's internals stay free to change and the separability the
+        tests above assert is not quietly undone by a caller binding to a
+        private name."""
         import main
-        self.assertNotIn("delinquency_request_form", inspect.getsource(main))
+        used = set(re.findall(r"drf_mod\.(\w+)", inspect.getsource(main)))
+        self.assertTrue(used)
+        self.assertEqual(used - {"build_lender_rows",
+                                 "generate_delinquency_request_form_bytes",
+                                 "delinquency_request_form_filename",
+                                 "NO_QUALIFYING_LOANS_TEXT", "COLUMNS"}, set())
+        self.assertEqual([n for n in used if n.startswith("_")], [])
 
 
 class PurityTests(unittest.TestCase):
