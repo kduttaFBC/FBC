@@ -30,8 +30,17 @@ needing lender information. The same applies to Loan Status, which is why the
 Loan Status rule is written as "not ordinary ACTIVE" rather than as a list of
 nine permitted values: a list would silently drop a tenth, unexpected one.
 
-THE NOTES COLUMN IS ALWAYS BLANK. It is the lender's to complete, and this module
-never writes to it.
+TWO COLUMNS ARE ALWAYS BLANK -- CLIENT-CONFIRMED (2026-08-18). Last Payment
+Receipt Date and Servicing Notes / Additional Information are BOTH the lender's
+to complete when the form comes back. Their HEADINGS remain; only their values
+are empty.
+
+FBC populates neither. The receipt date was previously read from the posting
+consolidation had already selected as authoritative; that retrieval is REMOVED
+OUTRIGHT rather than re-sourced. It is not calculated, not inferred, and not
+taken from SOUP, the SRF or Human Review. build_lender_rows no longer accepts the
+raw postings frame at all, so the SIGNATURE is the guarantee: there is no
+parameter through which submitted servicing data could re-populate the column.
 """
 
 import re
@@ -119,29 +128,28 @@ COLUMNS = [
     "Servicing Notes / Additional Information",
 ]
 
-# The lender's column. Written blank on every row, always.
+# THE TWO LENDER-COMPLETED COLUMNS -- CLIENT-CONFIRMED (2026-08-18).
+#
+# Both keep their headings and both are written BLANK on every generated row.
+# The lender completes them when the form comes back:
+#
+#   Last Payment Receipt Date                 the lender's servicing system knows
+#                                             this; FBC does not assert it
+#   Servicing Notes / Additional Information  free-form context only the lender
+#                                             can supply
+#
+# FBC populates NEITHER. The receipt date was previously read from the
+# authoritative posting; that retrieval is removed outright rather than
+# re-sourced, and build_lender_rows no longer accepts the raw postings frame at
+# all -- the SIGNATURE is the guarantee, so no future edit can quietly
+# re-populate the column from submitted servicing data. It is not calculated, not
+# inferred, and not taken from SOUP, the SRF or Human Review.
+LENDER_COMPLETED_COLUMNS = (COLUMNS[5], COLUMNS[6])
+
 NOTES_COLUMN = COLUMNS[-1]
+RECEIPT_DATE_COLUMN = COLUMNS[5]
 
 NO_QUALIFYING_LOANS_TEXT = "No loans requiring additional information."
-
-_RECEIPT_DATE_COLUMN = "Payment Receipt Date"
-
-
-def _receipt_date_index(servicer_inputs_df):
-    """{(sheet, excel row): Payment Receipt Date} over the RAW postings.
-
-    Keyed on the sheet as well as the row number because a workbook may carry
-    postings on more than one sheet, where row numbers repeat."""
-    if servicer_inputs_df is None or _RECEIPT_DATE_COLUMN not in servicer_inputs_df.columns:
-        return {}
-    if "_excel_row" not in servicer_inputs_df.columns:
-        return {}
-    index = {}
-    for _i, row in servicer_inputs_df.iterrows():
-        key = (row.get("_sheet_name"), row.get("_excel_row"))
-        if key[1] is not None:
-            index[key] = row.get(_RECEIPT_DATE_COLUMN)
-    return index
 
 
 def _identifier(value):
@@ -160,34 +168,14 @@ def _identifier(value):
     return str(value).strip()
 
 
-def _last_payment_receipt_date(final_row, receipt_index):
-    """The receipt date of the posting consolidation ALREADY chose as
-    authoritative.
-
-    _excel_row on the consolidated frame is effective_last["_excel_row"] -- the
-    one posting Loan Status, Delinquency Status and Ending Balance are all taken
-    from. Reading its receipt date reuses that existing decision instead of
-    inventing a "last payment" rule, and guarantees the date describes the same
-    posting as the three columns beside it. It inherits the incomplete-final-
-    posting fallback for free: when the true last posting is blank across every
-    authoritative signal, effective_last is the last posting with real data, and
-    this reads that one.
-
-    Validated on all 104 qualifying July rows: 58 populated, 46 blank, and ZERO
-    disagreements with the latest date anywhere on the loan. The blanks are
-    correct -- these are non-paying loans, so no payment was received. Nothing
-    reaches backwards into an earlier cycle to fill the cell."""
-    value = receipt_index.get((final_row.get("_sheet_name"), final_row.get("_excel_row")))
-    return None if _norm(value) == "" else value
-
-
-def build_lender_rows(final, servicer_inputs_df=None, excluded_gps=None):
+def build_lender_rows(final, excluded_gps=None):
     """The qualifying loans for ONE lender-and-deal, in SBA GP Number order.
 
     `final` is checks._apply_verified_overrides(consolidate_cycle_postings(...),
     verified_overrides) -- supplied by the caller, never built here and never
-    mutated. servicer_inputs_df is the same lender's RAW postings, read only for
-    the receipt date.
+    mutated. It is the ONLY data source: there is deliberately no parameter for
+    the raw postings frame, so neither lender-completed column can be populated
+    from submitted servicing data.
 
     excluded_gps is the application's own closed-at-zero suppression set,
     captured at /api/audit from STAT-01. It is APPLIED here and never recomputed:
@@ -196,7 +184,6 @@ def build_lender_rows(final, servicer_inputs_df=None, excluded_gps=None):
         return []
 
     suppressed = {str(gp).strip() for gp in (excluded_gps or [])}
-    receipt_index = _receipt_date_index(servicer_inputs_df)
     rows = []
 
     for gp in final.index:
@@ -218,8 +205,10 @@ def build_lender_rows(final, servicer_inputs_df=None, excluded_gps=None):
             # verbatim so the lender sees what their own system reported.
             "Loan Status": "" if loan_status is None else str(loan_status).strip(),
             "Delinquency Status": "" if dq_status is None else str(dq_status).strip(),
-            "Last Payment Receipt Date": _last_payment_receipt_date(row, receipt_index),
-            NOTES_COLUMN: "",          # the lender's to complete
+            # BOTH lender-completed columns, blank by requirement. Neither is
+            # calculated, inferred, nor read from SOUP, the SRF or Human Review.
+            RECEIPT_DATE_COLUMN: "",
+            NOTES_COLUMN: "",
         })
 
     rows.sort(key=lambda r: r["SBA GP Number"])
@@ -264,7 +253,8 @@ CENTER = Alignment(horizontal="center", vertical="center")
 CENTER_WRAP = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 BALANCE_FORMAT = "#,##0"
-DATE_FORMAT = "mm-dd-yy"
+# No date format: Last Payment Receipt Date is lender-completed and FBC writes no
+# value into it, so a number format would describe a cell that is always empty.
 
 BALANCE_HEADING = "Securitization Balance"
 
@@ -348,11 +338,12 @@ def _write_sheet(ws, rows, cycle_month=None):
         banded = (excel_row % 2) == 0          # even rows filled, as supplied
         for offset, column in enumerate(COLUMNS):
             value = row.get(column)
-            if column == NOTES_COLUMN:
-                value = None               # ALWAYS blank -- the lender's column
-            elif column == "Last Payment Receipt Date" and value is not None:
-                parsed = pd.to_datetime(value, errors="coerce")
-                value = None if pd.isna(parsed) else parsed.to_pydatetime()
+            if column in LENDER_COMPLETED_COLUMNS:
+                # ALWAYS blank, whatever the row dict carries. Defence in depth:
+                # the builder already writes "" for both, and blanking again here
+                # means no caller-supplied value can reach a lender-completed
+                # cell. Their HEADINGS remain -- only the values are empty.
+                value = None
             elif column == "Securitization Balance" and value is not None:
                 try:
                     value = float(value)
@@ -366,8 +357,6 @@ def _write_sheet(ws, rows, cycle_month=None):
                 cell.fill = BAND_FILL
             if column == "Securitization Balance":
                 cell.number_format = BALANCE_FORMAT
-            elif column == "Last Payment Receipt Date":
-                cell.number_format = DATE_FORMAT
 
 
 def generate_delinquency_request_form_bytes(blocks, buffer, cycle_month=None):

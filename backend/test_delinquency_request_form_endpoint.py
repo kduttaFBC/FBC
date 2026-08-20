@@ -300,12 +300,18 @@ class WiringTests(_Harness):
         _, body = self.run_review(spec)
         self.assertEqual(self.data_rows(body, "CBT 2025"), [])
 
-    def test_the_receipt_date_survives_end_to_end(self):
+    def test_the_receipt_date_is_blank_end_to_end(self):
+        """CLIENT-CONFIRMED (2026-08-18): lender-completed. The posting carries
+        "2026-07-05" and it must not reach the workbook. Replaces
+        test_the_receipt_date_survives_end_to_end."""
         gp = "1000000001"
         spec = {"CBT 2025": _lender(D2025, gp, name="CBT 2025",
                                     overrides={(gp, "Loan Status"): "REO"})}
         _, body = self.run_review(spec)
-        self.assertEqual(str(self.data_rows(body, "CBT 2025")[0][5])[:10], "2026-07-05")
+        row = self.data_rows(body, "CBT 2025")[0]
+        self.assertIsNone(row[5])          # Last Payment Receipt Date
+        self.assertIsNone(row[6])          # Servicing Notes
+        self.assertEqual(row[3], "REO")    # everything else unchanged
 
     def test_the_balance_heading_carries_the_reporting_month_end(self):
         _, body = self.run_review(ONE)

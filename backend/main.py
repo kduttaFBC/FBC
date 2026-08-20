@@ -1357,10 +1357,12 @@ async def corrections_review(payload: dict):
             # be applied twice, and the set itself is the audit's own -- read
             # verbatim off the session entry, never recomputed.
             #
-            # servicer_inputs_df is passed for ONE purpose: Last Payment Receipt
-            # Date, read off the posting consolidation ALREADY selected as
-            # authoritative (the frame's own _excel_row). No date is
-            # recalculated, and nothing reaches back into an earlier cycle.
+            # THE FINAL FRAME IS THE ONLY INPUT. CLIENT-CONFIRMED (2026-08-18):
+            # Last Payment Receipt Date and Servicing Notes are BOTH the lender's
+            # to complete, so the raw postings frame is deliberately NOT passed --
+            # build_lender_rows has no parameter for it, which is what makes
+            # re-populating either column from submitted servicing data
+            # impossible rather than merely absent.
             #
             # Appended EVEN WHEN THE ROW LIST IS EMPTY -- a lender with nothing
             # outstanding gets a worksheet saying so. Filtering here would drop
@@ -1368,7 +1370,7 @@ async def corrections_review(payload: dict):
             # exists to prevent.
             try:
                 delinquency_blocks.append((servicer, drf_mod.build_lender_rows(
-                    report_final, servicer_inputs_df,
+                    report_final,
                     excluded_gps=entry.get("excluded_gps") or [],
                 )))
                 delinquency_servicers.append(servicer)

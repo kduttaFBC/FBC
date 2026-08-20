@@ -1,15 +1,17 @@
 """Delinquency Information Request Form — the isolated report module.
 
 CLIENT-CONFIRMED (2026-08-18). Covers the eligibility algorithm, the seven
-columns and their sources, the receipt-date mapping, closed-at-zero suppression,
-the workbook's reproduced structure, and the module's isolation from everything
-it must not touch.
+columns and their sources, the two lender-completed columns, closed-at-zero
+suppression, the workbook's reproduced structure, and the module's isolation from
+everything it must not touch.
 
 Endpoint wiring is a later commit and is not tested here.
 
-THE ONE INVARIANT THAT OUTRANKS ALL OTHERS: the Servicing Notes / Additional
-Information column is blank on every generated lender row. It is the lender's to
-complete, and a value appearing there would be FBC answering its own question.
+THE ONE INVARIANT THAT OUTRANKS ALL OTHERS: Last Payment Receipt Date and
+Servicing Notes / Additional Information are blank on every generated lender row.
+Both are the lender's to complete when the form comes back, and a value appearing
+in either would be FBC answering its own question. Their HEADINGS remain -- only
+their values are empty.
 """
 
 import ast
@@ -56,8 +58,11 @@ def _frames(postings, overrides=None):
 
 
 def _rows(postings, overrides=None, excluded_gps=None):
-    si, final = _frames(postings, overrides)
-    return drf.build_lender_rows(final, si, excluded_gps=excluded_gps)
+    """The final frame is the ONLY input build_lender_rows takes. _frames still
+    returns the raw postings so a test can assert what the SRF carried and was
+    NOT used."""
+    _si_df, final = _frames(postings, overrides)
+    return drf.build_lender_rows(final, excluded_gps=excluded_gps)
 
 
 def _code_only(module):
@@ -300,61 +305,100 @@ class ColumnSourceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Last Payment Receipt Date
+# The two lender-completed columns
 # ---------------------------------------------------------------------------
 
-class ReceiptDateTests(unittest.TestCase):
-    """Read from the posting consolidation ALREADY chose as authoritative."""
+class LenderCompletedFieldsTests(unittest.TestCase):
+    """CLIENT-CONFIRMED (2026-08-18): Last Payment Receipt Date and Servicing
+    Notes are BOTH the lender's to complete. FBC populates neither.
 
-    def test_it_comes_from_the_authoritative_posting(self):
+    Replaces ReceiptDateTests, which asserted the superseded requirement that
+    the date be read from the posting consolidation had already selected as
+    authoritative. That retrieval is removed outright, not re-sourced."""
+
+    RECEIPT = "Last Payment Receipt Date"
+    RECEIPT_OFFSET = 5
+    NOTES_OFFSET = 6
+
+    def test_the_receipt_date_is_blank_even_when_the_srf_carries_one(self):
+        # _si() supplies "Payment Receipt Date": "2026-07-05" on the posting.
         rows = _rows([_si(**{"Loan Status": "REO"})])
-        self.assertEqual(str(rows[0]["Last Payment Receipt Date"])[:10], "2026-07-05")
+        self.assertEqual(rows[0][self.RECEIPT], "")
 
-    def test_with_several_postings_it_is_the_last_one_consolidation_used(self):
+    def test_it_is_blank_even_when_the_consolidated_posting_carries_one(self):
+        """The old join key still exists on the frame; nothing reads it."""
+        si, final = _frames([_si(**{"Loan Status": "REO"})])
+        self.assertIn("_excel_row", final.columns)
+        self.assertEqual(drf.build_lender_rows(final)[0][self.RECEIPT], "")
+
+    def test_it_is_blank_across_several_postings_with_different_dates(self):
         postings = [
             _si(**{"Loan Payment Instance": 1, "Payment Receipt Date": "2026-07-05",
                    "_excel_row": 10}),
             _si(**{"Loan Payment Instance": 2, "Payment Receipt Date": "2026-07-20",
                    "_excel_row": 11, "Loan Status": "REO"}),
         ]
-        si, final = _frames(postings)
-        # Consolidation's own choice of authoritative row.
-        self.assertEqual(final.at["1000000001", "_excel_row"], 11)
-        rows = drf.build_lender_rows(final, si)
-        self.assertEqual(str(rows[0]["Last Payment Receipt Date"])[:10], "2026-07-20")
+        _si_df, final = _frames(postings)
+        self.assertEqual(drf.build_lender_rows(final)[0][self.RECEIPT], "")
 
-    def test_a_blank_receipt_date_stays_blank(self):
-        """A non-paying loan has no receipt date. Nothing reaches backwards into
-        an earlier posting to fill the cell."""
-        postings = [
-            _si(**{"Loan Payment Instance": 1, "Payment Receipt Date": "2026-06-05",
-                   "_excel_row": 10}),
-            _si(**{"Loan Payment Instance": 2, "Payment Receipt Date": None,
-                   "_excel_row": 11, "Loan Status": "REO"}),
-        ]
-        si, final = _frames(postings)
-        rows = drf.build_lender_rows(final, si)
-        self.assertIsNone(rows[0]["Last Payment Receipt Date"])
+    def test_both_columns_are_blank_on_every_row_of_the_sheet(self):
+        rows = _rows([_si(f"100000000{i}", **{"Loan Status": "REO"})
+                      for i in range(1, 6)])
+        self.assertEqual(len(rows), 5)
+        ws = _sheet([("Lendistry 2025", rows)])["Lendistry 2025"]
+        for i in range(len(rows)):
+            with self.subTest(row=i):
+                self.assertIsNone(ws.cell(row=drf.FIRST_DATA_ROW + i,
+                                          column=drf.FIRST_COLUMN
+                                          + self.RECEIPT_OFFSET).value)
+                self.assertIsNone(ws.cell(row=drf.FIRST_DATA_ROW + i,
+                                          column=drf.FIRST_COLUMN
+                                          + self.NOTES_OFFSET).value)
 
-    def test_it_is_blank_when_the_column_is_absent_entirely(self):
-        postings = [_si(**{"Loan Status": "REO"})]
-        del postings[0]["Payment Receipt Date"]
-        si, final = _frames(postings)
-        rows = drf.build_lender_rows(final, si)
-        self.assertIsNone(rows[0]["Last Payment Receipt Date"])
+    def test_they_stay_blank_even_if_a_row_dict_carries_values(self):
+        """Defence in depth: the writer blanks both regardless of input."""
+        rows = _rows([_si(**{"Loan Status": "REO"})])
+        rows[0][self.RECEIPT] = "2026-07-05"
+        rows[0][drf.NOTES_COLUMN] = "FBC SHOULD NOT WRITE THIS"
+        ws = _sheet([("Lendistry 2025", rows)])["Lendistry 2025"]
+        for offset in (self.RECEIPT_OFFSET, self.NOTES_OFFSET):
+            with self.subTest(offset=offset):
+                self.assertIsNone(ws.cell(row=drf.FIRST_DATA_ROW,
+                                          column=drf.FIRST_COLUMN + offset).value)
 
-    def test_it_is_blank_when_no_raw_frame_is_supplied(self):
-        _si_df, final = _frames([_si(**{"Loan Status": "REO"})])
-        rows = drf.build_lender_rows(final, None)
-        self.assertIsNone(rows[0]["Last Payment Receipt Date"])
+    def test_both_column_headings_remain(self):
+        ws = _sheet([("Lendistry 2025", [])])["Lendistry 2025"]
+        self.assertEqual(ws.cell(row=drf.HEADER_ROW,
+                                 column=drf.FIRST_COLUMN + self.RECEIPT_OFFSET).value,
+                         "Last Payment Receipt Date")
+        self.assertIn("Servicing Notes",
+                      ws.cell(row=drf.HEADER_ROW,
+                              column=drf.FIRST_COLUMN + self.NOTES_OFFSET).value)
 
-    def test_rows_on_another_sheet_cannot_supply_the_date(self):
-        """The index is keyed on sheet AND row, so a repeated row number on a
-        second sheet cannot leak its date onto this loan."""
-        si, final = _frames([_si(**{"Loan Status": "REO"})])
-        si.loc[0, "_sheet_name"] = "Some Other Sheet"
-        rows = drf.build_lender_rows(final, si)
-        self.assertIsNone(rows[0]["Last Payment Receipt Date"])
+    def test_the_module_reads_no_receipt_date_source_at_all(self):
+        code = _code_only(drf)
+        # The HEADING is a column of the form and must survive, so it is removed
+        # before the scan. What must not appear anywhere is the SRF's own
+        # "Payment Receipt Date" source column, or any of the retrieval it fed.
+        self.assertIn('"Last Payment Receipt Date"', code)
+        self.assertNotIn("Payment Receipt Date",
+                         code.replace('"Last Payment Receipt Date"', ""))
+        for forbidden in ("receipt_index", "_receipt_date_index",
+                          "_last_payment_receipt_date", "_excel_row",
+                          "servicer_inputs_df"):
+            with self.subTest(name=forbidden):
+                self.assertNotIn(forbidden, code)
+
+    def test_build_lender_rows_cannot_reach_the_raw_frame(self):
+        """The signature is the guarantee: there is no parameter to pass one."""
+        params = inspect.signature(drf.build_lender_rows).parameters
+        self.assertNotIn("servicer_inputs_df", params)
+        self.assertEqual(list(params), ["final", "excluded_gps"])
+
+    def test_both_columns_are_named_as_lender_completed(self):
+        self.assertEqual(drf.LENDER_COMPLETED_COLUMNS,
+                         ("Last Payment Receipt Date",
+                          "Servicing Notes / Additional Information"))
 
 
 # ---------------------------------------------------------------------------
@@ -473,8 +517,13 @@ class WorkbookTests(unittest.TestCase):
     def test_number_formats(self):
         self.assertEqual(self.ws.cell(row=5, column=drf.FIRST_COLUMN + 2).number_format,
                          "#,##0")
+
+    def test_the_receipt_date_carries_no_date_format(self):
+        """CLIENT-CONFIRMED (2026-08-18): lender-completed, so FBC writes no
+        value -- and a date format would describe a cell that is always empty.
+        Replaces the assertion that the cell carried mm-dd-yy."""
         self.assertEqual(self.ws.cell(row=5, column=drf.FIRST_COLUMN + 5).number_format,
-                         "mm-dd-yy")
+                         "General")
 
     def test_data_rows_are_banded_on_even_rows(self):
         self.assertIsNone(self.ws.cell(row=5, column=2).fill.fill_type)
@@ -504,10 +553,10 @@ class WorkbookTests(unittest.TestCase):
         self.assertNotIsInstance(value, bool)
         self.assertEqual(float(value), 900.0)
 
-    def test_the_receipt_date_is_written_as_a_date_not_text(self):
-        import datetime
-        self.assertIsInstance(self.ws.cell(row=5, column=drf.FIRST_COLUMN + 5).value,
-                              datetime.datetime)
+    def test_the_receipt_date_cell_is_empty(self):
+        """Lender-completed. Replaces the assertion that it was written as a
+        date, which encoded the superseded requirement."""
+        self.assertIsNone(self.ws.cell(row=5, column=drf.FIRST_COLUMN + 5).value)
 
 
 class BalanceHeadingTests(unittest.TestCase):
@@ -669,19 +718,18 @@ class IsolationTests(unittest.TestCase):
 
 
 class PurityTests(unittest.TestCase):
-    """Inputs are read, never written."""
+    """Inputs are read, never written.
+
+    The raw postings frame no longer has a purity test because it no longer has
+    an interface to violate: build_lender_rows takes no such parameter, which
+    LenderCompletedFieldsTests.test_build_lender_rows_cannot_reach_the_raw_frame
+    asserts directly."""
 
     def test_the_final_frame_is_not_mutated(self):
-        si, final = _frames([_si(**{"Loan Status": "REO"})])
+        _si_df, final = _frames([_si(**{"Loan Status": "REO"})])
         before = final.copy(deep=True)
-        drf.build_lender_rows(final, si)
+        drf.build_lender_rows(final)
         pd.testing.assert_frame_equal(final, before)
-
-    def test_the_raw_postings_frame_is_not_mutated(self):
-        si, final = _frames([_si(**{"Loan Status": "REO"})])
-        before = si.copy(deep=True)
-        drf.build_lender_rows(final, si)
-        pd.testing.assert_frame_equal(si, before)
 
     def test_the_suppression_set_is_not_mutated(self):
         excluded = ["1000000001"]
@@ -690,8 +738,8 @@ class PurityTests(unittest.TestCase):
         self.assertEqual(excluded, before)
 
     def test_an_empty_frame_produces_no_rows(self):
-        self.assertEqual(drf.build_lender_rows(pd.DataFrame(), None), [])
-        self.assertEqual(drf.build_lender_rows(None, None), [])
+        self.assertEqual(drf.build_lender_rows(pd.DataFrame()), [])
+        self.assertEqual(drf.build_lender_rows(None), [])
 
 
 if __name__ == "__main__":
