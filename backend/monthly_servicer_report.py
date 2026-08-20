@@ -333,8 +333,51 @@ def _single_posting_value(group, column, gp, servicer_name, issues):
     return None
 
 
+# EXCEL DATE SERIALS. A lender can enter a date into a cell whose number
+# format is NOT a date format -- Millennium's Modification Date column is
+# currency-formatted, so their 2026-06-12 sits in the sheet as the bare number
+# 46185 displaying as "$46,185.00". calamine returns a datetime only for a
+# DATE-FORMATTED cell, so such a cell reaches this module as the raw Excel
+# serial, and pd.to_datetime reads a bare number as NANOSECONDS since
+# 1970-01-01 -- turning 2026-06-12 into 1970-01-01. Excel serials are DAYS
+# since 1899-12-30, which is what the conversion below applies.
+_EXCEL_SERIAL_EPOCH = "1899-12-30"
+# 1900-03-01, the first serial free of Excel's 1900 leap-year artifact.
+_MIN_EXCEL_SERIAL = 61
+# 2100-12-31.
+_MAX_EXCEL_SERIAL = 73415
+
+
 def _coerce_date(value):
-    parsed = pd.to_datetime(value, errors="coerce")
+    """A source cell's date, or None.
+
+    A NUMBER is read as an Excel serial (days since 1899-12-30), never as a
+    nanosecond count. Outside the plausible serial window a number is not a
+    date at all -- zero, a count, a stray amount -- and the cell is left BLANK
+    rather than converted into a date that would be indistinguishable from a
+    real one on a distributed report. That is the same never-guess rule every
+    other unresolved field in this module follows.
+
+    Every non-numeric input keeps its existing behaviour exactly: a
+    datetime.date, a datetime.datetime, a pandas Timestamp and a parseable date
+    string pass through as before, and a blank or unparseable value is None.
+
+    Assumes the 1900 date system. A serial carries no record of its workbook's
+    epoch, and every file measured is 1900-system.
+    """
+    if isinstance(value, bool):
+        return None
+    if pd.api.types.is_number(value):
+        try:
+            serial = float(value)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(serial) or not (_MIN_EXCEL_SERIAL <= serial <= _MAX_EXCEL_SERIAL):
+            return None
+        parsed = pd.to_datetime(serial, unit="D", origin=_EXCEL_SERIAL_EPOCH,
+                                errors="coerce")
+    else:
+        parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
         return None
     return parsed.to_pydatetime()

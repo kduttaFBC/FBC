@@ -35,6 +35,7 @@ The real-file tests skip unless the fixtures are present. Run with:
     FALCONBRIDGE_SRF_DIR=... python -m pytest test_monthly_servicer_report.py
 """
 
+import datetime
 import glob
 import inspect
 import io
@@ -1525,6 +1526,213 @@ class ConsolidationRulesUnchangedTests(unittest.TestCase):
                     "Payment Received", "Beginning Balance", "Ending Balance",
                     "Lender Loan Number"}
         self.assertEqual(resolved & set(msr._SOURCE_COLUMNS.values()), set())
+
+
+
+# ---------------------------------------------------------------------------
+# NUMERIC EXCEL DATE SERIALS
+#
+# Millennium 2025 GP 7859248901's July 2026 Modification Date. The lender
+# entered 2026-06-12 into a cell whose number format is CURRENCY, so the sheet
+# holds the bare Excel serial 46185 (displaying as "$46,185.00") rather than a
+# date. calamine returns a datetime only for a DATE-FORMATTED cell, so the
+# report received the number -- and pd.to_datetime reads a bare number as
+# NANOSECONDS since 1970, printing 01-01-70 where the client's own finalized
+# report prints 06-12-26.
+#
+# Every test below is about how a SOURCE CELL is read. Nothing here touches a
+# status, a determination or a financial value.
+# ---------------------------------------------------------------------------
+
+DEFECT_GP = "7859248901"
+DEFECT_SERIAL = 46185
+DEFECT_DATE = datetime.datetime(2026, 6, 12)
+EPOCH = datetime.datetime(1970, 1, 1)
+
+
+def _with_dates(columns, value, gp=DEFECT_GP, status="Deferred", dq="60 days"):
+    """One-loan Servicer Inputs frame carrying `value` in each named column."""
+    frame = _srf([(gp, "L-1", status, dq, 40000.0, 34445.68, 0.0)])
+    for column in columns:
+        frame[column] = value
+    return frame
+
+
+class ExcelDateSerialCoercionTests(unittest.TestCase):
+    """_coerce_date reads a number as DAYS since 1899-12-30, never as a
+    nanosecond count."""
+
+    def test_the_reported_serial_becomes_the_client_date(self):
+        for value in (DEFECT_SERIAL, float(DEFECT_SERIAL)):
+            with self.subTest(value=value):
+                self.assertEqual(msr._coerce_date(value), DEFECT_DATE)
+
+    def test_a_fractional_serial_keeps_its_calendar_day(self):
+        self.assertEqual(msr._coerce_date(DEFECT_SERIAL + 0.5).date(), DEFECT_DATE.date())
+
+    def test_the_plausible_window_boundaries(self):
+        self.assertEqual(msr._coerce_date(msr._MIN_EXCEL_SERIAL),
+                         datetime.datetime(1900, 3, 1))
+        self.assertEqual(msr._coerce_date(msr._MAX_EXCEL_SERIAL),
+                         datetime.datetime(2100, 12, 31))
+        self.assertIsNone(msr._coerce_date(msr._MIN_EXCEL_SERIAL - 1))
+        self.assertIsNone(msr._coerce_date(msr._MAX_EXCEL_SERIAL + 1))
+
+    def test_an_implausible_number_is_blank_and_never_the_epoch(self):
+        """Zero, a count, a stray amount. Blank beats a date that would look
+        exactly like a real one on a distributed report."""
+        for value in (0, 0.0, 1, 60, -5, -46185, 1e12, float("nan"), True, False):
+            with self.subTest(value=value):
+                coerced = msr._coerce_date(value)
+                self.assertIsNone(coerced)
+                self.assertNotEqual(coerced, EPOCH)
+
+    def test_existing_non_numeric_handling_is_unchanged(self):
+        for value in (datetime.date(2026, 6, 12), datetime.datetime(2026, 6, 12),
+                      pd.Timestamp("2026-06-12"), "06/12/2026", "2026-06-12",
+                      "June 12, 2026"):
+            with self.subTest(value=value):
+                self.assertEqual(msr._coerce_date(value), DEFECT_DATE)
+
+    def test_blank_and_unparseable_values_stay_blank(self):
+        for value in (None, "", "   ", "n/a", "TBD", pd.NaT, float("nan"),
+                      datetime.time(0, 0)):
+            with self.subTest(value=value):
+                self.assertIsNone(msr._coerce_date(value))
+
+
+class SerialDateInEveryDateColumnTests(unittest.TestCase):
+    """The five date columns share one call site, so they share the fix."""
+
+    def test_every_date_column_reads_the_serial_correctly(self):
+        issues = []
+        rows = msr.build_servicer_rows(
+            _with_dates(msr._DATE_COLUMNS, DEFECT_SERIAL), "Millennium Bank",
+            issues=issues)
+        self.assertEqual(len(rows), 1)
+        for column in msr._DATE_COLUMNS:
+            with self.subTest(column=column):
+                self.assertEqual(rows[0][column], DEFECT_DATE)
+        self.assertEqual(issues, [])
+
+    def test_a_serial_and_a_real_date_produce_identical_rows(self):
+        """The number is INTERPRETED differently; nothing else changes."""
+        serial = msr.build_servicer_rows(
+            _with_dates(msr._DATE_COLUMNS, DEFECT_SERIAL), "Millennium Bank")
+        dated = msr.build_servicer_rows(
+            _with_dates(msr._DATE_COLUMNS, DEFECT_DATE), "Millennium Bank")
+        self.assertEqual(serial, dated)
+
+
+class MillenniumModificationDateRegressionTests(unittest.TestCase):
+    """THE REPORTED DEFECT. Millennium Bank GP 7859248901, July 2026."""
+
+    def setUp(self):
+        self.frame = _with_dates(["Modification  Date"], DEFECT_SERIAL)
+        self.issues = []
+        self.rows = msr.build_servicer_rows(self.frame, "Millennium Bank",
+                                            issues=self.issues)
+        self.row = self.rows[0]
+
+    def test_the_row_holds_the_client_date(self):
+        self.assertEqual(self.row["SBA GP Number"], DEFECT_GP)
+        self.assertEqual(self.row["Modification  Date"], DEFECT_DATE)
+        self.assertNotEqual(self.row["Modification  Date"], EPOCH)
+        self.assertEqual(self.issues, [])
+
+    def test_the_generated_cell_holds_the_client_date_in_the_client_format(self):
+        report = msr.build_deal_report("SOUP2025_1", [
+            {"servicer_name": "Millennium Bank", "display_label": "Millennium 2025",
+             "rows": self.rows, "issues": self.issues, "note_series": "2025 FBC-1",
+             "remittance_date": pd.Timestamp("2026-08-21"),
+             "collection_period_calendar": SAMPLE_CALENDAR}])
+        ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
+        cell = ws.cell(row=9, column=msr.MSR_COLUMNS.index("Modification  Date") + 1)
+        self.assertEqual(cell.value, DEFECT_DATE)
+        self.assertEqual(cell.number_format, "mm-dd-yy")
+
+    def test_the_loan_status_and_delinquency_status_are_untouched(self):
+        """This loan's determinations come from consolidation, not from here."""
+        self.assertEqual(self.row["Loan Status"], "Deferred")
+        self.assertEqual(self.row["Delinquency Status"], "60 days")
+
+    def test_the_financial_values_are_untouched(self):
+        self.assertEqual(self.row["Beginning Actual Balance"], 40000.0)
+        self.assertEqual(self.row["Ending Actual Balance"], 34445.68)
+        self.assertEqual(self.row["Total Payment Received"], 0.0)
+
+
+class NoEpochDateIsEverWrittenTests(unittest.TestCase):
+    """The guard for the NEXT variant of this bug, not this instance of it: no
+    date this report writes may predate 1990."""
+
+    def test_no_generated_date_cell_predates_1990(self):
+        frame = pd.concat([
+            _with_dates(msr._DATE_COLUMNS, DEFECT_SERIAL, gp="1"),
+            _with_dates(msr._DATE_COLUMNS, DEFECT_DATE, gp="2"),
+            _with_dates(msr._DATE_COLUMNS, "06/12/2026", gp="3"),
+            _with_dates(msr._DATE_COLUMNS, 0, gp="4"),
+            _with_dates(msr._DATE_COLUMNS, None, gp="5"),
+        ], ignore_index=True)
+        rows = msr.build_servicer_rows(frame, "Millennium Bank")
+        report = msr.build_deal_report("SOUP2025_1", [
+            {"servicer_name": "Millennium Bank", "display_label": "Millennium 2025",
+             "rows": rows, "issues": [], "note_series": "2025 FBC-1",
+             "remittance_date": pd.Timestamp("2026-08-21"),
+             "collection_period_calendar": SAMPLE_CALENDAR}])
+        ws = _render(report)[msr.MONTHLY_SERVICER_REPORT_SHEET]
+        floor = datetime.datetime(1990, 1, 1)
+        for offset in range(len(rows)):
+            for column in msr._DATE_COLUMNS:
+                cell = ws.cell(row=9 + offset,
+                               column=msr.MSR_COLUMNS.index(column) + 1)
+                with self.subTest(row=9 + offset, column=column):
+                    if cell.value is not None:
+                        self.assertGreaterEqual(cell.value, floor)
+
+
+@unittest.skipUnless(os.environ.get("FALCONBRIDGE_JULY_MILLENNIUM_2025_XLSX"),
+                     "set FALCONBRIDGE_JULY_MILLENNIUM_2025_XLSX")
+class RealJulyModificationDateTests(unittest.TestCase):
+    """The real July 2026 Millennium SRF, against the client's own finalized
+    Monthly Servicer Report for the same loan."""
+
+    @classmethod
+    def setUpClass(cls):
+        raw = open(os.environ["FALCONBRIDGE_JULY_MILLENNIUM_2025_XLSX"], "rb").read()
+        _sk, _dl, _lt, si, cls.deal = file_readers.read_servicer_file(
+            raw, filename="Millennium Bank||Millennium 2025__x.xlsx")
+        cls.frame = si
+        cls.issues = []
+        cls.rows = msr.build_servicer_rows(si, "Millennium Bank", issues=cls.issues)
+
+    def _row(self):
+        return next(r for r in self.rows if r["SBA GP Number"] == DEFECT_GP)
+
+    def test_the_source_cell_is_still_the_bare_serial(self):
+        """If the lender ever fixes the cell format this test says so, rather
+        than the fix silently ceasing to be exercised."""
+        values = self.frame.loc[self.frame["SBA GP Number"] == DEFECT_GP,
+                                "Modification  Date"]
+        self.assertEqual([float(v) for v in values], [float(DEFECT_SERIAL)])
+
+    def test_the_modification_date_matches_the_client_report(self):
+        self.assertEqual(self.deal, "SOUP2025_1")
+        self.assertEqual(self._row()["Modification  Date"], DEFECT_DATE)
+
+    def test_the_loan_status_and_delinquency_status_are_as_submitted(self):
+        row = self._row()
+        self.assertEqual(row["Loan Status"], "Deferred")
+        self.assertEqual(row["Delinquency Status"], "60 days")
+
+    def test_no_july_millennium_date_predates_1990(self):
+        floor = datetime.datetime(1990, 1, 1)
+        for row in self.rows:
+            for column in msr._DATE_COLUMNS:
+                value = row[column]
+                with self.subTest(gp=row["SBA GP Number"], column=column):
+                    if value is not None:
+                        self.assertGreaterEqual(value, floor)
 
 
 if __name__ == "__main__":
