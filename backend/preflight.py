@@ -278,3 +278,65 @@ def format_preflight(result):
             if not f["column"]:
                 lines.append(f"  {code} {sev}: {f['detail']}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# DISPOSITION: whole-file rejection vs row-scoped quarantine
+#
+# preflight_workbook itself is unchanged and still REPORTS ONLY — it raises
+# nothing and knows nothing about fail-vs-warn policy. This helper answers a
+# narrower question for the caller: "are this workbook's blocking findings
+# confined to identifiable ROWS, or do they condemn the whole file?"
+#
+# Only FORM-01 is row-isolatable, and that is a property of what each code
+# means, not a policy preference:
+#
+#   FORM-01  a specific cell on a specific row carries a pasted literal where
+#            a formula belongs. The defect IS the row. Every other row in the
+#            workbook is untouched and still formula-derived, so rejecting
+#            them too discards good lender data to punish a bad row.
+#
+#   FORM-02  a protected column is empty where a formula belongs. Observed
+#            live as 113-of-113 rows across four columns — a template-level
+#            fault, not a row-level one.
+#   FORM-03  NO formula cell anywhere carries a cached value. The workbook was
+#            written programmatically and never recalculated. There is no
+#            "unaffected" subset to salvage; every protected column arrives
+#            blank. This is the corrected-workbook re-ingestion control.
+#   FORM-04  the workbook could not be opened at all.
+#   FORM-05  nothing could be verified (WARN, never blocking).
+#
+# So this returns rows ONLY when EVERY blocking finding is a FORM-01 that
+# names at least one row. A single FORM-02/03/04 alongside them, or a FORM-01
+# with an empty row list, collapses the answer back to None and the caller
+# rejects the whole file exactly as before. Fail-closed by construction: the
+# default answer is None.
+ROW_ISOLATABLE_CODES = ("FORM-01",)
+
+
+def isolatable_rows(result):
+    """The 1-based worksheet rows a FORM-01-only failure is confined to.
+
+    Returns a sorted list of row numbers when every blocking (FAIL) finding is
+    a row-isolatable code carrying at least one row, otherwise None.
+
+    None means "this failure is not row-scopable — reject the workbook", and
+    it is also what a clean workbook returns (nothing to quarantine). The
+    caller must treat None as the pre-existing whole-file disposition; this
+    helper never decides to accept anything on its own."""
+    if result.get("ok"):
+        return None
+    blocking = [f for f in result.get("findings", []) if f.get("severity") == "FAIL"]
+    if not blocking:
+        return None
+    rows = set()
+    for finding in blocking:
+        if finding.get("code") not in ROW_ISOLATABLE_CODES:
+            return None
+        finding_rows = finding.get("rows") or []
+        if not finding_rows:
+            # A blocking finding that names no row cannot be quarantined to
+            # one -- it condemns the file.
+            return None
+        rows.update(finding_rows)
+    return sorted(rows) or None

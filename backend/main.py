@@ -362,6 +362,11 @@ async def audit(
         servicer_loan_counts = {}
         recommendations = []
         corrections_skipped = []
+        # Every loan withheld by the ingestion formula-integrity gate, with the
+        # preflight finding that caused it. Surfaced in the response so an
+        # accepted-with-quarantine workbook can never look like a clean one:
+        # the audit succeeded, but these loans were deliberately not determined.
+        ingestion_quarantine = []
         # Per-servicer correction state stashed for POST /api/corrections/review:
         # original bytes + their SHA-256 + the eligible candidate set. Written
         # into SESSION_CACHE once the session_id is minted (end of this handler).
@@ -405,7 +410,31 @@ async def audit(
             preflight = preflight_mod.preflight_workbook(
                 file_bytes, filename=uploaded.filename,
             )
-            if not preflight["ok"]:
+            # DISPOSITION — whole-file rejection vs row-scoped quarantine.
+            #
+            # preflight still runs on every workbook, still detects every
+            # defect, and still reports them identically. What changed is only
+            # what happens NEXT when it fails.
+            #
+            # FORM-02/03/04 are file-level faults with no salvageable subset
+            # (see preflight.ROW_ISOLATABLE_CODES), so they keep the HTTP 400
+            # below byte-for-byte. FORM-03 in particular is the corrected-
+            # workbook re-ingestion control and is untouched.
+            #
+            # A FORM-01-only failure is different: the defect is confined to
+            # named worksheet rows, and every other row in the workbook is
+            # still formula-derived and perfectly good lender data. Rejecting
+            # 55 sound rows to punish 1 defective one discards real reporting
+            # and, in practice, pushes someone toward hand-editing the lender's
+            # workbook -- the one outcome this application exists to prevent.
+            # Those rows are instead carried forward as a quarantine set:
+            # ingested, reported, and withheld from any automated
+            # determination or correction.
+            #
+            # Nothing is repaired, inferred, recalculated or substituted. The
+            # lender's bytes are used exactly as submitted.
+            quarantine_rows = preflight_mod.isolatable_rows(preflight)
+            if not preflight["ok"] and quarantine_rows is None:
                 blocking = [f for f in preflight["findings"]
                             if f["severity"] == "FAIL"]
                 return JSONResponse(status_code=400, content={
@@ -436,6 +465,60 @@ async def audit(
             # artifact the reviewer saw. They are held only for the session
             # TTL and are never mutated.
 
+            # ROWS -> LOANS. preflight names worksheet ROWS; every downstream
+            # check reasons about LOANS. The bridge is _excel_row, the 1-based
+            # physical row number file_readers already attaches to each
+            # Servicer Inputs record for exactly this kind of back-reference.
+            #
+            # Resolved from the DataFrame rather than by re-opening the
+            # workbook, so the mapping can never disagree with the rows the
+            # audit actually ingested. A row preflight flagged that carries no
+            # readable GP contributes nothing here -- it is reported in the
+            # response's preflight block regardless, so it cannot vanish.
+            #
+            # A loan is quarantined if ANY of its postings is defective: the
+            # cycle is consolidated across postings, so one bad posting taints
+            # every figure derived from that loan this cycle.
+            quarantined_gps = {}
+            if quarantine_rows:
+                blocking_findings = [f for f in preflight["findings"]
+                                     if f["severity"] == "FAIL"]
+                detail = (
+                    f"Ingestion formula-integrity gate (preflight FORM-01) flagged "
+                    f"worksheet row(s) {quarantine_rows} on sheet "
+                    f"'{preflight['sheet']}' of '{uploaded.filename}'. Affected "
+                    f"column(s): "
+                    + ", ".join(sorted({str(f["column"]) for f in blocking_findings if f.get("column")}))
+                    + ". These cells contain pasted literals where the template "
+                    "carries formulas, so any figure computed from them is "
+                    "untrustworthy. The submitted values have been left exactly "
+                    "as received — nothing was repaired, inferred or "
+                    "recalculated. This loan is withheld from automated "
+                    "determination and correction pending lender resubmission "
+                    "or reviewer judgement."
+                )
+                flagged = set(quarantine_rows)
+                if "_excel_row" in servicer_inputs_df.columns and "SBA GP Number" in servicer_inputs_df.columns:
+                    hit = servicer_inputs_df[servicer_inputs_df["_excel_row"].isin(flagged)]
+                    for gp in hit["SBA GP Number"].dropna().astype(str).str.strip().unique():
+                        if gp:
+                            quarantined_gps[gp] = detail
+                ingestion_quarantine.append({
+                    "servicer": display_label,
+                    "filename": uploaded.filename,
+                    "sheet": preflight["sheet"],
+                    "rows_affected": quarantine_rows,
+                    "loans_quarantined": sorted(quarantined_gps),
+                    "findings": blocking_findings,
+                    "disposition": (
+                        "ACCEPTED WITH ROW-SCOPED QUARANTINE — the workbook was "
+                        "ingested and every unaffected loan processed normally. "
+                        "The loans listed above are held at UNVERIFIED and "
+                        "excluded from automated correction. No lender value was "
+                        "modified."
+                    ),
+                })
+
             # soup_key is what actually matches SOUP's Servicer column (e.g.
             # "Lendistry"); display_label is what shows up in results/report
             # tabs/summary (e.g. "Lendistry 2024") — these differ for files
@@ -447,6 +530,7 @@ async def audit(
             results = checks_mod.run_servicer_reconciliation(
                 display_label, loan_terms_df, servicer_inputs_df, soup_servicer_df,
                 memo_df=memo_df, memo_lender_key=soup_key, deal=deal,
+                quarantined_gps=quarantined_gps or None,
             )
 
             # RECOMMENDATIONS ONLY — no corrected workbook is written during
@@ -808,6 +892,7 @@ async def audit(
             "session_id": session_id,
             "recommendations": recommendations,
             "corrections_skipped": corrections_skipped,
+            "ingestion_quarantine": ingestion_quarantine,
         })
 
     except Exception as exc:
