@@ -66,6 +66,25 @@ WARNING_REASONS = {
     "MEMO DATA QUALITY WARNING",
     "DEFERRAL DATA QUALITY WARNING",
     "SCHEDULED PAYMENT AMBIGUOUS",
+    # Added with the row-scoped FORM-01 quarantine. The ingestion gate found
+    # this loan's protected formula cells overwritten with pasted literals in
+    # the SOURCE workbook, so every figure computed from them is untrustworthy
+    # -- which is exactly what this set means. Belongs here rather than in a
+    # review CATEGORY because a quarantined loan must not become a candidate
+    # at all: there is no value this module could responsibly propose writing
+    # back into a workbook whose own inputs are known defective, and proposing
+    # one would be the "silently normalise the defect away" failure the
+    # cross-domain rule already exists to prevent.
+    #
+    # The loan is NOT hidden. STAT-01 keeps its record visible with the
+    # SOURCE FORMULA INTEGRITY DEFECT tag, Calculated DQ Status = UNVERIFIED,
+    # and preflight's own finding text in "Source Integrity Detail".
+    # Spelled as a literal, like every other member of this set: corrections.py
+    # is deliberately isolated from checks.py (see CLAUDE.md) and importing it
+    # here purely for a constant would create the coupling that isolation
+    # exists to prevent. test_form01_row_quarantine.py asserts the two spellings
+    # stay identical, so a rename cannot silently desynchronise them.
+    "SOURCE FORMULA INTEGRITY DEFECT",
 }
 
 _NOT_A_REAL_STATUS = {"", "UNVERIFIED", "REVIEW", "NAN", "NONE"}

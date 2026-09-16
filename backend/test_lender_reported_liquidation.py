@@ -308,9 +308,21 @@ class WarningReasonsScope(unittest.TestCase):
                          ["Delinquency Status", "Loan Status"])
 
     def test_the_warning_set_itself_is_unchanged(self):
+        """A membership pin, so the LIQUIDATION bypass above is re-examined
+        whenever the warning set grows.
+
+        UPDATED with the row-scoped FORM-01 quarantine (see
+        test_form01_row_quarantine.py), which deliberately adds a fourth
+        member: a loan whose SOURCE workbook cells were overwritten with
+        pasted literals must not become a correction candidate. The four
+        iterating tests above already assert the new member suppresses
+        corrections exactly like the other three -- including that it is NOT
+        reached by the LIQUIDATION bypass -- so the guard this pin provides
+        is intact rather than merely re-baselined."""
         self.assertEqual(corrections.WARNING_REASONS,
                          {"MEMO DATA QUALITY WARNING", "DEFERRAL DATA QUALITY WARNING",
-                          "SCHEDULED PAYMENT AMBIGUOUS"})
+                          "SCHEDULED PAYMENT AMBIGUOUS",
+                          "SOURCE FORMULA INTEGRITY DEFECT"})
 
 
 # ---------------------------------------------------------------------------

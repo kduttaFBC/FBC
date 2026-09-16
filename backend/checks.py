@@ -2142,6 +2142,25 @@ def loans_closed_at_zero(soup_servicer_df):
 # deliberate decision, not an assumption made here.
 _TERMINAL_COLLECTION_KEYWORDS = ("FORECLOSURE", "LIQUIDATION", "REO")
 
+# STAT-01 reason tag for a loan quarantined by the ingestion-layer formula
+# integrity gate (preflight FORM-01). The defect is in the SOURCE workbook's
+# protected formula cells, not in this loan's arithmetic -- so this is
+# deliberately its own tag rather than being folded into an existing one:
+#
+#   SCHEDULED PAYMENT AMBIGUOUS  says the cycle obligation is unresolved.
+#   MEMO/DEFERRAL DATA QUALITY   says the deferral evidence is unreadable.
+#   This tag                     says one or more protected cells feeding this
+#                                loan were overwritten with pasted literals,
+#                                so NOTHING computed from them can be trusted.
+#
+# It forces Calculated DQ Status to UNVERIFIED (which in turn makes
+# DQ Status Match "REVIEW" through the existing branch) and, via
+# corrections.WARNING_REASONS, excludes the loan from every correction
+# candidate. It NEVER repairs, infers or recalculates the defective value --
+# the lender's own bytes are reported back untouched and the reviewer is told
+# exactly which rows preflight flagged.
+SOURCE_FORMULA_INTEGRITY_QUARANTINE = "SOURCE FORMULA INTEGRITY DEFECT"
+
 
 def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, received, scheduled,
                                 has_payment_cols, memo_df, servicer_name, cycle_month,
@@ -2551,10 +2570,22 @@ def _calculate_expected_status(gp, srf_status, soup_status, soup_dq_raw, receive
     return calculated_dq, expected_loan_status, deferral, memo_warning, warning_type, is_terminal_this_cycle, reversal_info, deferral_evidence
 
 
-def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None, closed_at_zero=None):
+def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servicer_name=None,
+                      closed_at_zero=None, quarantined_gps=None):
     records = []
     correction_data = []
     suppressed_closed_gps = []
+    # Normalized ONCE here rather than per-loan: GP identity is compared as a
+    # stripped string everywhere in this module (see closed_at_zero below,
+    # which uses the identical form).
+    # Accepts either a plain iterable of GP numbers or a {gp: detail} mapping.
+    # The mapping form carries preflight's OWN finding text through to the
+    # reviewer verbatim, so the row states which columns and which worksheet
+    # rows were flagged rather than a generic "quarantined".
+    if isinstance(quarantined_gps, dict):
+        quarantined = {str(g).strip(): str(d or "") for g, d in quarantined_gps.items()}
+    else:
+        quarantined = {str(g).strip(): "" for g in (quarantined_gps or ())}
     # CLIENT-CONFIRMED (2026-08-04): a record whose ONLY reason is the
     # informational "DEFERRAL RESUME INFORMATION" marker (both Loan Status
     # and DQ Status genuinely match, no real warning) must stay visible in
@@ -2615,6 +2646,30 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             srf_dq=srf_dq, scheduled_ambiguous=scheduled_ambiguous,
             servicing_fee=row.get("servicing_fee"),
         )
+
+        # INGESTION-LAYER QUARANTINE (preflight FORM-01). Applied BEFORE the
+        # capture below so the defective-derived value cannot reach
+        # audited_status_by_loan and from there the Audited Portfolio Summary.
+        #
+        # This overrides the RESULT, never the calculation: _calculate_expected_status
+        # above ran exactly as it does for every other loan, and nothing here
+        # touches the ladder, the sufficiency threshold, the reversal formula,
+        # the deferral branches or Loan Status. It replaces a figure that was
+        # computed from untrustworthy source cells with the codebase's existing
+        # word for "we could not establish this": UNVERIFIED.
+        #
+        # Expected Loan Status is deliberately LEFT ALONE. It is derived from
+        # SOUP history and the memo -- independent evidence that the overwritten
+        # SRF cells cannot corrupt -- so blanking it would discard a sound
+        # finding. Only the delinquency figure, which does read the defective
+        # servicing-fee/posting-instance cells, is withdrawn.
+        #
+        # _classify_delinquency_bucket returns None for "UNVERIFIED", so the loan
+        # drops out of every aging bucket while remaining in Outstanding -- the
+        # same disposition an off-domain status already gets, not a new one.
+        source_integrity_quarantined = str(gp).strip() in quarantined
+        if source_integrity_quarantined:
+            calculated_dq = "UNVERIFIED"
 
         # Captured HERE — unconditionally, before any skip-check below can
         # short-circuit this iteration — so audited_status_by_loan ends up
@@ -2712,6 +2767,7 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             status_match and dq_match is True and not memo_warning and not scheduled_ambiguous
             and not resume_via_change_in_terms_exception and not scheduled_payment_updated_during_cycle
             and not srf_status_is_terminal_collection
+            and not source_integrity_quarantined
         ):
             continue
 
@@ -2732,6 +2788,11 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
         # Lists ALL applicable reasons rather than picking just one, since
         # a record can genuinely have more than one at once.
         reasons = []
+        # Listed first: it explains why the Calculated DQ Status below reads
+        # UNVERIFIED, and it is the condition that governs every other tag on
+        # this row.
+        if source_integrity_quarantined:
+            reasons.append(SOURCE_FORMULA_INTEGRITY_QUARANTINE)
         if not status_match:
             reasons.append("LOAN STATUS MISMATCH")
         # DELINQUENCY STATUS MISMATCH is only ever asserted when the DQ
@@ -2852,6 +2913,11 @@ def status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=None, servi
             ) if scheduled_payment_updated_during_cycle else "",
             "Terminal Status Review Detail": terminal_status_review_detail,
             "Posting Count": int(row.get("posting_count", 1)),
+            # The ingestion gate's own finding text, verbatim, so the reviewer
+            # sees WHICH protected columns and WHICH worksheet rows preflight
+            # flagged -- not merely that something was wrong. Blank for every
+            # loan that was not quarantined.
+            "Source Integrity Detail": quarantined.get(str(gp).strip(), "") if source_integrity_quarantined else "",
             "Scheduled Payment Ambiguous": "YES" if scheduled_ambiguous else "NO",
             "Data Quality Issue": (
                 f"Multiple distinct nonzero Scheduled Payment values this cycle "
@@ -4496,7 +4562,8 @@ ALL_CHECKS_META = [
 ]
 
 
-def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df, soup_servicer_df, memo_df=None, memo_lender_key=None, deal=None):
+def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df, soup_servicer_df,
+                               memo_df=None, memo_lender_key=None, deal=None, quarantined_gps=None):
     """Runs all checks for a single servicer file against its SOUP history.
 
     memo_df (from file_readers.read_service_memo) is optional — when not
@@ -4521,7 +4588,22 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
     CONT-01 to Servicer + Deal + normalized GP Number instead of Servicer + GP
     Number alone — see population_check's docstring-level comment for why.
     Affects only those two; BAL-01, BAL-02, STAT-01, STAT-02, PAY-01/02, DUP-01, NEG-01, and PORT-01
-    are unchanged by this parameter."""
+    are unchanged by this parameter.
+
+    quarantined_gps is the ingestion layer's FORM-01 verdict: the loans whose
+    protected formula cells were found overwritten with pasted literals in the
+    SOURCE workbook. Either an iterable of GP numbers or a {gp: detail}
+    mapping carrying preflight's own finding text. STAT-01 withdraws those
+    loans' Calculated DQ Status to UNVERIFIED and tags them
+    SOURCE_FORMULA_INTEGRITY_QUARANTINE; corrections.py then excludes them
+    from every candidate through WARNING_REASONS.
+
+    Scoped DELIBERATELY to STAT-01, which is the only check that produces a
+    determination fed back into a lender workbook (correction_data) and the
+    only source of the Audited Portfolio Summary's delinquency figures. The
+    other checks are reporting-only: their findings on an affected loan stay
+    fully visible, which is the point -- quarantine withdraws trust in a
+    computed figure, it does not hide the loan."""
     # CLOSED-AT-ZERO ELIGIBILITY, resolved ONCE per servicer and shared by
     # every client-facing exception check. Computed here rather than inside
     # each check so all four apply an identical rule to an identical set --
@@ -4537,7 +4619,9 @@ def run_servicer_reconciliation(servicer_name, loan_terms_df, servicer_inputs_df
         ),
         balance_continuity_check(servicer_inputs_df, soup_servicer_df, closed_at_zero=closed_at_zero),
         liquidation_balance_check(servicer_inputs_df, closed_at_zero=closed_at_zero),
-        status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df, servicer_name=memo_lender_key or servicer_name, closed_at_zero=closed_at_zero),
+        status_match_check(servicer_inputs_df, soup_servicer_df, memo_df=memo_df,
+                           servicer_name=memo_lender_key or servicer_name,
+                           closed_at_zero=closed_at_zero, quarantined_gps=quarantined_gps),
         terminal_status_review_check(servicer_inputs_df, soup_servicer_df, servicer_name=servicer_name, closed_at_zero=closed_at_zero),
         missing_payment_periods_check(soup_servicer_df, loan_terms_df),
         payment_shortfall_check(servicer_inputs_df),
